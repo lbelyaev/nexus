@@ -1,0 +1,26 @@
+{
+  "name": "@nexus/client-core",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@nexus/types": "workspace:*",
+    "react": "^18"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16",
+    "@types/react": "^18",
+    "jsdom": "^28.1.0",
+    "react-dom": "^18",
+    "typescript": "^5.7",
+    "vitest": "^3"
+  }
+}

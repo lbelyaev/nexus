@@ -1,0 +1,27 @@
+{
+  "name": "@nexus/gateway",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest watch",
+    "dev": "bun run src/main.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@nexus/types": "workspace:*",
+    "@nexus/policy": "workspace:*",
+    "@nexus/state": "workspace:*",
+    "@nexus/acp-bridge": "workspace:*",
+    "ws": "^8"
+  },
+  "devDependencies": {
+    "@types/ws": "^8",
+    "typescript": "^5.7",
+    "vitest": "^3"
+  }
+}

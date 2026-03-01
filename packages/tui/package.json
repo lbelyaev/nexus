@@ -1,0 +1,30 @@
+{
+  "name": "@nexus/tui",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "nexus-tui": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest watch",
+    "dev": "bun run src/index.tsx",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@nexus/client-core": "workspace:*",
+    "@nexus/types": "workspace:*",
+    "ink": "^5",
+    "react": "^18"
+  },
+  "devDependencies": {
+    "@types/react": "^18",
+    "ink-testing-library": "^4",
+    "typescript": "^5.7",
+    "vitest": "^3"
+  }
+}

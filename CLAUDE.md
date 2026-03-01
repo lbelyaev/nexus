@@ -1,0 +1,126 @@
+# CLAUDE.md — Nexus Development Guide
+
+## What is Nexus?
+
+Nexus is a lightweight, modular AI agent gateway. It proves the full chain:
+**User -> TUI -> WebSocket -> Gateway -> ACP -> Claude Code** with real-time streaming and approval mediation.
+
+## Quick Start
+
+```bash
+bun install          # install all deps
+bun run build        # build all 7 packages
+bun run test         # run all tests (~190 across 7 packages)
+bun run typecheck    # typecheck without emitting
+```
+
+### Run the gateway
+
+```bash
+bun run --filter=@nexus/gateway dev
+```
+
+### Run the TUI
+
+```bash
+NEXUS_TOKEN=<token from gateway output> bun run --filter=@nexus/tui dev
+```
+
+## Project Structure
+
+```
+nexus/
+├── config/                     # Runtime configuration
+│   ├── nexus.default.json      # Gateway config (port, auth, runtime command)
+│   └── policy.default.json     # Tool approval policy rules
+├── docs/                       # Architecture docs & plans
+└── packages/
+    ├── types/                  # Shared types + type guards (zero deps)
+    ├── policy/                 # Policy evaluation engine (pure logic)
+    ├── state/                  # SQLite state store (sessions + audit)
+    ├── acp-bridge/             # ACP client, NDJSON stream, subprocess manager
+    ├── gateway/                # WS server, router, auth, orchestration
+    ├── client-core/            # React hooks (useConnection, useSession, useApproval)
+    └── tui/                    # Terminal UI (Ink 5 + React 18)
+```
+
+## Dependency Graph
+
+```
+types (zero deps)
+  ├── policy
+  ├── state (+bun:sqlite or better-sqlite3 via runtime adapter)
+  ├── acp-bridge
+  ├── client-core (+react)
+  │     └── tui (+ink)
+  └── gateway (+ws, policy, state, acp-bridge)
+```
+
+## Code Style
+
+- **Arrow functions only**: `const fn = () => {}`, never `function fn() {}`
+- **Named exports only**: no `export default`
+- **No bun-scoped imports**: use `node:*` and npm packages only (portable to Node/Deno)
+- **Strict TypeScript**: `strict: true`, ESNext target, bundler module resolution
+- **Test framework**: vitest (not bun:test)
+- **TDD**: tests first, implementation second
+
+## Architecture Rules
+
+- Gateway owns the Client <-> Gateway protocol (NOT ACP)
+- Gateway translates between its protocol and ACP
+- ACP sessions are 1:1 with gateway sessions
+- Policy is evaluated at the gateway level, not in the agent
+- Auth is mandatory — token required on every WS connection
+- State store holds session metadata + audit log (NOT transcripts — Claude Code owns those)
+
+## Key Protocols
+
+### Client <-> Gateway (WebSocket JSON)
+
+**ClientMessage** types: `session_new`, `prompt`, `cancel`, `approval_response`, `session_list`
+**GatewayEvent** types: `session_created`, `text_delta`, `tool_start`, `tool_end`, `approval_request`, `turn_end`, `error`, `session_list`
+
+### Gateway <-> Agent (ACP over NDJSON stdio)
+
+JSON-RPC 2.0 per the [Agent Client Protocol](https://agentclientprotocol.com) spec:
+- **Client → Agent requests**: `initialize`, `session/new`, `session/prompt`
+- **Client → Agent notifications**: `session/cancel`
+- **Agent → Client notifications**: `session/update` (text chunks, tool calls)
+- **Agent → Client requests**: `session/request_permission` (expects permission response)
+
+Key ACP shapes:
+- `initialize`: `{ protocolVersion: 1, clientCapabilities: {} }`
+- `session/new`: `{ cwd: string, mcpServers: [] }` → returns `{ sessionId }`
+- `session/prompt`: `{ sessionId, prompt: ContentBlock[] }` where ContentBlock is `{ type: "text", text }`
+- `session/update`: `{ sessionId, update: { sessionUpdate: "agent_message_chunk"|"tool_call"|"tool_call_update", ... } }`
+- `session/request_permission`: `{ sessionId, toolCall, options }` → response: `{ outcome: { outcome: "selected", optionId } }`
+
+## Testing
+
+All tests use vitest. Each package has its own test suite.
+
+```bash
+bun run test                              # all packages
+bun run --filter=@nexus/gateway test      # single package
+bun run --filter=@nexus/gateway test:watch # watch mode
+```
+
+State tests use `:memory:` SQLite. ACP bridge tests use mock streams. Gateway E2E tests use real WS connections with mock ACP sessions.
+
+## Config
+
+Gateway loads config from (in order):
+1. CLI argument path
+2. `NEXUS_CONFIG` env var
+3. `./config/nexus.json`
+4. `./config/nexus.default.json`
+
+If `auth.token` is empty, a random 32-char hex token is generated on startup.
+
+## File Conventions
+
+- Source in `src/`, compiled to `dist/`
+- Tests in `src/__tests__/*.test.ts`
+- Each package has `vitest.config.ts` with `passWithNoTests: true`
+- Package entry points: `src/index.ts` re-exports public API
