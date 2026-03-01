@@ -20,6 +20,11 @@ export const spawnAgent = (
     env: options?.env ? { ...process.env, ...options.env } : undefined,
   });
 
+  // Forward agent stderr to gateway console for debugging
+  child.stderr?.on("data", (chunk: Buffer) => {
+    process.stderr.write(`[agent] ${chunk.toString()}`);
+  });
+
   const rpc = createRpcClient(child.stdout!, child.stdin!, {
     timeout: options?.timeout,
   });

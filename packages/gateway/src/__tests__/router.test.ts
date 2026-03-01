@@ -8,7 +8,7 @@ const mockAcpSession = (): AcpSession => ({
   id: "gw-session-1",
   acpSessionId: "acp-session-1",
   prompt: vi.fn().mockResolvedValue(undefined),
-  respondToPermission: vi.fn(),
+  respondToPermission: vi.fn().mockReturnValue(true),
   cancel: vi.fn(),
   onEvent: vi.fn(),
 });
@@ -102,6 +102,63 @@ describe("createRouter", () => {
     });
   });
 
+  it("prompt emits text_delta when prompt result has a single content block object", async () => {
+    (acpSession.prompt as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      stopReason: "end_turn",
+      content: { type: "text", text: "Final response text" },
+    });
+
+    const { emit, events } = collectEvents();
+    router.handleMessage({ type: "session_new" }, emit);
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === "session_created")).toBe(true);
+    });
+
+    const sessionCreated = events.find((e) => e.type === "session_created");
+    if (!sessionCreated || sessionCreated.type !== "session_created") {
+      throw new Error("session_created event missing");
+    }
+
+    events.length = 0;
+    router.handleMessage(
+      { type: "prompt", sessionId: sessionCreated.sessionId, text: "hello" },
+      emit,
+    );
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === "turn_end")).toBe(true);
+    });
+
+    const textEvent = events.find((e) => e.type === "text_delta");
+    expect(textEvent).toBeDefined();
+    if (textEvent?.type === "text_delta") {
+      expect(textEvent.delta).toBe("Final response text");
+    }
+  });
+
+  it("prompt rebinds session event emitter to current client emit callback", async () => {
+    const first = collectEvents();
+    router.handleMessage({ type: "session_new" }, first.emit);
+
+    await vi.waitFor(() => {
+      expect(first.events.some((e) => e.type === "session_created")).toBe(true);
+    });
+
+    const sessionCreated = first.events.find((e) => e.type === "session_created");
+    if (!sessionCreated || sessionCreated.type !== "session_created") {
+      throw new Error("session_created event missing");
+    }
+
+    const second = collectEvents();
+    router.handleMessage(
+      { type: "prompt", sessionId: sessionCreated.sessionId, text: "hello" },
+      second.emit,
+    );
+
+    expect(acpSession.onEvent).toHaveBeenCalledWith(second.emit);
+  });
+
   it("session_list emits session_list event from state store", async () => {
     const { emit, events } = collectEvents();
     router.handleMessage({ type: "session_new" }, emit);
@@ -150,5 +207,25 @@ describe("createRouter", () => {
     );
 
     expect(acpSession.respondToPermission).toHaveBeenCalledWith("req-1", "allow_once");
+  });
+
+  it("approval_response forwards explicit optionId when provided", async () => {
+    const { emit, events } = collectEvents();
+    router.handleMessage({ type: "session_new" }, emit);
+
+    await vi.waitFor(() => {
+      expect(events).toHaveLength(1);
+    });
+
+    router.handleMessage(
+      {
+        type: "approval_response",
+        requestId: "req-2",
+        optionId: "allow_always",
+      },
+      emit,
+    );
+
+    expect(acpSession.respondToPermission).toHaveBeenCalledWith("req-2", "allow_always");
   });
 });

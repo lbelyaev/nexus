@@ -7,6 +7,7 @@ export interface NexusConfig {
   runtime: {
     command: string[];
     cwd?: string;
+    env?: Record<string, string>;
   };
   dataDir: string;
 }

@@ -59,6 +59,7 @@ export const createRouter = (deps: RouterDeps): Router => {
     msg: Extract<ClientMessage, { type: "prompt" }>,
     emit: EventEmitter,
   ): void => {
+    console.log(`[router] handlePrompt: sessionId=${msg.sessionId}, text=${msg.text.slice(0, 50)}`);
     const session = sessions.get(msg.sessionId);
     if (!session) {
       emit({
@@ -73,11 +74,40 @@ export const createRouter = (deps: RouterDeps): Router => {
       lastActivityAt: new Date().toISOString(),
     });
 
+    // Always bind prompt-time emitter so streaming events (approval/tool/text)
+    // are delivered to the same client that initiated this prompt.
+    session.onEvent(emit);
+
     // ACP streaming events flow via session.onEvent → emit
     // prompt() resolves when the turn ends (PromptResponse with stopReason)
     session.prompt(msg.text).then(
       (result) => {
-        const r = result as { stopReason?: string } | undefined;
+        console.log(`[router] Prompt response: ${JSON.stringify(result ?? null).slice(0, 500)}`);
+        const r = result as { stopReason?: string; content?: unknown } | undefined;
+
+        // Extract any text from the prompt response content blocks
+        // (the agent may include final text here instead of streaming it)
+        try {
+          const rawContent = r?.content;
+          const blocks = Array.isArray(rawContent)
+            ? rawContent
+            : rawContent && typeof rawContent === "object"
+              ? [rawContent]
+              : [];
+          for (const block of blocks) {
+            const b = block as { type?: unknown; text?: unknown };
+            if (b.type === "text" && typeof b.text === "string" && b.text.length > 0) {
+              emit({
+                type: "text_delta",
+                sessionId: msg.sessionId,
+                delta: b.text,
+              });
+            }
+          }
+        } catch (contentErr) {
+          console.error(`[router] Error extracting prompt response content:`, contentErr);
+        }
+
         emit({
           type: "turn_end",
           sessionId: msg.sessionId,
@@ -128,19 +158,29 @@ export const createRouter = (deps: RouterDeps): Router => {
     msg: Extract<ClientMessage, { type: "approval_response" }>,
     emit: EventEmitter,
   ): void => {
-    for (const session of sessions.values()) {
-      const optionId = msg.allow ? "allow_once" : "reject_once";
-      session.respondToPermission(msg.requestId, optionId);
+    console.log(`[router] Received approval_response: requestId=${msg.requestId}, allow=${String(msg.allow)}, optionId=${msg.optionId ?? "<none>"}`);
+    console.log(`[router] Active sessions: ${sessions.size}`);
 
-      stateStore.logEvent({
-        sessionId: session.id,
-        timestamp: new Date().toISOString(),
-        type: msg.allow ? "approval" : "deny",
-        detail: `requestId=${msg.requestId}`,
-      });
-      return;
+    const allow = msg.allow ?? msg.optionId?.startsWith("allow_") ?? false;
+    const optionId =
+      msg.optionId
+      ?? (allow ? "allow_once" : "reject_once");
+
+    // Search all sessions for the one with the matching pending permission
+    for (const session of sessions.values()) {
+      const found = session.respondToPermission(msg.requestId, optionId);
+      if (found) {
+        stateStore.logEvent({
+          sessionId: session.id,
+          timestamp: new Date().toISOString(),
+          type: allow ? "approval" : "deny",
+          detail: `requestId=${msg.requestId}`,
+        });
+        return;
+      }
     }
 
+    console.log(`[router] No session found with pending permission for requestId=${msg.requestId}`);
     emit({
       type: "error",
       sessionId: "",

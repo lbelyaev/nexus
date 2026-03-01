@@ -8,18 +8,32 @@ export interface SessionInfo {
   lastActivityAt: string;
 }
 
+export interface ApprovalOption {
+  optionId: string;
+  name: string;
+  kind: string;
+}
+
 export type ClientMessage =
   | { type: "prompt"; sessionId: string; text: string }
-  | { type: "approval_response"; requestId: string; allow: boolean }
+  | { type: "approval_response"; requestId: string; allow?: boolean; optionId?: string }
   | { type: "cancel"; sessionId: string }
   | { type: "session_new"; runtimeId?: string }
   | { type: "session_list" };
 
 export type GatewayEvent =
   | { type: "text_delta"; sessionId: string; delta: string }
-  | { type: "tool_start"; sessionId: string; tool: string; params: unknown }
-  | { type: "tool_end"; sessionId: string; tool: string; result?: string }
-  | { type: "approval_request"; sessionId: string; requestId: string; tool: string; description: string }
+  | { type: "thinking_delta"; sessionId: string; delta: string }
+  | { type: "tool_start"; sessionId: string; tool: string; toolCallId?: string; params: unknown }
+  | { type: "tool_end"; sessionId: string; tool: string; toolCallId?: string; result?: string }
+  | {
+      type: "approval_request";
+      sessionId: string;
+      requestId: string;
+      tool: string;
+      description: string;
+      options?: ApprovalOption[];
+    }
   | { type: "turn_end"; sessionId: string; stopReason: string }
   | { type: "error"; sessionId: string; message: string }
   | { type: "session_created"; sessionId: string; model: string }
@@ -35,6 +49,7 @@ const CLIENT_MESSAGE_TYPES = new Set([
 
 const GATEWAY_EVENT_TYPES = new Set([
   "text_delta",
+  "thinking_delta",
   "tool_start",
   "tool_end",
   "approval_request",
@@ -53,7 +68,10 @@ export const isClientMessage = (value: unknown): value is ClientMessage => {
     case "prompt":
       return typeof obj.sessionId === "string" && typeof obj.text === "string";
     case "approval_response":
-      return typeof obj.requestId === "string" && typeof obj.allow === "boolean";
+      return (
+        typeof obj.requestId === "string" &&
+        (typeof obj.allow === "boolean" || typeof obj.optionId === "string")
+      );
     case "cancel":
       return typeof obj.sessionId === "string";
     case "session_new":
@@ -72,6 +90,7 @@ export const isGatewayEvent = (value: unknown): value is GatewayEvent => {
 
   switch (obj.type) {
     case "text_delta":
+    case "thinking_delta":
       return typeof obj.sessionId === "string" && typeof obj.delta === "string";
     case "tool_start":
       return typeof obj.sessionId === "string" && typeof obj.tool === "string";
@@ -82,7 +101,22 @@ export const isGatewayEvent = (value: unknown): value is GatewayEvent => {
         typeof obj.sessionId === "string" &&
         typeof obj.requestId === "string" &&
         typeof obj.tool === "string" &&
-        typeof obj.description === "string"
+        typeof obj.description === "string" &&
+        (
+          obj.options === undefined
+          || (
+            Array.isArray(obj.options)
+            && obj.options.every(
+              (opt) => (
+                typeof opt === "object"
+                && opt !== null
+                && typeof (opt as Record<string, unknown>).optionId === "string"
+                && typeof (opt as Record<string, unknown>).name === "string"
+                && typeof (opt as Record<string, unknown>).kind === "string"
+              ),
+            )
+          )
+        )
       );
     case "turn_end":
       return typeof obj.sessionId === "string" && typeof obj.stopReason === "string";

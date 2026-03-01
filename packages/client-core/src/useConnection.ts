@@ -30,6 +30,18 @@ export const useConnection = (
   onEventRef.current = onEvent;
 
   useEffect(() => {
+    const decoder = new TextDecoder();
+    const dispatchRaw = (raw: string): void => {
+      try {
+        const data = JSON.parse(raw);
+        if (isGatewayEvent(data) && onEventRef.current) {
+          onEventRef.current(data);
+        }
+      } catch {
+        // Ignore malformed messages
+      }
+    };
+
     const wsUrl = `${url}${url.includes("?") ? "&" : "?"}token=${encodeURIComponent(token)}`;
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
@@ -40,15 +52,42 @@ export const useConnection = (
     };
 
     ws.onmessage = (event: MessageEvent) => {
-      try {
-        const data = JSON.parse(
-          typeof event.data === "string" ? event.data : "",
-        );
-        if (isGatewayEvent(data) && onEventRef.current) {
-          onEventRef.current(data);
-        }
-      } catch {
-        // Ignore malformed messages
+      if (typeof event.data === "string") {
+        dispatchRaw(event.data);
+        return;
+      }
+
+      if (event.data instanceof ArrayBuffer) {
+        dispatchRaw(decoder.decode(new Uint8Array(event.data)));
+        return;
+      }
+
+      if (ArrayBuffer.isView(event.data)) {
+        dispatchRaw(decoder.decode(event.data));
+        return;
+      }
+
+      if (typeof Blob !== "undefined" && event.data instanceof Blob) {
+        event.data
+          .text()
+          .then((text) => dispatchRaw(text))
+          .catch(() => {});
+        return;
+      }
+
+      // Some runtimes expose blob-like objects without instanceof Blob support.
+      if (
+        typeof event.data === "object" &&
+        event.data !== null &&
+        "text" in event.data &&
+        typeof (event.data as { text: unknown }).text === "function"
+      ) {
+        (
+          event.data as unknown as { text: () => Promise<string> }
+        )
+          .text()
+          .then((text) => dispatchRaw(text))
+          .catch(() => {});
       }
     };
 

@@ -221,4 +221,90 @@ describe("createRpcClient", () => {
 
     rpc.destroy();
   });
+
+  it("multiple notification handlers all receive the same notification", async () => {
+    const { childStdout, childStdin } = makeStreams();
+    const rpc = createRpcClient(childStdout, childStdin, { timeout: 500 });
+
+    const received1: unknown[] = [];
+    const received2: unknown[] = [];
+    rpc.onNotification((n) => received1.push(n));
+    rpc.onNotification((n) => received2.push(n));
+
+    childStdout.write(
+      JSON.stringify({ jsonrpc: "2.0", method: "session/update", params: { x: 1 } }) + "\n",
+    );
+
+    await vi.waitFor(() => {
+      expect(received1).toHaveLength(1);
+      expect(received2).toHaveLength(1);
+    });
+
+    expect(received1[0]).toEqual(received2[0]);
+
+    rpc.destroy();
+  });
+
+  it("onNotification returns unsubscribe function", async () => {
+    const { childStdout, childStdin } = makeStreams();
+    const rpc = createRpcClient(childStdout, childStdin, { timeout: 500 });
+
+    const received: unknown[] = [];
+    const unsub = rpc.onNotification((n) => received.push(n));
+
+    childStdout.write(
+      JSON.stringify({ jsonrpc: "2.0", method: "test", params: {} }) + "\n",
+    );
+
+    await vi.waitFor(() => expect(received).toHaveLength(1));
+
+    unsub();
+
+    childStdout.write(
+      JSON.stringify({ jsonrpc: "2.0", method: "test", params: {} }) + "\n",
+    );
+
+    // Give time for any handler to fire
+    await new Promise((r) => setTimeout(r, 50));
+    expect(received).toHaveLength(1); // still 1, unsubscribed
+
+    rpc.destroy();
+  });
+
+  it("multiple request handlers — first to resolve wins", async () => {
+    const { childStdout, childStdin } = makeStreams();
+    const written = collectWritten(childStdin);
+    const rpc = createRpcClient(childStdout, childStdin, { timeout: 500 });
+
+    // Handler 1 only handles session "s1"
+    rpc.onRequest(async (_method, params) => {
+      const p = params as { sessionId: string };
+      if (p.sessionId !== "s1") throw new Error("not mine");
+      return { result: "handler1" };
+    });
+
+    // Handler 2 only handles session "s2"
+    rpc.onRequest(async (_method, params) => {
+      const p = params as { sessionId: string };
+      if (p.sessionId !== "s2") throw new Error("not mine");
+      return { result: "handler2" };
+    });
+
+    // Send request for s2 — should be handled by handler2
+    childStdout.write(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 10,
+        method: "session/request_permission",
+        params: { sessionId: "s2" },
+      }) + "\n",
+    );
+
+    await vi.waitFor(() => expect(written.length).toBeGreaterThanOrEqual(1));
+
+    const response = JSON.parse(written[0]!.trim());
+    expect(response.result).toEqual({ result: "handler2" });
+
+    rpc.destroy();
+  });
 });

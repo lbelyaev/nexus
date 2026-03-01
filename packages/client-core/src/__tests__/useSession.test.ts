@@ -186,6 +186,82 @@ describe("useSession", () => {
     ]);
   });
 
+  it("accumulates toolCalls on tool_start with running status", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "tool_start",
+        sessionId: "sess-1",
+        tool: "Read /tmp/foo",
+        params: { file_path: "/tmp/foo" },
+      });
+    });
+
+    expect(result.current.toolCalls).toEqual([
+      { tool: "Read /tmp/foo", params: { file_path: "/tmp/foo" }, status: "running" },
+    ]);
+  });
+
+  it("updates toolCalls status on tool_end (entry persists)", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "tool_start",
+        sessionId: "sess-1",
+        tool: "Read /tmp/foo",
+        params: { file_path: "/tmp/foo" },
+      });
+    });
+
+    act(() => {
+      result.current.handleEvent({
+        type: "tool_end",
+        sessionId: "sess-1",
+        tool: "Read /tmp/foo",
+        result: "contents",
+      });
+    });
+
+    expect(result.current.toolCalls).toEqual([
+      { tool: "Read /tmp/foo", params: { file_path: "/tmp/foo" }, status: "completed" },
+    ]);
+    // Active tools should still be empty (removed as before)
+    expect(result.current.activeTools).toEqual([]);
+  });
+
+  it("completes lone running tool when tool_end arrives without matching id/name", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "tool_start",
+        sessionId: "sess-1",
+        tool: "Bash",
+        toolCallId: "tc-1",
+        params: { command: "ls" },
+      });
+    });
+
+    // Simulate runtime sending inconsistent tool label and missing toolCallId on completion.
+    act(() => {
+      result.current.handleEvent({
+        type: "tool_end",
+        sessionId: "sess-1",
+        tool: "Terminal",
+      });
+    });
+
+    expect(result.current.activeTools).toEqual([]);
+    expect(result.current.toolCalls).toEqual([
+      { tool: "Bash", toolCallId: "tc-1", params: { command: "ls" }, status: "completed" },
+    ]);
+  });
+
   it("sets error on error event", () => {
     const sendMessage = vi.fn();
     const { result } = renderHook(() => useSession(sendMessage));

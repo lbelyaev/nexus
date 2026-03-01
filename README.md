@@ -150,12 +150,14 @@ Rules are evaluated first-match-wins. Pattern matching is substring-based.
 ```bash
 bun run build         # Build all packages
 bun run test          # Run all tests
+bun run test:coverage # Run all tests with coverage
 bun run typecheck     # Type-check without emitting
 bun run dev           # Start all dev servers
 
 # Single package
 bun run --filter=@nexus/gateway test
 bun run --filter=@nexus/gateway test:watch
+bun run --filter=@nexus/gateway test -- --coverage
 ```
 
 ### Testing

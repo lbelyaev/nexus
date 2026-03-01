@@ -9,6 +9,7 @@ describe("isClientMessage", () => {
   it("validates an approval_response message", () => {
     expect(isClientMessage({ type: "approval_response", requestId: "r1", allow: true })).toBe(true);
     expect(isClientMessage({ type: "approval_response", requestId: "r1", allow: false })).toBe(true);
+    expect(isClientMessage({ type: "approval_response", requestId: "r1", optionId: "allow_always" })).toBe(true);
   });
 
   it("validates a cancel message", () => {
@@ -46,6 +47,7 @@ describe("isClientMessage", () => {
 
   it("rejects approval_response with wrong allow type", () => {
     expect(isClientMessage({ type: "approval_response", requestId: "r1", allow: "yes" })).toBe(false);
+    expect(isClientMessage({ type: "approval_response", requestId: "r1" })).toBe(false);
   });
 });
 
@@ -70,6 +72,17 @@ describe("isGatewayEvent", () => {
       requestId: "r1",
       tool: "Exec",
       description: "Run npm test",
+    })).toBe(true);
+    expect(isGatewayEvent({
+      type: "approval_request",
+      sessionId: "s1",
+      requestId: "r1",
+      tool: "Exec",
+      description: "Run npm test",
+      options: [
+        { optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+        { optionId: "allow_always", name: "Allow always", kind: "allow_always" },
+      ],
     })).toBe(true);
   });
 

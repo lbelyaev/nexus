@@ -48,11 +48,13 @@ export const createGatewayServer = (deps: {
   wss.on("connection", (ws: WebSocket) => {
     ws.on("message", (data: Buffer | string) => {
       const raw = typeof data === "string" ? data : data.toString();
+      console.log(`[ws] Received: ${raw.slice(0, 200)}`);
 
       let msg;
       try {
         msg = parseClientMessage(raw);
-      } catch {
+      } catch (err) {
+        console.log(`[ws] Parse error: ${err instanceof Error ? err.message : err}`);
         const errorEvent: GatewayEvent = {
           type: "error",
           sessionId: "",

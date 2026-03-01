@@ -128,4 +128,34 @@ describe("useApproval", () => {
 
     expect(result.current.pendingApprovals).toHaveLength(0);
   });
+
+  it("approveAll prefers allow_always optionId when available", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useApproval(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "approval_request",
+        sessionId: "sess-1",
+        requestId: "req-1",
+        tool: "bash",
+        description: "Run ls",
+        options: [
+          { optionId: "allow_once", name: "Allow Once", kind: "allow_once" },
+          { optionId: "allow_always", name: "Always Allow", kind: "allow_always" },
+        ],
+      });
+    });
+
+    act(() => {
+      result.current.approveAll();
+    });
+
+    expect(sendMessage).toHaveBeenCalledWith({
+      type: "approval_response",
+      requestId: "req-1",
+      allow: true,
+      optionId: "allow_always",
+    });
+  });
 });

@@ -12,7 +12,7 @@ const createMockAcpSession = (id: string): AcpSession => ({
   id,
   acpSessionId: `acp-${id}`,
   prompt: vi.fn().mockResolvedValue({ text: "mock response" }),
-  respondToPermission: vi.fn(),
+  respondToPermission: vi.fn().mockReturnValue(true),
   cancel: vi.fn(),
   onEvent: vi.fn(),
 });

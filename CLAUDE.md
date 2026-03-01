@@ -11,6 +11,7 @@ Nexus is a lightweight, modular AI agent gateway. It proves the full chain:
 bun install          # install all deps
 bun run build        # build all 7 packages
 bun run test         # run all tests (~190 across 7 packages)
+bun run test:coverage # run all tests with coverage
 bun run typecheck    # typecheck without emitting
 ```
 
@@ -102,7 +103,9 @@ All tests use vitest. Each package has its own test suite.
 
 ```bash
 bun run test                              # all packages
+bun run test:coverage                     # all packages with coverage
 bun run --filter=@nexus/gateway test      # single package
+bun run --filter=@nexus/gateway test -- --coverage
 bun run --filter=@nexus/gateway test:watch # watch mode
 ```
 

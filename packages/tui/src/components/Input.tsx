@@ -4,9 +4,10 @@ import { Box, Text, useInput, useStdin } from "ink";
 export interface InputProps {
   onSubmit: (text: string) => void;
   isDisabled: boolean;
+  isFocused?: boolean;
 }
 
-export const Input = ({ onSubmit, isDisabled }: InputProps) => {
+export const Input = ({ onSubmit, isDisabled, isFocused = true }: InputProps) => {
   const [value, setValue] = useState("");
   const { isRawModeSupported } = useStdin();
 
@@ -32,7 +33,7 @@ export const Input = ({ onSubmit, isDisabled }: InputProps) => {
         setValue((prev) => prev + input);
       }
     },
-    { isActive: isRawModeSupported },
+    { isActive: isRawModeSupported && isFocused },
   );
 
   if (!isRawModeSupported) {

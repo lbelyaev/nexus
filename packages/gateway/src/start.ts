@@ -7,6 +7,7 @@ import { createStateStore } from "@nexus/state";
 import { loadPolicyFromString } from "@nexus/policy";
 import { spawnAgent, createAcpSession } from "@nexus/acp-bridge";
 import type { AcpSession } from "@nexus/acp-bridge";
+import { evaluatePolicy } from "@nexus/policy";
 
 export const startGateway = async (configPath?: string) => {
   const config = loadConfig(configPath);
@@ -39,6 +40,8 @@ export const startGateway = async (configPath?: string) => {
   console.log(`[nexus] Spawning agent: ${config.runtime.command.join(" ")}`);
   const agent = spawnAgent(config.runtime.command, {
     cwd: config.runtime.cwd,
+    env: config.runtime.env,
+    timeout: 300_000, // 5 min — tool-using prompts can be slow
   });
 
   agent.onExit((code) => {
@@ -67,7 +70,9 @@ export const startGateway = async (configPath?: string) => {
       const acpSessionId = result.sessionId;
       console.log(`[nexus] ACP session created: ${acpSessionId} (gateway: ${gatewaySessionId})`);
 
-      const session = createAcpSession(agent.rpc, acpSessionId, gatewaySessionId);
+      const session = createAcpSession(agent.rpc, acpSessionId, gatewaySessionId, {
+        policyEvaluator: (tool, params) => evaluatePolicy(policyConfig, tool, params),
+      });
       session.onEvent(onEvent);
 
       return session;
