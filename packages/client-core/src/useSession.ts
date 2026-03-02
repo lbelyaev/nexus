@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from "react";
-import type { ClientMessage, GatewayEvent } from "@nexus/types";
+import type { ClientMessage, GatewayEvent, TranscriptMessage } from "@nexus/types";
 
 export interface ActiveTool {
   tool: string;
@@ -51,10 +51,12 @@ export interface UseSessionResult {
   isStreaming: boolean;
   activeTools: ActiveTool[];
   toolCalls: ToolCall[];
+  transcript: TranscriptMessage[];
   error: string | null;
   sendPrompt: (text: string) => void;
   steer: (text: string) => void;
   cancel: () => void;
+  requestReplay: (sessionId: string) => void;
   handleEvent: (event: GatewayEvent) => void;
 }
 
@@ -73,6 +75,7 @@ export const useSession = (
   const [isStreaming, setIsStreaming] = useState(false);
   const [activeTools, setActiveTools] = useState<ActiveTool[]>([]);
   const [toolCalls, setToolCalls] = useState<ToolCall[]>([]);
+  const [transcript, setTranscript] = useState<TranscriptMessage[]>([]);
   const [error, setError] = useState<string | null>(null);
   const queuedSteerRef = useRef<string | null>(null);
   const ignoreCancelledTurnEndRef = useRef(false);
@@ -207,6 +210,9 @@ export const useSession = (
         });
         break;
       }
+      case "transcript":
+        setTranscript(event.messages);
+        break;
       case "error":
         ignoreCancelledTurnEndRef.current = false;
         setError(event.message);
@@ -243,6 +249,13 @@ export const useSession = (
     [isStreaming, sendMessage, sendPromptInternal, sessionId],
   );
 
+  const requestReplay = useCallback(
+    (sid: string) => {
+      sendMessage({ type: "session_replay", sessionId: sid });
+    },
+    [sendMessage],
+  );
+
   const cancel = useCallback(() => {
     queuedSteerRef.current = null;
     ignoreCancelledTurnEndRef.current = false;
@@ -264,10 +277,12 @@ export const useSession = (
     isStreaming,
     activeTools,
     toolCalls,
+    transcript,
     error,
     sendPrompt,
     steer,
     cancel,
+    requestReplay,
     handleEvent,
   };
 };

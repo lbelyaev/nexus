@@ -491,6 +491,47 @@ describe("useSession", () => {
     expect(sendMessage).toHaveBeenCalledTimes(2);
   });
 
+  it("requestReplay sends session_replay message", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.requestReplay("sess-42");
+    });
+
+    expect(sendMessage).toHaveBeenCalledWith({
+      type: "session_replay",
+      sessionId: "sess-42",
+    });
+  });
+
+  it("sets transcript on transcript event", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    const messages = [
+      { id: 1, sessionId: "sess-1", role: "user" as const, content: "hi", timestamp: "2026-01-01T00:00:00Z", tokenEstimate: 1 },
+      { id: 2, sessionId: "sess-1", role: "assistant" as const, content: "hello", timestamp: "2026-01-01T00:00:01Z", tokenEstimate: 2 },
+    ];
+
+    act(() => {
+      result.current.handleEvent({
+        type: "transcript",
+        sessionId: "sess-1",
+        messages,
+      });
+    });
+
+    expect(result.current.transcript).toEqual(messages);
+  });
+
+  it("has empty transcript initially", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    expect(result.current.transcript).toEqual([]);
+  });
+
   it("ignores stale cancelled turn_end after steer reprompt", () => {
     const sendMessage = vi.fn();
     const { result } = renderHook(() => useSession(sendMessage));

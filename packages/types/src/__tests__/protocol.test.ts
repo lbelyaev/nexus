@@ -26,6 +26,14 @@ describe("isClientMessage", () => {
     expect(isClientMessage({ type: "session_list" })).toBe(true);
   });
 
+  it("validates a session_replay message", () => {
+    expect(isClientMessage({ type: "session_replay", sessionId: "s1" })).toBe(true);
+  });
+
+  it("rejects session_replay with missing sessionId", () => {
+    expect(isClientMessage({ type: "session_replay" })).toBe(false);
+  });
+
   it("rejects null and non-objects", () => {
     expect(isClientMessage(null)).toBe(false);
     expect(isClientMessage(undefined)).toBe(false);
@@ -112,6 +120,25 @@ describe("isGatewayEvent", () => {
 
   it("validates session_list", () => {
     expect(isGatewayEvent({ type: "session_list", sessions: [] })).toBe(true);
+  });
+
+  it("validates transcript", () => {
+    expect(isGatewayEvent({ type: "transcript", sessionId: "s1", messages: [] })).toBe(true);
+    expect(isGatewayEvent({
+      type: "transcript",
+      sessionId: "s1",
+      messages: [{ id: 1, sessionId: "s1", role: "user", content: "hi", timestamp: "2026-01-01T00:00:00Z", tokenEstimate: 1 }],
+    })).toBe(true);
+  });
+
+  it("rejects transcript with missing fields", () => {
+    expect(isGatewayEvent({ type: "transcript", sessionId: "s1" })).toBe(false);
+    expect(isGatewayEvent({ type: "transcript", messages: [] })).toBe(false);
+    expect(isGatewayEvent({
+      type: "transcript",
+      sessionId: "s1",
+      messages: [{ id: "bad-id", role: "user" }],
+    })).toBe(false);
   });
 
   it("rejects malformed events", () => {

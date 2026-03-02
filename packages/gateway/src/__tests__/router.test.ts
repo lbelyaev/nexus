@@ -160,26 +160,31 @@ describe("createRouter", () => {
     }
   });
 
-  it("prompt rebinds session event emitter to current client emit callback", async () => {
-    const first = collectEvents();
-    router.handleMessage({ type: "session_new" }, first.emit);
+  it("prompt rebinds session event emitter on each prompt for owner connection", async () => {
+    const owner = collectEvents();
+    router.handleMessage({ type: "session_new" }, owner.emit);
 
     await vi.waitFor(() => {
-      expect(first.events.some((e) => e.type === "session_created")).toBe(true);
+      expect(owner.events.some((e) => e.type === "session_created")).toBe(true);
     });
 
-    const sessionCreated = first.events.find((e) => e.type === "session_created");
+    const sessionCreated = owner.events.find((e) => e.type === "session_created");
     if (!sessionCreated || sessionCreated.type !== "session_created") {
       throw new Error("session_created event missing");
     }
 
-    const second = collectEvents();
     router.handleMessage(
       { type: "prompt", sessionId: sessionCreated.sessionId, text: "hello" },
-      second.emit,
+      owner.emit,
+    );
+    router.handleMessage(
+      { type: "prompt", sessionId: sessionCreated.sessionId, text: "again" },
+      owner.emit,
     );
 
-    expect(acpSession.onEvent).toHaveBeenCalledWith(second.emit);
+    expect(acpSession.onEvent).toHaveBeenCalledTimes(2);
+    expect(typeof (acpSession.onEvent as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe("function");
+    expect(typeof (acpSession.onEvent as ReturnType<typeof vi.fn>).mock.calls[1][0]).toBe("function");
   });
 
   it("session_list emits session_list event from state store", async () => {
@@ -226,6 +231,20 @@ describe("createRouter", () => {
       expect(events).toHaveLength(1);
     });
 
+    const sessionId = (events[0] as Extract<GatewayEvent, { type: "session_created" }>).sessionId;
+    router.handleMessage(
+      { type: "prompt", sessionId, text: "needs approval" },
+      emit,
+    );
+    const eventHandler = (acpSession.onEvent as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as EventEmitter;
+    eventHandler({
+      type: "approval_request",
+      sessionId,
+      requestId: "req-1",
+      tool: "Bash",
+      description: "run command",
+    });
+
     router.handleMessage(
       { type: "approval_response", requestId: "req-1", allow: true },
       emit,
@@ -242,6 +261,20 @@ describe("createRouter", () => {
       expect(events).toHaveLength(1);
     });
 
+    const sessionId = (events[0] as Extract<GatewayEvent, { type: "session_created" }>).sessionId;
+    router.handleMessage(
+      { type: "prompt", sessionId, text: "needs approval" },
+      emit,
+    );
+    const eventHandler = (acpSession.onEvent as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as EventEmitter;
+    eventHandler({
+      type: "approval_request",
+      sessionId,
+      requestId: "req-2",
+      tool: "Bash",
+      description: "run command",
+    });
+
     router.handleMessage(
       {
         type: "approval_response",
@@ -252,5 +285,136 @@ describe("createRouter", () => {
     );
 
     expect(acpSession.respondToPermission).toHaveBeenCalledWith("req-2", "allow_always");
+  });
+
+  it("prompt records user message to transcript", async () => {
+    const { emit, events } = collectEvents();
+    router.handleMessage({ type: "session_new" }, emit);
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === "session_created")).toBe(true);
+    });
+
+    const sessionId = (events[0] as Extract<GatewayEvent, { type: "session_created" }>).sessionId;
+
+    router.handleMessage(
+      { type: "prompt", sessionId, text: "hello world" },
+      emit,
+    );
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === "turn_end")).toBe(true);
+    });
+
+    const transcript = stateStore.getTranscript(sessionId);
+    expect(transcript.length).toBeGreaterThanOrEqual(1);
+    expect(transcript[0].role).toBe("user");
+    expect(transcript[0].content).toBe("hello world");
+    expect(transcript[0].tokenEstimate).toBeGreaterThan(0);
+  });
+
+  it("prompt records assistant text from prompt response to transcript", async () => {
+    (acpSession.prompt as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      stopReason: "end_turn",
+      content: { type: "text", text: "Assistant reply" },
+    });
+
+    const { emit, events } = collectEvents();
+    router.handleMessage({ type: "session_new" }, emit);
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === "session_created")).toBe(true);
+    });
+
+    const sessionId = (events[0] as Extract<GatewayEvent, { type: "session_created" }>).sessionId;
+
+    events.length = 0;
+    router.handleMessage(
+      { type: "prompt", sessionId, text: "hello" },
+      emit,
+    );
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === "turn_end")).toBe(true);
+    });
+
+    const transcript = stateStore.getTranscript(sessionId);
+    const assistantMsg = transcript.find((m) => m.role === "assistant");
+    expect(assistantMsg).toBeDefined();
+    expect(assistantMsg!.content).toBe("Assistant reply");
+  });
+
+  it("session_replay returns transcript for the requested session", async () => {
+    const { emit, events } = collectEvents();
+    router.handleMessage({ type: "session_new" }, emit);
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === "session_created")).toBe(true);
+    });
+
+    const sessionId = (events[0] as Extract<GatewayEvent, { type: "session_created" }>).sessionId;
+
+    // Send a prompt to populate transcript
+    router.handleMessage(
+      { type: "prompt", sessionId, text: "test message" },
+      emit,
+    );
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === "turn_end")).toBe(true);
+    });
+
+    events.length = 0;
+    router.handleMessage(
+      { type: "session_replay", sessionId },
+      emit,
+    );
+
+    expect(events).toHaveLength(1);
+    expect(events[0].type).toBe("transcript");
+    if (events[0].type === "transcript") {
+      expect(events[0].sessionId).toBe(sessionId);
+      expect(events[0].messages.length).toBeGreaterThanOrEqual(1);
+      expect(events[0].messages[0].role).toBe("user");
+      expect(events[0].messages[0].content).toBe("test message");
+    }
+  });
+
+  it("session_replay returns empty transcript for unknown session", () => {
+    const { emit, events } = collectEvents();
+    router.handleMessage(
+      { type: "session_replay", sessionId: "nonexistent" },
+      emit,
+    );
+
+    expect(events).toHaveLength(1);
+    expect(events[0].type).toBe("transcript");
+    if (events[0].type === "transcript") {
+      expect(events[0].messages).toEqual([]);
+    }
+  });
+
+  it("session_replay rejects requests from non-owner connection", async () => {
+    const owner = collectEvents();
+    router.handleMessage({ type: "session_new" }, owner.emit);
+
+    await vi.waitFor(() => {
+      expect(owner.events.some((e) => e.type === "session_created")).toBe(true);
+    });
+
+    const sessionId = (owner.events[0] as Extract<GatewayEvent, { type: "session_created" }>).sessionId;
+
+    const other = collectEvents();
+    router.handleMessage(
+      { type: "session_replay", sessionId },
+      other.emit,
+    );
+
+    expect(other.events).toHaveLength(1);
+    expect(other.events[0].type).toBe("error");
+    if (other.events[0].type === "error") {
+      expect(other.events[0].sessionId).toBe(sessionId);
+      expect(other.events[0].message).toMatch(/owned by another connection/i);
+    }
   });
 });

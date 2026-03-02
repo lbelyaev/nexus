@@ -9,6 +9,7 @@ import { spawnAgent, createAcpSession } from "@nexus/acp-bridge";
 import type { AgentProcess } from "@nexus/acp-bridge";
 import { evaluatePolicy } from "@nexus/policy";
 import type { NexusConfig, RuntimeProfile } from "@nexus/types";
+import { createLogger } from "./logger.js";
 
 const inferRuntimeId = (command: string[]): string => {
   const joined = command.join(" ").toLowerCase();
@@ -112,20 +113,27 @@ const resolveModelAlias = (
 };
 
 export const startGateway = async (configPath?: string) => {
+  const log = createLogger("gateway.start");
   const config = loadConfig(configPath);
   const runtimeRegistry = normalizeRuntimeRegistry(config);
   const runtimeAgents = new Map<string, { profile: RuntimeProfile; agent: AgentProcess }>();
 
-  console.log(`[nexus] Repo root: ${repoRoot}`);
-  console.log(`[nexus] Config loaded: port=${config.port}, host=${config.host}`);
-  console.log(`[nexus] Auth token: ${config.auth.token.slice(0, 8)}...`);
-  console.log(`[nexus] Runtime profiles: ${Object.keys(runtimeRegistry.profiles).join(", ")} (default=${runtimeRegistry.defaultRuntimeId})`);
+  log.info("gateway_boot", {
+    repoRoot,
+    port: config.port,
+    host: config.host,
+    tokenPreview: `${config.auth.token.slice(0, 8)}...`,
+    runtimeProfiles: Object.keys(runtimeRegistry.profiles),
+    defaultRuntimeId: runtimeRegistry.defaultRuntimeId,
+  });
   if (Object.keys(runtimeRegistry.modelAliases).length > 0) {
-    console.log(`[nexus] Model aliases: ${Object.entries(runtimeRegistry.modelAliases).map(([k, v]) => `${k}=>${v}`).join(", ")}`);
+    log.info("model_aliases_loaded", {
+      aliases: Object.entries(runtimeRegistry.modelAliases).map(([k, v]) => `${k}=>${v}`).join(", "),
+    });
   }
   if (Object.keys(runtimeRegistry.modelCatalog).length > 0) {
     const counts = Object.entries(runtimeRegistry.modelCatalog).map(([runtimeId, models]) => `${runtimeId}:${models.length}`).join(", ");
-    console.log(`[nexus] Model catalog loaded: ${counts}`);
+    log.info("model_catalog_loaded", { counts });
   }
 
   // State store — resolve dataDir relative to repo root
@@ -133,7 +141,7 @@ export const startGateway = async (configPath?: string) => {
   mkdirSync(dataDir, { recursive: true });
   const dbPath = resolve(dataDir, "nexus.db");
   const stateStore = createStateStore(dbPath);
-  console.log(`[nexus] State store initialized at ${dbPath}`);
+  log.info("state_store_initialized", { dbPath });
 
   // Policy — resolve relative to repo root
   let policyConfig;
@@ -141,26 +149,36 @@ export const startGateway = async (configPath?: string) => {
     const policyPath = resolve(repoRoot, "config/policy.default.json");
     const policyJson = readFileSync(policyPath, "utf-8");
     policyConfig = loadPolicyFromString(policyJson);
-    console.log(`[nexus] Policy loaded: ${policyConfig.rules.length} rules`);
+    log.info("policy_loaded", { ruleCount: policyConfig.rules.length });
   } catch {
     policyConfig = { rules: [] };
-    console.log(`[nexus] No policy file found, using permissive defaults`);
+    log.warn("policy_file_missing_using_permissive_defaults");
   }
 
   // Spawn and initialize one ACP process per runtime profile.
   for (const [runtimeProfileId, profile] of Object.entries(runtimeRegistry.profiles)) {
     const inferred = inferRuntimeId(profile.command);
     const authSource = inferAuthSource(runtimeProfileId, profile.command, profile.env);
-    console.log(`[nexus] Spawning runtime "${runtimeProfileId}" (${inferred}): ${profile.command.join(" ")}`);
+    log.info("runtime_spawning", {
+      runtimeProfileId,
+      inferred,
+      command: profile.command.join(" "),
+    });
     if (profile.defaultModel) {
       const resolvedDefaultModel = resolveModelAlias(profile.defaultModel, runtimeRegistry.modelAliases);
       const aliasNote = resolvedDefaultModel.requested === resolvedDefaultModel.resolved
         ? ""
         : ` (alias -> ${resolvedDefaultModel.resolved})`;
-      console.log(`[nexus] Runtime "${runtimeProfileId}" default model: ${resolvedDefaultModel.requested}${aliasNote}`);
+      log.info("runtime_default_model", {
+        runtimeProfileId,
+        defaultModel: `${resolvedDefaultModel.requested}${aliasNote}`,
+      });
     }
     if (inferred === "codex") {
-      console.log(`[nexus] Runtime "${runtimeProfileId}" auth source: ${authSource}`);
+      log.info("runtime_auth_source", {
+        runtimeProfileId,
+        authSource,
+      });
     }
 
     const agent = spawnAgent(profile.command, {
@@ -170,15 +188,15 @@ export const startGateway = async (configPath?: string) => {
     });
 
     agent.onExit((code) => {
-      console.error(`[nexus] Runtime "${runtimeProfileId}" exited with code ${code}`);
+      log.error("runtime_exited", { runtimeProfileId, code });
     });
 
-    console.log(`[nexus] Initializing runtime "${runtimeProfileId}" via ACP...`);
+    log.info("runtime_initializing", { runtimeProfileId });
     const initResult = await agent.rpc.sendRequest("initialize", {
       protocolVersion: 1,
       clientCapabilities: {},
     });
-    console.log(`[nexus] Runtime "${runtimeProfileId}" initialized:`, initResult);
+    log.info("runtime_initialized", { runtimeProfileId, initResult });
 
     runtimeAgents.set(runtimeProfileId, { profile, agent });
   }
@@ -241,10 +259,11 @@ export const startGateway = async (configPath?: string) => {
         && !hasExplicitAlias
         && modelSelection.requested === modelSelection.resolved
       ) {
-        console.warn(
-          `[nexus] Ambiguous model alias "${modelSelection.requested}" for runtime "${runtimeId}". `
-          + "Consider setting config.modelAliases to a pinned model ID for reproducibility.",
-        );
+        log.warn("ambiguous_model_alias", {
+          runtimeId,
+          requestedModel: modelSelection.requested,
+          suggestion: "Set config.modelAliases to a pinned model ID for reproducibility.",
+        });
       }
 
       // Ask the agent to create a session — it returns the actual sessionId
@@ -262,10 +281,12 @@ export const startGateway = async (configPath?: string) => {
       } catch (error) {
         modelParamAccepted = false;
         const message = error instanceof Error ? error.message : String(error);
-        console.warn(
-          `[nexus] Runtime "${runtimeId}" rejected session/new with model="${modelSelection.resolved}" `
-          + `(requested="${modelSelection.requested}"). Retrying without model. Error: ${message}`,
-        );
+        log.warn("runtime_rejected_session_new_model_retrying_without_model", {
+          runtimeId,
+          requestedModel: modelSelection.requested,
+          resolvedModel: modelSelection.resolved,
+          error: message,
+        });
         result = await runtime.agent.rpc.sendRequest("session/new", baseSessionParams) as { sessionId: string; model?: string };
       }
 
@@ -277,10 +298,15 @@ export const startGateway = async (configPath?: string) => {
         : `, resolvedModel=${modelSelection.resolved}`;
       const runtimeNote = runtimeReportedModel ? `, runtimeModel=${runtimeReportedModel}` : ", runtimeModel=not-reported";
       const modelParamNote = modelParamAccepted ? ", modelParam=accepted-or-ignored" : ", modelParam=rejected";
-      console.log(
-        `[nexus] ACP session created: ${acpSessionId} `
-        + `(gateway: ${gatewaySessionId}, runtime: ${runtimeId}, requestedModel=${modelSelection.requested}${resolutionNote}${runtimeNote}${modelParamNote})`,
-      );
+      log.info("acp_session_created", {
+        acpSessionId,
+        gatewaySessionId,
+        runtimeId,
+        requestedModel: modelSelection.requested,
+        resolutionNote,
+        runtimeNote,
+        modelParamNote,
+      });
 
       const session = createAcpSession(runtime.agent.rpc, acpSessionId, gatewaySessionId, {
         policyEvaluator: (tool, params) => evaluatePolicy(policyConfig, tool, params),
@@ -310,19 +336,22 @@ export const startGateway = async (configPath?: string) => {
   });
 
   const { port } = await server.start();
-  console.log(`[nexus] Gateway listening on ${config.host}:${port}`);
-  console.log(`[nexus] Connect via: ws://${config.host}:${port}/ws?token=${config.auth.token}`);
+  log.info("gateway_listening", { host: config.host, port });
+  const connectUrl = `ws://${config.host}:${port}/ws?token=${config.auth.token}`;
+  log.info("connect_via", { url: connectUrl });
+  // Keep a human-friendly line for terminal workflows and docs that parse this exact prefix.
+  console.log(`[nexus] Connect via: ${connectUrl}`);
 
   // Graceful shutdown
   const shutdown = async () => {
-    console.log(`\n[nexus] Shutting down...`);
+    log.info("gateway_shutdown_start");
     await server.stop();
     for (const [runtimeProfileId, runtime] of runtimeAgents) {
-      console.log(`[nexus] Stopping runtime "${runtimeProfileId}"...`);
+      log.info("runtime_stopping", { runtimeProfileId });
       await runtime.agent.kill();
     }
     stateStore.close();
-    console.log(`[nexus] Goodbye.`);
+    log.info("gateway_shutdown_complete");
     process.exit(0);
   };
 

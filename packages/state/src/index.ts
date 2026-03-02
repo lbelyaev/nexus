@@ -3,3 +3,4 @@ export * from "./store.js";
 export * from "./migrations.js";
 export * from "./sessions.js";
 export * from "./audit.js";
+export * from "./transcript.js";

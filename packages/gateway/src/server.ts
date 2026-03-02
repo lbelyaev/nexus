@@ -3,6 +3,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { parseClientMessage, type GatewayEvent } from "@nexus/types";
 import { validateToken } from "./auth.js";
 import type { Router } from "./router.js";
+import { createLogger } from "./logger.js";
 
 export interface GatewayServer {
   start: () => Promise<{ port: number }>;
@@ -16,6 +17,7 @@ export const createGatewayServer = (deps: {
   router: Router;
 }): GatewayServer => {
   const { port, host, token, router } = deps;
+  const log = createLogger("gateway.server");
 
   const httpServer = createServer(
     (req: IncomingMessage, res: ServerResponse) => {
@@ -36,6 +38,9 @@ export const createGatewayServer = (deps: {
     const providedToken = url.searchParams.get("token");
 
     if (!validateToken(providedToken, token)) {
+      log.warn("ws_upgrade_rejected_invalid_token", {
+        remoteAddress: req.socket.remoteAddress ?? null,
+      });
       socket.destroy();
       return;
     }
@@ -46,30 +51,43 @@ export const createGatewayServer = (deps: {
   });
 
   wss.on("connection", (ws: WebSocket) => {
+    const connectionId = `conn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const emit = (event: GatewayEvent) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(event));
+      }
+    };
+
+    log.info("ws_connected", { connectionId });
+
     ws.on("message", (data: Buffer | string) => {
       const raw = typeof data === "string" ? data : data.toString();
-      console.log(`[ws] Received: ${raw.slice(0, 200)}`);
+      log.debug("ws_message_received", {
+        connectionId,
+        preview: raw.slice(0, 200),
+      });
 
       let msg;
       try {
         msg = parseClientMessage(raw);
       } catch (err) {
-        console.log(`[ws] Parse error: ${err instanceof Error ? err.message : err}`);
+        log.warn("ws_message_parse_error", {
+          connectionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
         const errorEvent: GatewayEvent = {
           type: "error",
           sessionId: "",
           message: `Invalid message: ${raw.slice(0, 200)}`,
         };
-        ws.send(JSON.stringify(errorEvent));
+        emit(errorEvent);
         return;
       }
-
-      const emit = (event: GatewayEvent) => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify(event));
-        }
-      };
       router.handleMessage(msg, emit);
+    });
+
+    ws.on("close", () => {
+      log.info("ws_disconnected", { connectionId });
     });
   });
 

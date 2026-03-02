@@ -25,5 +25,18 @@ export const initDatabase = (db: DatabaseAdapter): void => {
 
     CREATE INDEX IF NOT EXISTS idx_audit_events_sessionId ON audit_events(sessionId);
     CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
+
+    CREATE TABLE IF NOT EXISTS transcript_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      sessionId TEXT NOT NULL,
+      role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      toolName TEXT,
+      toolCallId TEXT,
+      timestamp TEXT NOT NULL,
+      tokenEstimate INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_transcript_sessionId ON transcript_messages(sessionId);
   `);
 };

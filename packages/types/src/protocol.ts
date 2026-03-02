@@ -1,5 +1,8 @@
 // Client ↔ Gateway protocol types
 
+import type { TranscriptMessage } from "./memory.js";
+import { isTranscriptMessage } from "./memory.js";
+
 export interface SessionInfo {
   id: string;
   status: "active" | "idle";
@@ -19,7 +22,8 @@ export type ClientMessage =
   | { type: "approval_response"; requestId: string; allow?: boolean; optionId?: string }
   | { type: "cancel"; sessionId: string }
   | { type: "session_new"; runtimeId?: string; model?: string }
-  | { type: "session_list" };
+  | { type: "session_list" }
+  | { type: "session_replay"; sessionId: string };
 
 export type GatewayEvent =
   | { type: "text_delta"; sessionId: string; delta: string }
@@ -46,7 +50,8 @@ export type GatewayEvent =
       modelCatalog?: Record<string, string[]>;
       runtimeDefaults?: Record<string, string>;
     }
-  | { type: "session_list"; sessions: SessionInfo[] };
+  | { type: "session_list"; sessions: SessionInfo[] }
+  | { type: "transcript"; sessionId: string; messages: TranscriptMessage[] };
 
 const CLIENT_MESSAGE_TYPES = new Set([
   "prompt",
@@ -54,6 +59,7 @@ const CLIENT_MESSAGE_TYPES = new Set([
   "cancel",
   "session_new",
   "session_list",
+  "session_replay",
 ]);
 
 const GATEWAY_EVENT_TYPES = new Set([
@@ -66,6 +72,7 @@ const GATEWAY_EVENT_TYPES = new Set([
   "error",
   "session_created",
   "session_list",
+  "transcript",
 ]);
 
 const isStringRecord = (value: unknown): value is Record<string, string> => (
@@ -104,6 +111,8 @@ export const isClientMessage = (value: unknown): value is ClientMessage => {
       );
     case "session_list":
       return true;
+    case "session_replay":
+      return typeof obj.sessionId === "string";
     default:
       return false;
   }
@@ -160,6 +169,12 @@ export const isGatewayEvent = (value: unknown): value is GatewayEvent => {
       );
     case "session_list":
       return Array.isArray(obj.sessions);
+    case "transcript":
+      return (
+        typeof obj.sessionId === "string"
+        && Array.isArray(obj.messages)
+        && obj.messages.every((message) => isTranscriptMessage(message))
+      );
     default:
       return false;
   }
