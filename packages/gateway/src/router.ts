@@ -8,8 +8,21 @@ import type { AcpSession } from "@nexus/acp-bridge";
 
 export type EventEmitter = (event: GatewayEvent) => void;
 
+export interface ManagedAcpSession extends AcpSession {
+  runtimeId: string;
+  model: string;
+  modelRouting?: Record<string, string>;
+  modelAliases?: Record<string, string>;
+  modelCatalog?: Record<string, string[]>;
+  runtimeDefaults?: Record<string, string>;
+}
+
 export interface RouterDeps {
-  createAcpSession: (onEvent: EventEmitter) => Promise<AcpSession>;
+  createAcpSession: (
+    runtimeId: string | undefined,
+    model: string | undefined,
+    onEvent: EventEmitter,
+  ) => Promise<ManagedAcpSession>;
   stateStore: StateStore;
   policyConfig: PolicyConfig;
 }
@@ -20,30 +33,39 @@ export interface Router {
 
 export const createRouter = (deps: RouterDeps): Router => {
   const { createAcpSession, stateStore, policyConfig } = deps;
-  const sessions = new Map<string, AcpSession>();
+  const sessions = new Map<string, ManagedAcpSession>();
 
   const handleSessionNew = (
     msg: Extract<ClientMessage, { type: "session_new" }>,
     emit: EventEmitter,
   ): void => {
-    createAcpSession(emit).then(
+    createAcpSession(msg.runtimeId, msg.model, emit).then(
       (acpSession) => {
         const sessionId = acpSession.id;
         const now = new Date().toISOString();
 
         stateStore.createSession({
           id: sessionId,
-          runtimeId: msg.runtimeId ?? "default",
+          runtimeId: acpSession.runtimeId,
           acpSessionId: acpSession.acpSessionId,
           status: "active",
           createdAt: now,
           lastActivityAt: now,
           tokenUsage: { input: 0, output: 0 },
-          model: "claude",
+          model: acpSession.model,
         });
 
         sessions.set(sessionId, acpSession);
-        emit({ type: "session_created", sessionId, model: "claude" });
+        emit({
+          type: "session_created",
+          sessionId,
+          model: acpSession.model,
+          runtimeId: acpSession.runtimeId,
+          modelRouting: acpSession.modelRouting,
+          modelAliases: acpSession.modelAliases,
+          modelCatalog: acpSession.modelCatalog,
+          runtimeDefaults: acpSession.runtimeDefaults,
+        });
       },
       (err: unknown) => {
         emit({
@@ -146,12 +168,6 @@ export const createRouter = (deps: RouterDeps): Router => {
     }
 
     session.cancel();
-
-    emit({
-      type: "turn_end",
-      sessionId: msg.sessionId,
-      stopReason: "cancelled",
-    });
   };
 
   const handleApprovalResponse = (

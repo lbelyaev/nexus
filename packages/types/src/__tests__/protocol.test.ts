@@ -19,6 +19,7 @@ describe("isClientMessage", () => {
   it("validates a session_new message", () => {
     expect(isClientMessage({ type: "session_new" })).toBe(true);
     expect(isClientMessage({ type: "session_new", runtimeId: "claude-code" })).toBe(true);
+    expect(isClientMessage({ type: "session_new", runtimeId: "claude", model: "sonnet" })).toBe(true);
   });
 
   it("validates a session_list message", () => {
@@ -96,6 +97,17 @@ describe("isGatewayEvent", () => {
 
   it("validates session_created", () => {
     expect(isGatewayEvent({ type: "session_created", sessionId: "s1", model: "claude-4" })).toBe(true);
+    expect(isGatewayEvent({ type: "session_created", sessionId: "s1", model: "sonnet", runtimeId: "claude" })).toBe(true);
+    expect(isGatewayEvent({
+      type: "session_created",
+      sessionId: "s1",
+      model: "gpt-5.2-codex",
+      runtimeId: "codex",
+      modelRouting: { "gpt-5": "codex" },
+      modelAliases: { fast: "gpt-5.2-codex-mini" },
+      modelCatalog: { codex: ["gpt-5.2-codex", "gpt-5.3-codex"] },
+      runtimeDefaults: { codex: "gpt-5.2-codex" },
+    })).toBe(true);
   });
 
   it("validates session_list", () => {

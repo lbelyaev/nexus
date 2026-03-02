@@ -3,14 +3,14 @@
 ## What is Nexus?
 
 Nexus is a lightweight, modular AI agent gateway. It proves the full chain:
-**User -> TUI -> WebSocket -> Gateway -> ACP -> Claude Code** with real-time streaming and approval mediation.
+**User -> TUI -> WebSocket -> Gateway -> ACP -> Agent Runtime** with real-time streaming and approval mediation.
 
 ## Quick Start
 
 ```bash
 bun install          # install all deps
-bun run build        # build all 7 packages
-bun run test         # run all tests (~190 across 7 packages)
+bun run build        # build all packages
+bun run test         # run all tests
 bun run test:coverage # run all tests with coverage
 bun run typecheck    # typecheck without emitting
 ```
@@ -18,14 +18,50 @@ bun run typecheck    # typecheck without emitting
 ### Run the gateway
 
 ```bash
-bun run --filter=@nexus/gateway dev
+bun run gateway:dev:claude
+```
+
+### Run the gateway with Codex
+
+```bash
+bun run gateway:dev:codex
+```
+
+### Run the gateway with runtime registry (Claude + Codex)
+
+```bash
+bun run gateway:dev:multi
+```
+
+If you're in `packages/gateway`, use:
+
+```bash
+bun run dev:multi
 ```
 
 ### Run the TUI
 
 ```bash
-NEXUS_TOKEN=<token from gateway output> bun run --filter=@nexus/tui dev
+NEXUS_TOKEN=<token from gateway output> bun run tui:dev
 ```
+
+### Run the headless CLI
+
+```bash
+NEXUS_TOKEN=<token from gateway output> bun run cli:dev -- --prompt "hello"
+```
+
+TUI control commands:
+- `/runtime <id>` sets default runtime and creates a new session
+- `/model <name>` sets model label, applies model→runtime routing, and creates a new session
+- `/models` lists runtime defaults, model catalog, and known aliases
+- `/alias <nickname> <model-id>` adds a local TUI nickname for model selection
+- `/status` prints current connection/session/runtime/model and live counters
+
+Model selection notes:
+- `modelRouting` decides which runtime handles a model alias.
+- `modelAliases` resolves aliases (for example `gpt-5`) to pinned provider IDs for reproducibility.
+- `modelCatalog` feeds `/models` and is configured per runtime.
 
 ## Project Structure
 
@@ -33,6 +69,8 @@ NEXUS_TOKEN=<token from gateway output> bun run --filter=@nexus/tui dev
 nexus/
 ├── config/                     # Runtime configuration
 │   ├── nexus.default.json      # Gateway config (port, auth, runtime command)
+│   ├── nexus.multi.json        # Runtime registry config (claude + codex)
+│   ├── nexus.codex.json        # Gateway config for Codex ACP runtime
 │   └── policy.default.json     # Tool approval policy rules
 ├── docs/                       # Architecture docs & plans
 └── packages/
@@ -42,7 +80,8 @@ nexus/
     ├── acp-bridge/             # ACP client, NDJSON stream, subprocess manager
     ├── gateway/                # WS server, router, auth, orchestration
     ├── client-core/            # React hooks (useConnection, useSession, useApproval)
-    └── tui/                    # Terminal UI (Ink 5 + React 18)
+    ├── tui/                    # Terminal UI (Ink 5 + React 18)
+    └── cli/                    # Headless WS client for automation
 ```
 
 ## Dependency Graph
@@ -54,6 +93,7 @@ types (zero deps)
   ├── acp-bridge
   ├── client-core (+react)
   │     └── tui (+ink)
+  ├── cli (+ws)
   └── gateway (+ws, policy, state, acp-bridge)
 ```
 
@@ -93,6 +133,7 @@ JSON-RPC 2.0 per the [Agent Client Protocol](https://agentclientprotocol.com) sp
 Key ACP shapes:
 - `initialize`: `{ protocolVersion: 1, clientCapabilities: {} }`
 - `session/new`: `{ cwd: string, mcpServers: [] }` → returns `{ sessionId }`
+- `session/new`: gateway also sends `model` when selected/resolved
 - `session/prompt`: `{ sessionId, prompt: ContentBlock[] }` where ContentBlock is `{ type: "text", text }`
 - `session/update`: `{ sessionId, update: { sessionUpdate: "agent_message_chunk"|"tool_call"|"tool_call_update", ... } }`
 - `session/request_permission`: `{ sessionId, toolCall, options }` → response: `{ outcome: { outcome: "selected", optionId } }`

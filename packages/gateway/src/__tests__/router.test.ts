@@ -1,12 +1,17 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createStateStore, type StateStore } from "@nexus/state";
-import type { AcpSession } from "@nexus/acp-bridge";
 import type { PolicyConfig, GatewayEvent, ClientMessage } from "@nexus/types";
-import { createRouter, type Router, type EventEmitter } from "../router.js";
+import { createRouter, type Router, type EventEmitter, type ManagedAcpSession } from "../router.js";
 
-const mockAcpSession = (): AcpSession => ({
+const mockAcpSession = (): ManagedAcpSession => ({
   id: "gw-session-1",
   acpSessionId: "acp-session-1",
+  runtimeId: "default",
+  model: "claude",
+  modelRouting: { sonnet: "claude", "gpt-5": "codex" },
+  modelAliases: { fast: "gpt-5.2-codex-mini" },
+  modelCatalog: { codex: ["gpt-5.2-codex", "gpt-5.3-codex"], claude: ["sonnet"] },
+  runtimeDefaults: { codex: "gpt-5.2-codex", claude: "sonnet" },
   prompt: vi.fn().mockResolvedValue(undefined),
   respondToPermission: vi.fn().mockReturnValue(true),
   cancel: vi.fn(),
@@ -22,7 +27,8 @@ const collectEvents = (): { emit: EventEmitter; events: GatewayEvent[] } => {
 describe("createRouter", () => {
   let stateStore: StateStore;
   let router: Router;
-  let acpSession: AcpSession;
+  let acpSession: ManagedAcpSession;
+  let createAcpSessionMock: ReturnType<typeof vi.fn>;
   const policyConfig: PolicyConfig = {
     rules: [{ tool: "*", action: "allow" }],
   };
@@ -30,8 +36,9 @@ describe("createRouter", () => {
   beforeEach(() => {
     stateStore = createStateStore(":memory:");
     acpSession = mockAcpSession();
+    createAcpSessionMock = vi.fn(async (_runtimeId, _model, _onEvent: EventEmitter) => acpSession);
     router = createRouter({
-      createAcpSession: async (_onEvent: EventEmitter) => acpSession,
+      createAcpSession: createAcpSessionMock,
       stateStore,
       policyConfig,
     });
@@ -55,12 +62,28 @@ describe("createRouter", () => {
     if (event.type === "session_created") {
       expect(event.sessionId).toBeDefined();
       expect(typeof event.sessionId).toBe("string");
-      expect(event.model).toBeDefined();
+      expect(event.model).toBe("claude");
+      expect(event.runtimeId).toBe("default");
+      expect(event.modelRouting?.sonnet).toBe("claude");
+      expect(event.modelAliases?.fast).toBe("gpt-5.2-codex-mini");
+      expect(event.modelCatalog?.codex).toContain("gpt-5.3-codex");
+      expect(event.runtimeDefaults?.claude).toBe("sonnet");
 
       const stored = stateStore.getSession(event.sessionId);
       expect(stored).not.toBeNull();
       expect(stored!.status).toBe("active");
     }
+  });
+
+  it("session_new forwards requested runtimeId and model", async () => {
+    const { emit, events } = collectEvents();
+    router.handleMessage({ type: "session_new", runtimeId: "codex", model: "gpt-5" }, emit);
+
+    await vi.waitFor(() => {
+      expect(events).toHaveLength(1);
+    });
+
+    expect(createAcpSessionMock).toHaveBeenCalledWith("codex", "gpt-5", emit);
   });
 
   it("prompt emits error event if sessionId not found", () => {
@@ -191,6 +214,8 @@ describe("createRouter", () => {
     router.handleMessage({ type: "cancel", sessionId }, emit);
 
     expect(acpSession.cancel).toHaveBeenCalled();
+    expect(events).toHaveLength(1);
+    expect(events[0].type).toBe("session_created");
   });
 
   it("approval_response forwards to session.respondToPermission", async () => {

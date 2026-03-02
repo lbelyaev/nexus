@@ -10,6 +10,8 @@ describe("useSession", () => {
     const { result } = renderHook(() => useSession(sendMessage));
 
     expect(result.current.sessionId).toBeNull();
+    expect(result.current.sessionModel).toBeNull();
+    expect(result.current.sessionRuntimeId).toBeNull();
     expect(result.current.responseText).toBe("");
     expect(result.current.isStreaming).toBe(false);
     expect(result.current.activeTools).toEqual([]);
@@ -29,6 +31,8 @@ describe("useSession", () => {
     });
 
     expect(result.current.sessionId).toBe("sess-123");
+    expect(result.current.sessionModel).toBe("claude-4");
+    expect(result.current.sessionRuntimeId).toBeNull();
   });
 
   it("accumulates text_delta into responseText", () => {
@@ -297,5 +301,246 @@ describe("useSession", () => {
       type: "cancel",
       sessionId: "sess-1",
     });
+  });
+
+  it("steer while idle sends a prompt immediately", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_created",
+        sessionId: "sess-1",
+        model: "claude-4",
+      });
+    });
+
+    act(() => {
+      result.current.steer("focus on package-level tests");
+    });
+
+    expect(sendMessage).toHaveBeenCalledWith({
+      type: "prompt",
+      sessionId: "sess-1",
+      text: "focus on package-level tests",
+    });
+    expect(result.current.isStreaming).toBe(true);
+  });
+
+  it("steer while streaming cancels and auto-prompts on turn_end", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_created",
+        sessionId: "sess-1",
+        model: "claude-4",
+      });
+    });
+
+    act(() => {
+      result.current.sendPrompt("first run");
+    });
+    sendMessage.mockClear();
+
+    act(() => {
+      result.current.handleEvent({
+        type: "text_delta",
+        sessionId: "sess-1",
+        delta: "partial",
+      });
+      result.current.handleEvent({
+        type: "tool_start",
+        sessionId: "sess-1",
+        tool: "Bash",
+        params: { command: "sleep 1" },
+      });
+    });
+
+    act(() => {
+      result.current.steer("new direction");
+    });
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledWith({
+      type: "cancel",
+      sessionId: "sess-1",
+    });
+
+    act(() => {
+      result.current.handleEvent({
+        type: "turn_end",
+        sessionId: "sess-1",
+        stopReason: "cancelled",
+      });
+    });
+
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+    expect(sendMessage).toHaveBeenNthCalledWith(2, {
+      type: "prompt",
+      sessionId: "sess-1",
+      text: "new direction",
+    });
+    expect(result.current.responseText).toBe("");
+    expect(result.current.activeTools).toEqual([]);
+    expect(result.current.toolCalls).toEqual([]);
+    expect(result.current.isStreaming).toBe(true);
+  });
+
+  it("latest steer replaces queued steer and does not send duplicate cancel", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_created",
+        sessionId: "sess-1",
+        model: "claude-4",
+      });
+    });
+
+    act(() => {
+      result.current.sendPrompt("first run");
+    });
+    sendMessage.mockClear();
+
+    act(() => {
+      result.current.steer("first steer");
+      result.current.steer("second steer");
+    });
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).toHaveBeenCalledWith({
+      type: "cancel",
+      sessionId: "sess-1",
+    });
+
+    act(() => {
+      result.current.handleEvent({
+        type: "turn_end",
+        sessionId: "sess-1",
+        stopReason: "cancelled",
+      });
+    });
+
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+    expect(sendMessage).toHaveBeenNthCalledWith(2, {
+      type: "prompt",
+      sessionId: "sess-1",
+      text: "second steer",
+    });
+  });
+
+  it("manual cancel clears queued steer", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_created",
+        sessionId: "sess-1",
+        model: "claude-4",
+      });
+    });
+
+    act(() => {
+      result.current.sendPrompt("first run");
+    });
+    sendMessage.mockClear();
+
+    act(() => {
+      result.current.steer("new direction");
+    });
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      result.current.cancel();
+    });
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+    expect(sendMessage).toHaveBeenNthCalledWith(2, {
+      type: "cancel",
+      sessionId: "sess-1",
+    });
+
+    act(() => {
+      result.current.handleEvent({
+        type: "turn_end",
+        sessionId: "sess-1",
+        stopReason: "cancelled",
+      });
+    });
+
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores stale cancelled turn_end after steer reprompt", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_created",
+        sessionId: "sess-1",
+        model: "claude-4",
+      });
+    });
+
+    act(() => {
+      result.current.sendPrompt("first run");
+    });
+    sendMessage.mockClear();
+
+    act(() => {
+      result.current.steer("second run");
+    });
+    expect(sendMessage).toHaveBeenCalledWith({
+      type: "cancel",
+      sessionId: "sess-1",
+    });
+
+    // Cancelled turn from first run ends and triggers steer reprompt.
+    act(() => {
+      result.current.handleEvent({
+        type: "turn_end",
+        sessionId: "sess-1",
+        stopReason: "cancelled",
+      });
+    });
+    expect(sendMessage).toHaveBeenNthCalledWith(2, {
+      type: "prompt",
+      sessionId: "sess-1",
+      text: "second run",
+    });
+    expect(result.current.isStreaming).toBe(true);
+
+    // Stale duplicate cancelled completion should not stop current streaming turn.
+    act(() => {
+      result.current.handleEvent({
+        type: "turn_end",
+        sessionId: "sess-1",
+        stopReason: "cancelled",
+      });
+    });
+    expect(result.current.isStreaming).toBe(true);
+
+    // Current turn still renders output.
+    act(() => {
+      result.current.handleEvent({
+        type: "text_delta",
+        sessionId: "sess-1",
+        delta: "new output",
+      });
+    });
+    expect(result.current.responseText).toBe("new output");
+
+    act(() => {
+      result.current.handleEvent({
+        type: "turn_end",
+        sessionId: "sess-1",
+        stopReason: "end_turn",
+      });
+    });
+    expect(result.current.isStreaming).toBe(false);
   });
 });

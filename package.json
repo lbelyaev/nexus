@@ -9,6 +9,11 @@
     "test:coverage": "turbo run test -- --coverage",
     "test:watch": "turbo run test:watch",
     "dev": "turbo run dev",
+    "gateway:dev:claude": "NEXUS_CONFIG=../../config/nexus.default.json bun run --filter=@nexus/gateway dev",
+    "gateway:dev:multi": "NEXUS_CONFIG=../../config/nexus.multi.json bun run --filter=@nexus/gateway dev",
+    "gateway:dev:codex": "NEXUS_CONFIG=../../config/nexus.codex.json bun run --filter=@nexus/gateway dev",
+    "cli:dev": "bun run --filter=@nexus/cli dev",
+    "tui:dev": "bun run --filter=@nexus/tui dev",
     "lint": "turbo run lint",
     "typecheck": "turbo run typecheck"
   },

@@ -5,14 +5,28 @@ export interface InputProps {
   onSubmit: (text: string) => void;
   isDisabled: boolean;
   isFocused?: boolean;
+  onCancel?: () => void;
+  canCancel?: boolean;
 }
 
-export const Input = ({ onSubmit, isDisabled, isFocused = true }: InputProps) => {
+export const Input = ({
+  onSubmit,
+  isDisabled,
+  isFocused = true,
+  onCancel,
+  canCancel = false,
+}: InputProps) => {
   const [value, setValue] = useState("");
   const { isRawModeSupported } = useStdin();
 
   useInput(
     (input, key) => {
+      if (key.escape && canCancel && onCancel) {
+        onCancel();
+        setValue("");
+        return;
+      }
+
       if (isDisabled) return;
 
       if (key.return) {

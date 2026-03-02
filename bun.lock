@@ -22,6 +22,22 @@
         "vitest": "^3",
       },
     },
+    "packages/cli": {
+      "name": "@nexus/cli",
+      "version": "0.0.1",
+      "bin": {
+        "nexus-cli": "dist/main.js",
+      },
+      "dependencies": {
+        "@nexus/types": "workspace:*",
+        "ws": "^8",
+      },
+      "devDependencies": {
+        "@types/ws": "^8",
+        "typescript": "^5.7",
+        "vitest": "^3",
+      },
+    },
     "packages/client-core": {
       "name": "@nexus/client-core",
       "version": "0.0.1",
@@ -240,6 +256,8 @@
     "@jridgewell/trace-mapping": ["@jridgewell/trace-mapping@0.3.31", "", { "dependencies": { "@jridgewell/resolve-uri": "^3.1.0", "@jridgewell/sourcemap-codec": "^1.4.14" } }, "sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw=="],
 
     "@nexus/acp-bridge": ["@nexus/acp-bridge@workspace:packages/acp-bridge"],
+
+    "@nexus/cli": ["@nexus/cli@workspace:packages/cli"],
 
     "@nexus/client-core": ["@nexus/client-core@workspace:packages/client-core"],
 

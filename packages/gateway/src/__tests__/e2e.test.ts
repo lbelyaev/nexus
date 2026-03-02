@@ -1,16 +1,17 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import WebSocket from "ws";
 import { createGatewayServer, type GatewayServer } from "../server.js";
-import { createRouter, type Router, type EventEmitter } from "../router.js";
+import { createRouter, type EventEmitter, type ManagedAcpSession } from "../router.js";
 import { createStateStore, type StateStore } from "@nexus/state";
-import type { AcpSession } from "@nexus/acp-bridge";
 import type { PolicyConfig, GatewayEvent } from "@nexus/types";
 
 const TEST_TOKEN = "e2e-test-token-xyz";
 
-const createMockAcpSession = (id: string): AcpSession => ({
+const createMockAcpSession = (id: string): ManagedAcpSession => ({
   id,
   acpSessionId: `acp-${id}`,
+  runtimeId: "default",
+  model: "claude",
   prompt: vi.fn().mockResolvedValue({ text: "mock response" }),
   respondToPermission: vi.fn().mockReturnValue(true),
   cancel: vi.fn(),
@@ -68,7 +69,7 @@ describe("E2E: WS client -> Gateway -> mock ACP session -> events back", () => {
     stateStore = createStateStore(":memory:");
 
     const router = createRouter({
-      createAcpSession: async (_onEvent: EventEmitter) => {
+      createAcpSession: async (_runtimeId, _model, _onEvent: EventEmitter) => {
         sessionCounter += 1;
         return createMockAcpSession(`gw-session-${sessionCounter}`);
       },

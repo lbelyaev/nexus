@@ -34,7 +34,7 @@ describe("loadConfig", () => {
     expect(config.port).toBe(9999);
     expect(config.host).toBe("0.0.0.0");
     expect(config.auth.token).toBe("abc123");
-    expect(config.runtime.command).toEqual(["node", "agent.js"]);
+    expect(config.runtime?.command).toEqual(["node", "agent.js"]);
     expect(config.dataDir).toBe("/tmp/data");
   });
 
@@ -78,6 +78,137 @@ describe("loadConfig", () => {
       }),
     );
 
-    expect(() => loadConfig(configPath)).toThrow(/runtime\.command/);
+    expect(() => loadConfig(configPath)).toThrow(/runtime|runtimes/);
+  });
+
+  it("supports runtime registry with defaultRuntimeId", () => {
+    const configPath = join(tmpDir, "nexus.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        auth: { token: "mytoken" },
+        defaultRuntimeId: "codex",
+        runtimes: {
+          claude: { command: ["npx", "@zed-industries/claude-agent-acp"] },
+          codex: { command: ["npx", "@zed-industries/codex-acp"] },
+        },
+      }),
+    );
+
+    const config = loadConfig(configPath);
+    expect(config.runtimes?.claude?.command).toEqual(["npx", "@zed-industries/claude-agent-acp"]);
+    expect(config.runtimes?.codex?.command).toEqual(["npx", "@zed-industries/codex-acp"]);
+    expect(config.defaultRuntimeId).toBe("codex");
+  });
+
+  it("rejects invalid defaultRuntimeId for registry", () => {
+    const configPath = join(tmpDir, "nexus.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        auth: { token: "mytoken" },
+        defaultRuntimeId: "missing",
+        runtimes: {
+          claude: { command: ["npx", "@zed-industries/claude-agent-acp"] },
+        },
+      }),
+    );
+
+    expect(() => loadConfig(configPath)).toThrow(/defaultRuntimeId/);
+  });
+
+  it("supports modelRouting targeting runtime ids", () => {
+    const configPath = join(tmpDir, "nexus.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        auth: { token: "mytoken" },
+        runtimes: {
+          claude: { command: ["npx", "@zed-industries/claude-agent-acp"] },
+          codex: { command: ["npx", "@zed-industries/codex-acp"] },
+        },
+        modelRouting: {
+          sonnet: "claude",
+          "gpt-5": "codex",
+        },
+      }),
+    );
+
+    const config = loadConfig(configPath);
+    expect(config.modelRouting?.sonnet).toBe("claude");
+    expect(config.modelRouting?.["gpt-5"]).toBe("codex");
+  });
+
+  it("supports modelAliases for explicit model pinning", () => {
+    const configPath = join(tmpDir, "nexus.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        auth: { token: "mytoken" },
+        runtime: { command: ["npx", "@zed-industries/codex-acp"], defaultModel: "gpt-5" },
+        modelAliases: {
+          "gpt-5": "gpt-5-2026-02-15",
+        },
+      }),
+    );
+
+    const config = loadConfig(configPath);
+    expect(config.modelAliases?.["gpt-5"]).toBe("gpt-5-2026-02-15");
+  });
+
+  it("rejects invalid modelAliases entries", () => {
+    const configPath = join(tmpDir, "nexus.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        auth: { token: "mytoken" },
+        runtime: { command: ["npx", "@zed-industries/codex-acp"] },
+        modelAliases: {
+          "": "gpt-5-2026-02-15",
+        },
+      }),
+    );
+
+    expect(() => loadConfig(configPath)).toThrow(/modelAliases/);
+  });
+
+  it("supports modelCatalog per runtime", () => {
+    const configPath = join(tmpDir, "nexus.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        auth: { token: "mytoken" },
+        runtimes: {
+          claude: { command: ["npx", "@zed-industries/claude-agent-acp"] },
+          codex: { command: ["npx", "@zed-industries/codex-acp"] },
+        },
+        modelCatalog: {
+          claude: ["claude-opus-4-1-20250805", "claude-sonnet-4-20250514"],
+          codex: ["gpt-5.2-codex", "gpt-5.3-codex"],
+        },
+      }),
+    );
+
+    const config = loadConfig(configPath);
+    expect(config.modelCatalog?.claude).toContain("claude-opus-4-1-20250805");
+    expect(config.modelCatalog?.codex).toContain("gpt-5.3-codex");
+  });
+
+  it("rejects modelCatalog pointing to unknown runtime", () => {
+    const configPath = join(tmpDir, "nexus.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        auth: { token: "mytoken" },
+        runtimes: {
+          claude: { command: ["npx", "@zed-industries/claude-agent-acp"] },
+        },
+        modelCatalog: {
+          codex: ["gpt-5.2-codex"],
+        },
+      }),
+    );
+
+    expect(() => loadConfig(configPath)).toThrow(/modelCatalog/);
   });
 });

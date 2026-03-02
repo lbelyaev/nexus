@@ -18,7 +18,7 @@ export type ClientMessage =
   | { type: "prompt"; sessionId: string; text: string }
   | { type: "approval_response"; requestId: string; allow?: boolean; optionId?: string }
   | { type: "cancel"; sessionId: string }
-  | { type: "session_new"; runtimeId?: string }
+  | { type: "session_new"; runtimeId?: string; model?: string }
   | { type: "session_list" };
 
 export type GatewayEvent =
@@ -36,7 +36,16 @@ export type GatewayEvent =
     }
   | { type: "turn_end"; sessionId: string; stopReason: string }
   | { type: "error"; sessionId: string; message: string }
-  | { type: "session_created"; sessionId: string; model: string }
+  | {
+      type: "session_created";
+      sessionId: string;
+      model: string;
+      runtimeId?: string;
+      modelRouting?: Record<string, string>;
+      modelAliases?: Record<string, string>;
+      modelCatalog?: Record<string, string[]>;
+      runtimeDefaults?: Record<string, string>;
+    }
   | { type: "session_list"; sessions: SessionInfo[] };
 
 const CLIENT_MESSAGE_TYPES = new Set([
@@ -59,6 +68,20 @@ const GATEWAY_EVENT_TYPES = new Set([
   "session_list",
 ]);
 
+const isStringRecord = (value: unknown): value is Record<string, string> => (
+  typeof value === "object"
+  && value !== null
+  && Object.values(value as Record<string, unknown>).every((v) => typeof v === "string")
+);
+
+const isStringArrayRecord = (value: unknown): value is Record<string, string[]> => (
+  typeof value === "object"
+  && value !== null
+  && Object.values(value as Record<string, unknown>).every(
+    (v) => Array.isArray(v) && v.every((item) => typeof item === "string"),
+  )
+);
+
 export const isClientMessage = (value: unknown): value is ClientMessage => {
   if (typeof value !== "object" || value === null) return false;
   const obj = value as Record<string, unknown>;
@@ -75,7 +98,10 @@ export const isClientMessage = (value: unknown): value is ClientMessage => {
     case "cancel":
       return typeof obj.sessionId === "string";
     case "session_new":
-      return obj.runtimeId === undefined || typeof obj.runtimeId === "string";
+      return (
+        (obj.runtimeId === undefined || typeof obj.runtimeId === "string")
+        && (obj.model === undefined || typeof obj.model === "string")
+      );
     case "session_list":
       return true;
     default:
@@ -123,7 +149,15 @@ export const isGatewayEvent = (value: unknown): value is GatewayEvent => {
     case "error":
       return typeof obj.sessionId === "string" && typeof obj.message === "string";
     case "session_created":
-      return typeof obj.sessionId === "string" && typeof obj.model === "string";
+      return (
+        typeof obj.sessionId === "string"
+        && typeof obj.model === "string"
+        && (obj.runtimeId === undefined || typeof obj.runtimeId === "string")
+        && (obj.modelRouting === undefined || isStringRecord(obj.modelRouting))
+        && (obj.modelAliases === undefined || isStringRecord(obj.modelAliases))
+        && (obj.modelCatalog === undefined || isStringArrayRecord(obj.modelCatalog))
+        && (obj.runtimeDefaults === undefined || isStringRecord(obj.runtimeDefaults))
+      );
     case "session_list":
       return Array.isArray(obj.sessions);
     default:

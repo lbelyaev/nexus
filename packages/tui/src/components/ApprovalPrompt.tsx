@@ -7,6 +7,8 @@ export interface ApprovalPromptProps {
   onApprove: () => void;
   onApproveAll: () => void;
   onDeny: () => void;
+  onCancel?: () => void;
+  canCancel?: boolean;
 }
 
 export const ApprovalPrompt = ({
@@ -15,13 +17,19 @@ export const ApprovalPrompt = ({
   onApprove,
   onApproveAll,
   onDeny,
+  onCancel,
+  canCancel = false,
 }: ApprovalPromptProps) => {
   useInput(
-    (input) => {
-      const key = input.toLowerCase();
-      if (key === "y") onApprove();
-      if (key === "a") onApproveAll();
-      if (key === "n") onDeny();
+    (input, inputKey) => {
+      if (inputKey.escape && canCancel && onCancel) {
+        onCancel();
+        return;
+      }
+      const pressed = input.toLowerCase();
+      if (pressed === "y") onApprove();
+      if (pressed === "a") onApproveAll();
+      if (pressed === "n") onDeny();
     },
     { isActive: !!approval },
   );
@@ -37,7 +45,10 @@ export const ApprovalPrompt = ({
         Tool: <Text bold>{approval.tool}</Text>
       </Text>
       <Text>{approval.description}</Text>
-      <Text color="yellow">[y] approve  {totalPending > 1 ? <Text color="yellow">[a] approve all  </Text> : null}[n] reject</Text>
+      <Text color="yellow">
+        [y] approve  {totalPending > 1 ? <Text color="yellow">[a] approve all  </Text> : null}[n] reject
+        {canCancel ? <Text color="yellow">  [esc] cancel</Text> : null}
+      </Text>
     </Box>
   );
 };

@@ -52,6 +52,25 @@ describe("ApprovalPrompt", () => {
     expect(lastFrame()).toContain("3 pending");
   });
 
+  it("shows [esc] cancel when cancellation is enabled", () => {
+    const approval = {
+      requestId: "req-2",
+      tool: "delete_file",
+      description: "Delete temp.txt",
+    };
+    const { lastFrame } = render(
+      <ApprovalPrompt
+        approval={approval}
+        totalPending={3}
+        onApprove={noop}
+        onApproveAll={noop}
+        onDeny={noop}
+        canCancel={true}
+      />
+    );
+    expect(lastFrame()).toContain("[esc] cancel");
+  });
+
   it("hides [a] approve all when only one pending", () => {
     const approval = {
       requestId: "req-2",
@@ -107,5 +126,28 @@ describe("ApprovalPrompt", () => {
     await new Promise((r) => setTimeout(r, 0));
     stdin.write("n");
     expect(onDeny).toHaveBeenCalledOnce();
+  });
+
+  it("calls onCancel when esc is pressed", async () => {
+    const onCancel = vi.fn();
+    const approval = {
+      requestId: "req-6",
+      tool: "bash",
+      description: "Run long task",
+    };
+    const { stdin } = render(
+      <ApprovalPrompt
+        approval={approval}
+        totalPending={1}
+        onApprove={noop}
+        onApproveAll={noop}
+        onDeny={noop}
+        onCancel={onCancel}
+        canCancel={true}
+      />
+    );
+    await new Promise((r) => setTimeout(r, 0));
+    stdin.write("\u001B");
+    expect(onCancel).toHaveBeenCalledOnce();
   });
 });

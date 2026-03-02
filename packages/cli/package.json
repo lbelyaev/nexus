@@ -1,25 +1,22 @@
 {
-  "name": "@nexus/gateway",
+  "name": "@nexus/cli",
   "version": "0.0.1",
   "private": true,
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "nexus-cli": "dist/main.js"
+  },
   "scripts": {
     "build": "tsc",
     "test": "vitest run",
     "test:watch": "vitest watch",
     "dev": "bun run src/main.ts",
-    "dev:claude": "NEXUS_CONFIG=../../config/nexus.default.json bun run src/main.ts",
-    "dev:multi": "NEXUS_CONFIG=../../config/nexus.multi.json bun run src/main.ts",
-    "dev:codex": "NEXUS_CONFIG=../../config/nexus.codex.json bun run src/main.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@nexus/types": "workspace:*",
-    "@nexus/policy": "workspace:*",
-    "@nexus/state": "workspace:*",
-    "@nexus/acp-bridge": "workspace:*",
     "ws": "^8"
   },
   "devDependencies": {
