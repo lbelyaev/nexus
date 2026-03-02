@@ -1,5 +1,5 @@
 import React from "react";
-import { Box, Text } from "ink";
+import { Box, Static, Text } from "ink";
 import { MarkdownRenderer, type MarkdownRendererName } from "./MarkdownRenderer.js";
 
 export interface ChatMessage {
@@ -22,6 +22,28 @@ export interface ChatProps {
   markdownRenderer?: MarkdownRendererName;
 }
 
+const MessageRow = ({ msg, markdownRenderer }: { msg: ChatMessage; markdownRenderer: MarkdownRendererName }) => (
+  <Box>
+    {msg.role === "system" ? (
+      <Text color="yellow">{msg.text}</Text>
+    ) : msg.role === "assistant" ? (
+      <>
+        <Text bold color="green">
+          {"Assistant: "}
+        </Text>
+        <MarkdownRenderer text={msg.text} renderer={markdownRenderer} />
+      </>
+    ) : (
+      <>
+        <Text bold color="blue">
+          {"You: "}
+        </Text>
+        <Text>{msg.text}</Text>
+      </>
+    )}
+  </Box>
+);
+
 export const Chat = ({
   messages,
   streamingText,
@@ -31,27 +53,12 @@ export const Chat = ({
   markdownRenderer = "basic",
 }: ChatProps) => (
   <Box flexDirection="column">
-    {messages.map((msg, i) => (
-      <Box key={i}>
-        {msg.role === "system" ? (
-          <Text color="yellow">{msg.text}</Text>
-        ) : msg.role === "assistant" ? (
-          <>
-            <Text bold color="green">
-              {"Assistant: "}
-            </Text>
-            <MarkdownRenderer text={msg.text} renderer={markdownRenderer} />
-          </>
-        ) : (
-          <>
-            <Text bold color="blue">
-              {"You: "}
-            </Text>
-            <Text>{msg.text}</Text>
-          </>
-        )}
-      </Box>
-    ))}
+    {/* Finalized messages — Static tells Ink to render once and never re-diff */}
+    <Static items={messages}>
+      {(msg, i) => (
+        <MessageRow key={i} msg={msg} markdownRenderer={markdownRenderer} />
+      )}
+    </Static>
     {isStreaming && thinkingText && !streamingText && toolCalls.length === 0 && (
       <Box>
         <Text color="gray">{"  Thinking..."}</Text>

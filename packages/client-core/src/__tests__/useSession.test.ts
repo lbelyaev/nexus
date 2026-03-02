@@ -1,10 +1,25 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { renderHook, act } from "@testing-library/react";
 import { useSession } from "../useSession.js";
 import type { GatewayEvent } from "@nexus/types";
 
 describe("useSession", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** Advance timers to flush buffered text deltas */
+  const flushTextBuffers = () => {
+    act(() => {
+      vi.advanceTimersByTime(100);
+    });
+  };
+
   it("has correct initial state", () => {
     const sendMessage = vi.fn();
     const { result } = renderHook(() => useSession(sendMessage));
@@ -63,6 +78,7 @@ describe("useSession", () => {
       });
     });
 
+    flushTextBuffers();
     expect(result.current.responseText).toBe("Hello world!");
   });
 
@@ -88,6 +104,7 @@ describe("useSession", () => {
       });
     });
 
+    flushTextBuffers();
     expect(result.current.responseText).toBe("previous response");
 
     // Send new prompt
@@ -532,6 +549,7 @@ describe("useSession", () => {
         delta: "new output",
       });
     });
+    flushTextBuffers();
     expect(result.current.responseText).toBe("new output");
 
     act(() => {

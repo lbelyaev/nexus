@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import type { ClientMessage, GatewayEvent } from "@nexus/types";
 
 export interface ActiveTool {
@@ -77,9 +77,48 @@ export const useSession = (
   const queuedSteerRef = useRef<string | null>(null);
   const ignoreCancelledTurnEndRef = useRef(false);
 
+  // Buffer text/thinking deltas to reduce re-renders during fast streaming.
+  // Deltas accumulate in refs and flush to state every FLUSH_INTERVAL_MS.
+  const FLUSH_INTERVAL_MS = 50;
+  const textBufferRef = useRef("");
+  const thinkingBufferRef = useRef("");
+  const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const flushBuffers = useCallback(() => {
+    flushTimerRef.current = null;
+    if (textBufferRef.current) {
+      const chunk = textBufferRef.current;
+      textBufferRef.current = "";
+      setResponseText((prev) => prev + chunk);
+    }
+    if (thinkingBufferRef.current) {
+      const chunk = thinkingBufferRef.current;
+      thinkingBufferRef.current = "";
+      setThinkingText((prev) => prev + chunk);
+    }
+  }, []);
+
+  const scheduleFlush = useCallback(() => {
+    if (!flushTimerRef.current) {
+      flushTimerRef.current = setTimeout(flushBuffers, FLUSH_INTERVAL_MS);
+    }
+  }, [flushBuffers]);
+
+  // Clean up flush timer on unmount
+  useEffect(() => () => {
+    if (flushTimerRef.current) clearTimeout(flushTimerRef.current);
+  }, []);
+
   const sendPromptInternal = useCallback(
     (text: string) => {
       if (!sessionId) return;
+      // Clear buffers and state
+      textBufferRef.current = "";
+      thinkingBufferRef.current = "";
+      if (flushTimerRef.current) {
+        clearTimeout(flushTimerRef.current);
+        flushTimerRef.current = null;
+      }
       setResponseText("");
       setThinkingText("");
       setActiveTools([]);
@@ -104,11 +143,13 @@ export const useSession = (
         break;
       case "text_delta":
         ignoreCancelledTurnEndRef.current = false;
-        setResponseText((prev) => prev + event.delta);
+        textBufferRef.current += event.delta;
+        scheduleFlush();
         break;
       case "thinking_delta":
         ignoreCancelledTurnEndRef.current = false;
-        setThinkingText((prev) => prev + event.delta);
+        thinkingBufferRef.current += event.delta;
+        scheduleFlush();
         break;
       case "turn_end": {
         if (queuedSteerRef.current && sessionId && event.sessionId === sessionId) {
@@ -130,6 +171,12 @@ export const useSession = (
         }
 
         ignoreCancelledTurnEndRef.current = false;
+        // Flush any remaining buffered text before ending the turn
+        if (flushTimerRef.current) {
+          clearTimeout(flushTimerRef.current);
+          flushTimerRef.current = null;
+        }
+        flushBuffers();
         setIsStreaming(false);
         break;
       }
