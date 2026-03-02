@@ -1,0 +1,53 @@
+import { describe, it, expect } from "vitest";
+import { isTranscriptMessage } from "../memory.js";
+
+describe("isTranscriptMessage", () => {
+  const valid = {
+    id: 1,
+    sessionId: "sess-1",
+    role: "user",
+    content: "hello world",
+    timestamp: "2026-01-01T00:00:00Z",
+    tokenEstimate: 3,
+  };
+
+  it("validates a well-formed transcript message", () => {
+    expect(isTranscriptMessage(valid)).toBe(true);
+  });
+
+  it("validates all roles", () => {
+    for (const role of ["user", "assistant", "tool", "system"]) {
+      expect(isTranscriptMessage({ ...valid, role })).toBe(true);
+    }
+  });
+
+  it("accepts optional toolName and toolCallId", () => {
+    expect(isTranscriptMessage({ ...valid, role: "tool", toolName: "Read", toolCallId: "tc-1" })).toBe(true);
+  });
+
+  it("rejects invalid role", () => {
+    expect(isTranscriptMessage({ ...valid, role: "unknown" })).toBe(false);
+  });
+
+  it("rejects missing required fields", () => {
+    const { content, ...noContent } = valid;
+    expect(isTranscriptMessage(noContent)).toBe(false);
+
+    const { sessionId, ...noSession } = valid;
+    expect(isTranscriptMessage(noSession)).toBe(false);
+  });
+
+  it("rejects non-numeric id", () => {
+    expect(isTranscriptMessage({ ...valid, id: "not-a-number" })).toBe(false);
+  });
+
+  it("rejects non-numeric tokenEstimate", () => {
+    expect(isTranscriptMessage({ ...valid, tokenEstimate: "3" })).toBe(false);
+  });
+
+  it("rejects null and primitives", () => {
+    expect(isTranscriptMessage(null)).toBe(false);
+    expect(isTranscriptMessage("string")).toBe(false);
+    expect(isTranscriptMessage(42)).toBe(false);
+  });
+});
