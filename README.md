@@ -13,7 +13,7 @@ User -> TUI -> WebSocket -> Gateway -> ACP -> Agent Runtime (Claude/Codex)
 
 Traditional AI agent gateways tend toward monolithic designs — single-process god objects, inverted auth, tight coupling to specific runtimes. Nexus takes a different approach:
 
-- **Modular**: 7 focused packages, each with a single responsibility
+- **Modular**: 9 focused packages, each with a single responsibility
 - **Secure**: Token auth mandatory, policy-based tool approval, constant-time comparisons
 - **Pluggable**: Any ACP-compatible agent runtime works (Claude Code, Codex CLI, etc.)
 - **Streamable**: Real-time text deltas, tool status, and approval prompts over WebSocket
@@ -99,6 +99,7 @@ NEXUS_TOKEN=<token> bun run cli:dev
 | `@nexus/state` | SQLite session + audit store (runtime adapter) | types, bun:sqlite / better-sqlite3 |
 | `@nexus/acp-bridge` | ACP client, NDJSON streams, process management | types |
 | `@nexus/gateway` | WS server, message routing, auth, orchestration | all above + ws |
+| `@nexus/memory` | Pluggable memory provider interface + SQLite provider | state, types |
 | `@nexus/client-core` | React hooks for WS connection + sessions | types, react |
 | `@nexus/tui` | Terminal UI with Ink | client-core, ink, react |
 | `@nexus/cli` | Headless WebSocket client for automation/pipelines | types, ws |
@@ -180,6 +181,14 @@ Multi-runtime profile (`config/nexus.multi.json`):
   "modelCatalog": {
     "codex": ["gpt-5.2-codex", "gpt-5.3-codex"],
     "claude": ["claude-opus-4-1-20250805", "claude-sonnet-4-5-20250929"]
+  },
+  "memory": {
+    "enabled": true,
+    "provider": "sqlite",
+    "contextBudgetTokens": 1200,
+    "hotMessageCount": 8,
+    "warmSummaryCount": 4,
+    "coldFactCount": 8
   }
 }
 ```
@@ -203,6 +212,9 @@ Codex-only profile (`config/nexus.codex.json`):
 | `modelRouting.<model>` | Map model aliases to runtime IDs |
 | `modelAliases.<alias>` | Resolve model aliases to pinned provider model IDs |
 | `modelCatalog.<runtimeId>[]` | Models shown by `/models` in TUI |
+| `memory.enabled` | Enable/disable memory context system |
+| `memory.provider` | Memory provider ID (currently `sqlite`) |
+| `memory.*Count` / `memory.contextBudgetTokens` | Smart context retrieval/assembly tuning |
 | `runtime.cwd` | Working directory for the agent (optional) |
 | `dataDir` | SQLite database directory |
 

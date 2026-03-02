@@ -20,6 +20,11 @@ describe("createStateStore", () => {
     expect(typeof store.updateSession).toBe("function");
     expect(typeof store.logEvent).toBe("function");
     expect(typeof store.getEvents).toBe("function");
+    expect(typeof store.appendMessage).toBe("function");
+    expect(typeof store.getTranscript).toBe("function");
+    expect(typeof store.appendMemoryItem).toBe("function");
+    expect(typeof store.getMemoryItems).toBe("function");
+    expect(typeof store.searchMemory).toBe("function");
     expect(typeof store.close).toBe("function");
 
     store.close();

@@ -7,6 +7,18 @@ export interface RuntimeProfile {
   defaultModel?: string;
 }
 
+export interface MemoryConfig {
+  enabled?: boolean;
+  provider?: "sqlite";
+  contextBudgetTokens?: number;
+  hotMessageCount?: number;
+  warmSummaryCount?: number;
+  coldFactCount?: number;
+  maxFactsPerTurn?: number;
+  maxFactLength?: number;
+  summaryWindowMessages?: number;
+}
+
 export interface NexusConfig {
   port: number;
   host: string;
@@ -17,5 +29,6 @@ export interface NexusConfig {
   modelRouting?: Record<string, string>;
   modelAliases?: Record<string, string>;
   modelCatalog?: Record<string, string[]>;
+  memory?: MemoryConfig;
   dataDir: string;
 }

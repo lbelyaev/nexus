@@ -1,6 +1,6 @@
 import { readFileSync, existsSync } from "node:fs";
 import { resolve, dirname, join } from "node:path";
-import type { NexusConfig, RuntimeProfile } from "@nexus/types";
+import type { MemoryConfig, NexusConfig, RuntimeProfile } from "@nexus/types";
 import { generateToken } from "./auth.js";
 
 const DEFAULTS: Omit<NexusConfig, "runtime" | "auth"> & {
@@ -68,6 +68,7 @@ export const loadConfig = (configPath?: string): NexusConfig => {
     modelRouting: raw.modelRouting as Record<string, string> | undefined,
     modelAliases: raw.modelAliases as Record<string, string> | undefined,
     modelCatalog: raw.modelCatalog as Record<string, string[]> | undefined,
+    memory: raw.memory as MemoryConfig | undefined,
     dataDir: (raw.dataDir as string) ?? DEFAULTS.dataDir,
   };
 
@@ -137,6 +138,30 @@ export const loadConfig = (configPath?: string): NexusConfig => {
       if (!Array.isArray(models) || models.some((m) => typeof m !== "string" || !m.trim())) {
         throw new Error(`Invalid config: modelCatalog.${runtimeId} must be an array of non-empty strings`);
       }
+    }
+  }
+
+  if (config.memory) {
+    const numericFields: Array<keyof MemoryConfig> = [
+      "contextBudgetTokens",
+      "hotMessageCount",
+      "warmSummaryCount",
+      "coldFactCount",
+      "maxFactsPerTurn",
+      "maxFactLength",
+      "summaryWindowMessages",
+    ];
+    for (const key of numericFields) {
+      const value = config.memory[key];
+      if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value) || value <= 0)) {
+        throw new Error(`Invalid config: memory.${key} must be a positive number`);
+      }
+    }
+    if (config.memory.provider !== undefined && config.memory.provider !== "sqlite") {
+      throw new Error(`Invalid config: memory.provider must be "sqlite"`);
+    }
+    if (config.memory.enabled !== undefined && typeof config.memory.enabled !== "boolean") {
+      throw new Error("Invalid config: memory.enabled must be a boolean");
     }
   }
 

@@ -6,7 +6,7 @@ This document describes how AI coding agents should work with the Nexus codebase
 
 ## Repository Layout
 
-Nexus is a Turborepo monorepo with 8 packages. All packages live under `packages/` and depend on each other through `workspace:*` links.
+Nexus is a Turborepo monorepo with 9 packages. All packages live under `packages/` and depend on each other through `workspace:*` links.
 
 ### Package Roles
 
@@ -17,6 +17,7 @@ Nexus is a Turborepo monorepo with 8 packages. All packages live under `packages
 | `@nexus/state` | SQLite state store (runtime adapter: bun:sqlite / better-sqlite3) | `src/store.ts`, `src/database.ts`, `src/migrations.ts` |
 | `@nexus/acp-bridge` | ACP subprocess + JSON-RPC client | `src/session.ts`, `src/rpc.ts`, `src/manager.ts` |
 | `@nexus/gateway` | WS server, router, auth, boot | `src/router.ts`, `src/server.ts`, `src/start.ts` |
+| `@nexus/memory` | Pluggable memory provider interface + SQLite provider | `src/types.ts`, `src/provider.ts` |
 | `@nexus/client-core` | React hooks for WS + session | `src/useConnection.ts`, `src/useSession.ts` |
 | `@nexus/tui` | Terminal UI (Ink) | `src/App.tsx`, `src/components/` |
 | `@nexus/cli` | Headless WS CLI client for automation | `src/main.ts`, `src/client.ts` |
@@ -26,7 +27,7 @@ Nexus is a Turborepo monorepo with 8 packages. All packages live under `packages
 Turborepo handles this automatically via `dependsOn: ["^build"]`, but the logical order is:
 
 ```
-types -> policy, state, acp-bridge, cli (parallel) -> gateway -> client-core -> tui
+types -> policy, state, acp-bridge, memory, cli (parallel) -> gateway -> client-core -> tui
 ```
 
 ## Conventions to Follow

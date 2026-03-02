@@ -58,6 +58,12 @@ const serializePrettyEvent = (event: GatewayEvent): string => {
       return `[error] session=${event.sessionId} ${event.message}`;
     case "session_list":
       return `[session_list] ${event.sessions.length} session(s)`;
+    case "transcript":
+      return `[transcript] session=${event.sessionId} messages=${event.messages.length}`;
+    default: {
+      const _exhaustive: never = event;
+      return `[event] ${JSON.stringify(_exhaustive)}`;
+    }
   }
 };
 

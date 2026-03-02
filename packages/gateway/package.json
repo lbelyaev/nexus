@@ -19,6 +19,7 @@
     "@nexus/types": "workspace:*",
     "@nexus/policy": "workspace:*",
     "@nexus/state": "workspace:*",
+    "@nexus/memory": "workspace:*",
     "@nexus/acp-bridge": "workspace:*",
     "ws": "^8"
   },

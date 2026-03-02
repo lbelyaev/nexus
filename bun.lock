@@ -59,6 +59,7 @@
       "version": "0.0.1",
       "dependencies": {
         "@nexus/acp-bridge": "workspace:*",
+        "@nexus/memory": "workspace:*",
         "@nexus/policy": "workspace:*",
         "@nexus/state": "workspace:*",
         "@nexus/types": "workspace:*",
@@ -66,6 +67,18 @@
       },
       "devDependencies": {
         "@types/ws": "^8",
+        "typescript": "^5.7",
+        "vitest": "^3",
+      },
+    },
+    "packages/memory": {
+      "name": "@nexus/memory",
+      "version": "0.0.1",
+      "dependencies": {
+        "@nexus/state": "workspace:*",
+        "@nexus/types": "workspace:*",
+      },
+      "devDependencies": {
         "typescript": "^5.7",
         "vitest": "^3",
       },
@@ -262,6 +275,8 @@
     "@nexus/client-core": ["@nexus/client-core@workspace:packages/client-core"],
 
     "@nexus/gateway": ["@nexus/gateway@workspace:packages/gateway"],
+
+    "@nexus/memory": ["@nexus/memory@workspace:packages/memory"],
 
     "@nexus/policy": ["@nexus/policy@workspace:packages/policy"],
 

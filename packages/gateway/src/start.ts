@@ -8,6 +8,7 @@ import { loadPolicyFromString } from "@nexus/policy";
 import { spawnAgent, createAcpSession } from "@nexus/acp-bridge";
 import type { AgentProcess } from "@nexus/acp-bridge";
 import { evaluatePolicy } from "@nexus/policy";
+import { createSqliteMemoryProvider, type MemoryProvider } from "@nexus/memory";
 import type { NexusConfig, RuntimeProfile } from "@nexus/types";
 import { createLogger } from "./logger.js";
 
@@ -142,6 +143,27 @@ export const startGateway = async (configPath?: string) => {
   const dbPath = resolve(dataDir, "nexus.db");
   const stateStore = createStateStore(dbPath);
   log.info("state_store_initialized", { dbPath });
+
+  let memoryProvider: MemoryProvider | undefined;
+  const memoryConfig = config.memory;
+  const memoryEnabled = memoryConfig?.enabled ?? true;
+  if (memoryEnabled) {
+    memoryProvider = createSqliteMemoryProvider(stateStore, {
+      contextBudgetTokens: memoryConfig?.contextBudgetTokens,
+      hotMessageCount: memoryConfig?.hotMessageCount,
+      warmSummaryCount: memoryConfig?.warmSummaryCount,
+      coldFactCount: memoryConfig?.coldFactCount,
+      maxFactsPerTurn: memoryConfig?.maxFactsPerTurn,
+      maxFactLength: memoryConfig?.maxFactLength,
+      summaryWindowMessages: memoryConfig?.summaryWindowMessages,
+    });
+    log.info("memory_provider_initialized", {
+      provider: memoryConfig?.provider ?? "sqlite",
+      enabled: true,
+    });
+  } else {
+    log.info("memory_provider_disabled");
+  }
 
   // Policy — resolve relative to repo root
   let policyConfig;
@@ -325,6 +347,7 @@ export const startGateway = async (configPath?: string) => {
     },
     stateStore,
     policyConfig,
+    memoryProvider,
   });
 
   // Server

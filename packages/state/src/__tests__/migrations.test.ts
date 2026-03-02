@@ -44,12 +44,50 @@ describe("initDatabase", () => {
     expect(columnNames).toContain("detail");
   });
 
+  it("creates transcript_messages table with correct columns", () => {
+    initDatabase(db);
+
+    const columns = db
+      .prepare("PRAGMA table_info(transcript_messages)")
+      .all() as Array<{ name: string; type: string }>;
+    const columnNames = columns.map((c) => c.name);
+
+    expect(columnNames).toContain("id");
+    expect(columnNames).toContain("sessionId");
+    expect(columnNames).toContain("role");
+    expect(columnNames).toContain("content");
+    expect(columnNames).toContain("toolName");
+    expect(columnNames).toContain("toolCallId");
+    expect(columnNames).toContain("timestamp");
+    expect(columnNames).toContain("tokenEstimate");
+  });
+
+  it("creates memory_items table with correct columns", () => {
+    initDatabase(db);
+
+    const columns = db
+      .prepare("PRAGMA table_info(memory_items)")
+      .all() as Array<{ name: string; type: string }>;
+    const columnNames = columns.map((c) => c.name);
+
+    expect(columnNames).toContain("id");
+    expect(columnNames).toContain("sessionId");
+    expect(columnNames).toContain("kind");
+    expect(columnNames).toContain("content");
+    expect(columnNames).toContain("source");
+    expect(columnNames).toContain("confidence");
+    expect(columnNames).toContain("keywords");
+    expect(columnNames).toContain("createdAt");
+    expect(columnNames).toContain("lastAccessedAt");
+    expect(columnNames).toContain("tokenEstimate");
+  });
+
   it("is idempotent (calling twice does not error)", () => {
     initDatabase(db);
     expect(() => initDatabase(db)).not.toThrow();
   });
 
-  it("creates indexes on audit_events.sessionId and sessions.status", () => {
+  it("creates indexes for sessions, audit, transcript, and memory", () => {
     initDatabase(db);
 
     const indexes = db
@@ -62,5 +100,8 @@ describe("initDatabase", () => {
 
     expect(indexNames).toContain("idx_audit_events_sessionId");
     expect(indexNames).toContain("idx_sessions_status");
+    expect(indexNames).toContain("idx_transcript_sessionId");
+    expect(indexNames).toContain("idx_memory_items_session_kind_createdAt");
+    expect(indexNames).toContain("idx_memory_items_session_lastAccessedAt");
   });
 });

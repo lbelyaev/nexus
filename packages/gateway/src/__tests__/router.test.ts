@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createStateStore, type StateStore } from "@nexus/state";
 import type { PolicyConfig, GatewayEvent, ClientMessage } from "@nexus/types";
+import type { MemoryProvider } from "@nexus/memory";
 import { createRouter, type Router, type EventEmitter, type ManagedAcpSession } from "../router.js";
 
 const mockAcpSession = (): ManagedAcpSession => ({
@@ -29,6 +30,7 @@ describe("createRouter", () => {
   let router: Router;
   let acpSession: ManagedAcpSession;
   let createAcpSessionMock: ReturnType<typeof vi.fn>;
+  let memoryProvider: MemoryProvider;
   const policyConfig: PolicyConfig = {
     rules: [{ tool: "*", action: "allow" }],
   };
@@ -36,11 +38,26 @@ describe("createRouter", () => {
   beforeEach(() => {
     stateStore = createStateStore(":memory:");
     acpSession = mockAcpSession();
+    memoryProvider = {
+      id: "test-memory",
+      getContext: vi.fn(() => ({
+        sessionId: "gw-session-1",
+        budgetTokens: 1000,
+        totalTokens: 0,
+        hot: [],
+        warm: [],
+        cold: [],
+        rendered: "",
+      })),
+      search: vi.fn(() => []),
+      recordTurn: vi.fn(),
+    };
     createAcpSessionMock = vi.fn(async (_runtimeId, _model, _onEvent: EventEmitter) => acpSession);
     router = createRouter({
       createAcpSession: createAcpSessionMock,
       stateStore,
       policyConfig,
+      memoryProvider,
     });
   });
 
@@ -416,5 +433,69 @@ describe("createRouter", () => {
       expect(other.events[0].sessionId).toBe(sessionId);
       expect(other.events[0].message).toMatch(/owned by another connection/i);
     }
+  });
+
+  it("prompt injects memory context when provider returns rendered context", async () => {
+    (memoryProvider.getContext as ReturnType<typeof vi.fn>).mockReturnValueOnce({
+      sessionId: "gw-session-1",
+      budgetTokens: 1000,
+      totalTokens: 24,
+      hot: [],
+      warm: [],
+      cold: [],
+      rendered: "# Memory Context\n- prior fact\n# End Memory Context",
+    });
+
+    const { emit, events } = collectEvents();
+    router.handleMessage({ type: "session_new" }, emit);
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === "session_created")).toBe(true);
+    });
+
+    const sessionId = (events[0] as Extract<GatewayEvent, { type: "session_created" }>).sessionId;
+    router.handleMessage({ type: "prompt", sessionId, text: "current question" }, emit);
+
+    expect(acpSession.prompt).toHaveBeenCalledTimes(1);
+    expect((acpSession.prompt as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain("# Memory Context");
+    expect((acpSession.prompt as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain("# User Prompt");
+    expect(memoryProvider.getContext).toHaveBeenCalledWith({
+      sessionId,
+      prompt: "current question",
+    });
+  });
+
+  it("records turn memory after turn_end", async () => {
+    const { emit, events } = collectEvents();
+    router.handleMessage({ type: "session_new" }, emit);
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === "session_created")).toBe(true);
+    });
+
+    const sessionId = (events[0] as Extract<GatewayEvent, { type: "session_created" }>).sessionId;
+    router.handleMessage({ type: "prompt", sessionId, text: "remember this" }, emit);
+
+    const handler = (acpSession.onEvent as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as EventEmitter;
+    handler({
+      type: "text_delta",
+      sessionId,
+      delta: "assistant answer",
+    });
+    handler({
+      type: "turn_end",
+      sessionId,
+      stopReason: "end_turn",
+    });
+
+    await vi.waitFor(() => {
+      expect(memoryProvider.recordTurn).toHaveBeenCalled();
+    });
+
+    expect(memoryProvider.recordTurn).toHaveBeenCalledWith({
+      sessionId,
+      userText: "remember this",
+      assistantText: "assistant answer",
+    });
   });
 });

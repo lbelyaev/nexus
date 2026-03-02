@@ -90,6 +90,7 @@ nexus/
 types (zero deps)
   ├── policy
   ├── state (+bun:sqlite or better-sqlite3 via runtime adapter)
+  ├── memory (pluggable memory provider interface + SQLite provider)
   ├── acp-bridge
   ├── client-core (+react)
   │     └── tui (+ink)

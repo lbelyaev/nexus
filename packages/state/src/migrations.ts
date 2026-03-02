@@ -38,5 +38,23 @@ export const initDatabase = (db: DatabaseAdapter): void => {
     );
 
     CREATE INDEX IF NOT EXISTS idx_transcript_sessionId ON transcript_messages(sessionId);
+
+    CREATE TABLE IF NOT EXISTS memory_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      sessionId TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      content TEXT NOT NULL,
+      source TEXT NOT NULL,
+      confidence REAL NOT NULL DEFAULT 0.5,
+      keywords TEXT NOT NULL DEFAULT '[]',
+      createdAt TEXT NOT NULL,
+      lastAccessedAt TEXT NOT NULL,
+      tokenEstimate INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_memory_items_session_kind_createdAt
+      ON memory_items(sessionId, kind, createdAt DESC);
+    CREATE INDEX IF NOT EXISTS idx_memory_items_session_lastAccessedAt
+      ON memory_items(sessionId, lastAccessedAt DESC);
   `);
 };

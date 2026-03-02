@@ -211,4 +211,43 @@ describe("loadConfig", () => {
 
     expect(() => loadConfig(configPath)).toThrow(/modelCatalog/);
   });
+
+  it("supports memory config", () => {
+    const configPath = join(tmpDir, "nexus.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        auth: { token: "mytoken" },
+        runtime: { command: ["npx", "@zed-industries/claude-agent-acp"] },
+        memory: {
+          enabled: true,
+          provider: "sqlite",
+          contextBudgetTokens: 900,
+          hotMessageCount: 6,
+        },
+      }),
+    );
+
+    const config = loadConfig(configPath);
+    expect(config.memory?.enabled).toBe(true);
+    expect(config.memory?.provider).toBe("sqlite");
+    expect(config.memory?.contextBudgetTokens).toBe(900);
+    expect(config.memory?.hotMessageCount).toBe(6);
+  });
+
+  it("rejects invalid memory numeric settings", () => {
+    const configPath = join(tmpDir, "nexus.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        auth: { token: "mytoken" },
+        runtime: { command: ["npx", "@zed-industries/claude-agent-acp"] },
+        memory: {
+          contextBudgetTokens: 0,
+        },
+      }),
+    );
+
+    expect(() => loadConfig(configPath)).toThrow(/memory.contextBudgetTokens/);
+  });
 });

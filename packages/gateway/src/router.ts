@@ -6,6 +6,7 @@ import type {
 import { estimateTokens } from "@nexus/types";
 import type { StateStore } from "@nexus/state";
 import type { AcpSession } from "@nexus/acp-bridge";
+import type { MemoryProvider } from "@nexus/memory";
 import { createLogger } from "./logger.js";
 
 export type EventEmitter = (event: GatewayEvent) => void;
@@ -27,6 +28,7 @@ export interface RouterDeps {
   ) => Promise<ManagedAcpSession>;
   stateStore: StateStore;
   policyConfig: PolicyConfig;
+  memoryProvider?: MemoryProvider;
 }
 
 export interface Router {
@@ -73,6 +75,7 @@ export const createRecordingEmitter = (
   options?: {
     onTextDelta?: () => void;
     onApprovalRequest?: (requestId: string) => void;
+    onAssistantMessage?: (assistantText: string) => void;
   },
 ): EventEmitter => {
   let assistantBuffer = "";
@@ -113,6 +116,7 @@ export const createRecordingEmitter = (
         break;
       case "turn_end":
         if (assistantBuffer) {
+          options?.onAssistantMessage?.(assistantBuffer);
           stateStore.appendMessage({
             sessionId,
             role: "assistant",
@@ -129,7 +133,7 @@ export const createRecordingEmitter = (
 };
 
 export const createRouter = (deps: RouterDeps): Router => {
-  const { createAcpSession, stateStore, policyConfig } = deps;
+  const { createAcpSession, stateStore, policyConfig, memoryProvider } = deps;
   const sessions = new Map<string, ManagedAcpSession>();
   const sessionOwners = new Map<string, EventEmitter>();
   const requestToSessionId = new Map<string, string>();
@@ -247,6 +251,7 @@ export const createRouter = (deps: RouterDeps): Router => {
 
     // Wrap emit with recording layer to capture streaming events
     let sawStreamedText = false;
+    let assistantMessageForTurn = "";
     const recordingEmitWithHooks = createRecordingEmitter(msg.sessionId, stateStore, emit, {
       onTextDelta: () => {
         sawStreamedText = true;
@@ -254,7 +259,37 @@ export const createRouter = (deps: RouterDeps): Router => {
       onApprovalRequest: (requestId) => {
         trackPendingApproval(msg.sessionId, requestId);
       },
+      onAssistantMessage: (assistantText) => {
+        assistantMessageForTurn = assistantText;
+      },
     });
+
+    let promptText = msg.text;
+    if (memoryProvider) {
+      try {
+        const context = memoryProvider.getContext({
+          sessionId: msg.sessionId,
+          prompt: msg.text,
+        });
+        if (context.rendered) {
+          promptText = `${context.rendered}\n\n# User Prompt\n${msg.text}`;
+        }
+        log.debug("memory_context_applied", {
+          sessionId: msg.sessionId,
+          rendered: context.rendered.length > 0,
+          totalTokens: context.totalTokens,
+          budgetTokens: context.budgetTokens,
+          hotCount: context.hot.length,
+          warmCount: context.warm.length,
+          coldCount: context.cold.length,
+        });
+      } catch (error) {
+        log.warn("memory_context_failed", {
+          sessionId: msg.sessionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
 
     // Always bind prompt-time emitter so streaming events (approval/tool/text)
     // are delivered to the same client that initiated this prompt.
@@ -262,7 +297,7 @@ export const createRouter = (deps: RouterDeps): Router => {
 
     // ACP streaming events flow via session.onEvent → emit
     // prompt() resolves when the turn ends (PromptResponse with stopReason)
-    session.prompt(msg.text).then(
+    session.prompt(promptText).then(
       (result) => {
         log.info("prompt_response", {
           sessionId: msg.sessionId,
@@ -301,6 +336,20 @@ export const createRouter = (deps: RouterDeps): Router => {
           sessionId: msg.sessionId,
           stopReason: r?.stopReason ?? "end_turn",
         });
+        if (memoryProvider) {
+          try {
+            memoryProvider.recordTurn({
+              sessionId: msg.sessionId,
+              userText: msg.text,
+              assistantText: assistantMessageForTurn,
+            });
+          } catch (error) {
+            log.warn("memory_record_turn_failed", {
+              sessionId: msg.sessionId,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
       },
       (err: unknown) => {
         log.error("prompt_failed", {
