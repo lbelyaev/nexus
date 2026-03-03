@@ -60,6 +60,49 @@ describe("useSession", () => {
     expect(result.current.sessionSource).toBe("interactive");
   });
 
+  it("resets streaming state when a new session is created", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_created",
+        sessionId: "sess-1",
+        model: "claude-4",
+      });
+      result.current.sendPrompt("hello");
+      result.current.handleEvent({
+        type: "text_delta",
+        sessionId: "sess-1",
+        delta: "partial",
+      });
+      result.current.handleEvent({
+        type: "tool_start",
+        sessionId: "sess-1",
+        tool: "Bash",
+        params: { command: "sleep 10" },
+      });
+    });
+    flushTextBuffers();
+    expect(result.current.isStreaming).toBe(true);
+    expect(result.current.responseText).toBe("partial");
+    expect(result.current.activeTools).toHaveLength(1);
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_created",
+        sessionId: "sess-2",
+        model: "gpt-5",
+      });
+    });
+
+    expect(result.current.sessionId).toBe("sess-2");
+    expect(result.current.isStreaming).toBe(false);
+    expect(result.current.responseText).toBe("");
+    expect(result.current.activeTools).toEqual([]);
+    expect(result.current.toolCalls).toEqual([]);
+  });
+
   it("accumulates text_delta into responseText", () => {
     const sendMessage = vi.fn();
     const { result } = renderHook(() => useSession(sendMessage));

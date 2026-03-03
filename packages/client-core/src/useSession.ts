@@ -160,6 +160,20 @@ export const useSession = (
   const handleEvent = useCallback((event: GatewayEvent) => {
     switch (event.type) {
       case "session_created":
+        queuedSteerRef.current = null;
+        ignoreCancelledTurnEndRef.current = false;
+        textBufferRef.current = "";
+        thinkingBufferRef.current = "";
+        if (flushTimerRef.current) {
+          clearTimeout(flushTimerRef.current);
+          flushTimerRef.current = null;
+        }
+        setResponseText("");
+        setThinkingText("");
+        setIsStreaming(false);
+        setActiveTools([]);
+        setToolCalls([]);
+        setError(null);
         setSessionId(event.sessionId);
         setSessionModel(event.model);
         setSessionRuntimeId(event.runtimeId ?? null);
@@ -174,6 +188,14 @@ export const useSession = (
         break;
       case "session_closed":
         if (event.sessionId === sessionId) {
+          queuedSteerRef.current = null;
+          ignoreCancelledTurnEndRef.current = false;
+          textBufferRef.current = "";
+          thinkingBufferRef.current = "";
+          if (flushTimerRef.current) {
+            clearTimeout(flushTimerRef.current);
+            flushTimerRef.current = null;
+          }
           setSessionId(null);
           setSessionModel(null);
           setSessionRuntimeId(null);
@@ -181,9 +203,12 @@ export const useSession = (
           setSessionPrincipalType(null);
           setSessionPrincipalId(null);
           setSessionSource(null);
+          setResponseText("");
+          setThinkingText("");
           setIsStreaming(false);
           setActiveTools([]);
           setToolCalls([]);
+          setError(null);
         }
         break;
       case "runtime_health":

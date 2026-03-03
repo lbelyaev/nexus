@@ -1,0 +1,155 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 12% 18%, rgba(38, 240, 202, 0.18), transparent 42%),
+    radial-gradient(circle at 86% 8%, rgba(70, 216, 255, 0.2), transparent 48%),
+    linear-gradient(145deg, #05070d 0%, #0b1020 42%, #111931 100%);
+  color: #dbe7ff;
+  font-family: "IBM Plex Sans", "Avenir Next", "Helvetica Neue", sans-serif;
+}
+
+@layer components {
+  .panel {
+    @apply rounded-2xl border border-cyan-300/20 bg-ink-900/75 shadow-glow backdrop-blur;
+  }
+
+  .panel-title {
+    @apply text-lg font-semibold tracking-wide text-pulse-500;
+  }
+
+  .panel-subtitle {
+    @apply text-sm font-semibold uppercase tracking-[0.08em] text-pulse-300;
+  }
+
+  .field {
+    @apply flex flex-col gap-1 text-xs uppercase tracking-[0.08em] text-ink-100/80;
+  }
+
+  .input {
+    @apply w-full rounded-lg border border-cyan-300/20 bg-ink-950/85 px-3 py-2 text-sm text-ink-100 outline-none transition;
+  }
+
+  .input:focus {
+    @apply border-pulse-500/70 ring-2 ring-pulse-500/25;
+  }
+
+  .button-primary {
+    @apply rounded-lg border border-pulse-500/50 bg-pulse-500/15 px-3 py-2 text-sm font-semibold text-pulse-300 transition hover:bg-pulse-500/25 disabled:cursor-not-allowed disabled:opacity-40;
+  }
+
+  .button-secondary {
+    @apply rounded-lg border border-cyan-300/30 bg-ink-900/90 px-3 py-2 text-sm font-semibold text-ink-100/90 transition hover:border-cyan-200/50 hover:bg-ink-800/90 disabled:cursor-not-allowed disabled:opacity-40;
+  }
+
+  .button-warning {
+    @apply rounded-lg border border-yellow-300/45 bg-yellow-500/15 px-3 py-2 text-sm font-semibold text-yellow-200 transition hover:bg-yellow-500/25;
+  }
+
+  .button-danger {
+    @apply rounded-lg border border-red-300/45 bg-red-500/15 px-3 py-2 text-sm font-semibold text-red-200 transition hover:bg-red-500/30;
+  }
+
+  .chip {
+    @apply rounded-full border border-cyan-300/30 bg-ink-900/95 px-3 py-1 text-xs text-pulse-300;
+  }
+
+  .divider {
+    @apply my-4 h-px bg-gradient-to-r from-cyan-400/40 via-cyan-100/5 to-cyan-400/40;
+  }
+
+  .message {
+    @apply rounded-xl border px-3 py-2;
+  }
+
+  .message-role {
+    @apply mb-1 text-[11px] uppercase tracking-[0.08em] text-ink-100/60;
+  }
+
+  .message-user {
+    @apply ml-8 border-blue-300/30 bg-blue-500/15;
+  }
+
+  .message-assistant {
+    @apply mr-8 border-pulse-500/30 bg-ink-950/80;
+  }
+
+  .message-system {
+    @apply border-cyan-300/20 bg-ink-900/85 text-ink-100/85;
+  }
+
+  .message-streaming {
+    @apply animate-pulse;
+  }
+}
+
+.markdown-body {
+  font-family: "IBM Plex Sans", "Avenir Next", "Helvetica Neue", sans-serif;
+  line-height: 1.55;
+  font-size: 0.95rem;
+}
+
+.markdown-body p,
+.markdown-body ul,
+.markdown-body ol,
+.markdown-body table,
+.markdown-body blockquote,
+.markdown-body pre {
+  margin: 0.45rem 0;
+}
+
+.markdown-body ul,
+.markdown-body ol {
+  padding-left: 1.2rem;
+}
+
+.markdown-body code {
+  font-family: "IBM Plex Mono", "Menlo", "Monaco", monospace;
+  background: rgba(17, 25, 49, 0.85);
+  border: 1px solid rgba(70, 216, 255, 0.28);
+  border-radius: 0.3rem;
+  padding: 0.08rem 0.35rem;
+}
+
+.markdown-body pre {
+  padding: 0.7rem;
+  border-radius: 0.6rem;
+  background: rgba(5, 7, 13, 0.88);
+  border: 1px solid rgba(70, 216, 255, 0.22);
+  overflow-x: auto;
+}
+
+.markdown-body pre code {
+  border: none;
+  padding: 0;
+  background: transparent;
+}
+
+.markdown-body table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+.markdown-body th,
+.markdown-body td {
+  border: 1px solid rgba(70, 216, 255, 0.34);
+  padding: 0.4rem 0.45rem;
+  text-align: left;
+}
+
+.markdown-body th {
+  color: #26f0ca;
+  background: rgba(17, 25, 49, 0.78);
+}

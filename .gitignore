@@ -3,6 +3,8 @@ dist/
 coverage/
 **/coverage/
 .turbo/
+.next/
+**/.next/
 data/
 *.db
 *.db-journal
