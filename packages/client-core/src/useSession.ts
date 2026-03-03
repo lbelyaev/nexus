@@ -295,6 +295,17 @@ export const useSession = (
         break;
       case "error":
         ignoreCancelledTurnEndRef.current = false;
+        queuedSteerRef.current = null;
+        if (flushTimerRef.current) {
+          clearTimeout(flushTimerRef.current);
+          flushTimerRef.current = null;
+        }
+        flushBuffers();
+        setIsStreaming(false);
+        setActiveTools([]);
+        setToolCalls((prev) => prev.map((tool) => (
+          tool.status === "running" ? { ...tool, status: "failed" } : tool
+        )));
         setError(event.message);
         break;
     }

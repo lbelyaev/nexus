@@ -70,6 +70,9 @@ describe("useSession", () => {
         sessionId: "sess-1",
         model: "claude-4",
       });
+    });
+
+    act(() => {
       result.current.sendPrompt("hello");
       result.current.handleEvent({
         type: "text_delta",
@@ -349,6 +352,46 @@ describe("useSession", () => {
     });
 
     expect(result.current.error).toBe("something went wrong");
+  });
+
+  it("error event ends streaming and marks running tools as failed", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_created",
+        sessionId: "sess-1",
+        model: "claude-4",
+      });
+    });
+
+    act(() => {
+      result.current.sendPrompt("run");
+      result.current.handleEvent({
+        type: "tool_start",
+        sessionId: "sess-1",
+        tool: "Bash",
+        params: { command: "sleep 10" },
+      });
+    });
+
+    expect(result.current.isStreaming).toBe(true);
+    expect(result.current.activeTools).toHaveLength(1);
+    expect(result.current.toolCalls[0]?.status).toBe("running");
+
+    act(() => {
+      result.current.handleEvent({
+        type: "error",
+        sessionId: "sess-1",
+        message: "runtime failed",
+      });
+    });
+
+    expect(result.current.isStreaming).toBe(false);
+    expect(result.current.activeTools).toEqual([]);
+    expect(result.current.toolCalls[0]?.status).toBe("failed");
+    expect(result.current.error).toBe("runtime failed");
   });
 
   it("cancel sends cancel message", () => {

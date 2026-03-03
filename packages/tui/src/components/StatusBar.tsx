@@ -4,9 +4,10 @@ import { Box, Text } from "ink";
 export interface StatusBarProps {
   status: "connecting" | "connected" | "disconnected" | "error";
   model?: string;
+  isSessionInitializing?: boolean;
 }
 
-export const StatusBar = ({ status, model }: StatusBarProps) => (
+export const StatusBar = ({ status, model, isSessionInitializing = false }: StatusBarProps) => (
   <Box>
     <Text
       color={
@@ -20,7 +21,7 @@ export const StatusBar = ({ status, model }: StatusBarProps) => (
       {status === "connecting"
         ? "Connecting..."
         : status === "connected"
-          ? `Connected${model ? ` (${model})` : ""}`
+          ? `Connected${model ? ` (${model})` : isSessionInitializing ? " (creating session...)" : ""}`
           : status === "disconnected"
             ? "Disconnected"
             : "Error"}

@@ -143,6 +143,7 @@ export const App = ({ url, token }: AppProps) => {
   // Finalize response into messages when streaming stops
   const prevStreamingRef = useRef(false);
   const processedMemoryResultsRef = useRef(0);
+  const lastErrorRef = useRef<string | null>(null);
   useEffect(() => {
     if (prevStreamingRef.current && !session.isStreaming) {
       setMessages((prev) => {
@@ -169,6 +170,13 @@ export const App = ({ url, token }: AppProps) => {
     const rendered = next.flatMap((event) => formatMemoryResult(event));
     setMessages((prev) => [...prev, ...rendered]);
   }, [session.memoryResults]);
+
+  useEffect(() => {
+    if (!session.error) return;
+    if (session.error === lastErrorRef.current) return;
+    lastErrorRef.current = session.error;
+    setMessages((prev) => [...prev, { role: "system", text: `  Error: ${session.error}` }]);
+  }, [session.error]);
 
   const createSession = useCallback(
     (runtimeId?: string, model?: string, workspaceId?: string) => {
@@ -634,12 +642,11 @@ export const App = ({ url, token }: AppProps) => {
     <Box flexDirection="column" padding={1}>
       <StatusBar
         status={status}
+        isSessionInitializing={status === "connected" && !session.sessionId}
         model={
           session.sessionModel
             ? `${session.sessionWorkspaceId ?? preferredWorkspaceId}/${session.sessionRuntimeId ?? preferredRuntimeId ?? "default"}:${session.sessionModel}`
-            : preferredModel
-              ? `${preferredWorkspaceId}/${preferredRuntimeId ?? "default"}:${preferredModel}`
-              : undefined
+            : undefined
         }
       />
       <Chat
