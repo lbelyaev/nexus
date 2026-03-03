@@ -54,6 +54,15 @@ const waitForMessage = (messages: string[], timeout = 2000): Promise<string> =>
     check();
   });
 
+const waitForClose = (ws: WebSocket): Promise<void> =>
+  new Promise((resolve) => {
+    if (ws.readyState === WebSocket.CLOSED) {
+      resolve();
+      return;
+    }
+    ws.once("close", () => resolve());
+  });
+
 describe("E2E: WS client -> Gateway -> mock ACP session -> events back", () => {
   let server: GatewayServer;
   let stateStore: StateStore;
@@ -207,6 +216,45 @@ describe("E2E: WS client -> Gateway -> mock ACP session -> events back", () => {
       expect(list.sessions).toHaveLength(2);
 
       ws.close();
+    });
+  });
+
+  describe("reconnect and resume", () => {
+    it("replays transcript after reconnecting with same session id", async () => {
+      const first = await connectWs(port, TEST_TOKEN);
+
+      first.ws.send(JSON.stringify({ type: "session_new" }));
+      const createdRaw = await waitForMessage(first.messages);
+      const created = JSON.parse(createdRaw) as GatewayEvent;
+      expect(created.type).toBe("session_created");
+      if (created.type !== "session_created") throw new Error("unreachable");
+
+      first.ws.send(JSON.stringify({
+        type: "prompt",
+        sessionId: created.sessionId,
+        text: "remember this line",
+      }));
+      const promptRaw = await waitForMessage(first.messages);
+      const promptEvent = JSON.parse(promptRaw) as GatewayEvent;
+      expect(promptEvent.type).toBe("turn_end");
+
+      first.ws.close();
+      await waitForClose(first.ws);
+
+      const second = await connectWs(port, TEST_TOKEN);
+      second.ws.send(JSON.stringify({
+        type: "session_replay",
+        sessionId: created.sessionId,
+      }));
+
+      const replayRaw = await waitForMessage(second.messages);
+      const replayEvent = JSON.parse(replayRaw) as GatewayEvent;
+      expect(replayEvent.type).toBe("transcript");
+      if (replayEvent.type !== "transcript") throw new Error("unreachable");
+      expect(replayEvent.sessionId).toBe(created.sessionId);
+      expect(replayEvent.messages.some((m) => m.role === "user" && m.content.includes("remember this line"))).toBe(true);
+
+      second.ws.close();
     });
   });
 });

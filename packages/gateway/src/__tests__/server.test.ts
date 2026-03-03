@@ -16,6 +16,7 @@ const mockRouter: Router = {
     ...(reason ? { reason } : {}),
   }),
   getRuntimeHealth: () => [],
+  closeSessionsByRuntime: () => [],
   sweepIdleSessions: () => [],
   handleMessage: (msg, emit) => {
     if (msg.type === "session_list") {

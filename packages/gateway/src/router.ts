@@ -50,6 +50,7 @@ export interface Router {
   unregisterConnection: (connectionId: string, emit: EventEmitter) => void;
   setRuntimeHealth: (runtimeId: string, status: RuntimeHealthStatus, reason?: string) => RuntimeHealthInfo;
   getRuntimeHealth: () => RuntimeHealthInfo[];
+  closeSessionsByRuntime: (runtimeId: string, reason?: string) => string[];
   sweepIdleSessions: (now?: Date) => string[];
 }
 
@@ -1153,6 +1154,36 @@ export const createRouter = (deps: RouterDeps): Router => {
     return closed;
   };
 
+  const closeSessionsByRuntime = (
+    runtimeId: string,
+    reason = "runtime_unavailable",
+  ): string[] => {
+    const closed: string[] = [];
+    for (const [sessionId, session] of sessions) {
+      if (session.runtimeId !== runtimeId) continue;
+      const owner = sessionOwners.get(sessionId);
+      if (owner) {
+        owner({
+          type: "error",
+          sessionId,
+          message: `Runtime unavailable: ${runtimeId}${reason ? ` (${reason})` : ""}`,
+        });
+      }
+      if (closeSession(sessionId, reason, owner)) {
+        closed.push(sessionId);
+      }
+    }
+    if (closed.length > 0) {
+      log.warn("runtime_sessions_closed", {
+        runtimeId,
+        reason,
+        closedCount: closed.length,
+        sessionIds: closed,
+      });
+    }
+    return closed;
+  };
+
   const handleMessage = (msg: ClientMessage, emit: EventEmitter, context?: RouterMessageContext): void => {
     const connectionId = context?.connectionId ?? emitterConnectionIds.get(emit) ?? null;
     log.debug("message_received", {
@@ -1186,6 +1217,7 @@ export const createRouter = (deps: RouterDeps): Router => {
     unregisterConnection,
     setRuntimeHealth,
     getRuntimeHealth,
+    closeSessionsByRuntime,
     sweepIdleSessions,
   };
 };

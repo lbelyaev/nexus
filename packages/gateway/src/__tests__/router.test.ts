@@ -428,6 +428,37 @@ describe("createRouter", () => {
     expect(b.events.some((e) => e.type === "runtime_health")).toBe(true);
   });
 
+  it("closeSessionsByRuntime closes matching sessions and notifies owner", async () => {
+    const owner = collectEvents();
+    router.registerConnection("conn-owner", owner.emit);
+    router.handleMessage({ type: "session_new" }, owner.emit, { connectionId: "conn-owner" });
+
+    await vi.waitFor(() => {
+      expect(owner.events.some((e) => e.type === "session_created")).toBe(true);
+    });
+    const created = owner.events.find((e) => e.type === "session_created");
+    if (!created || created.type !== "session_created") throw new Error("expected session_created");
+    owner.events.length = 0;
+
+    const closed = router.closeSessionsByRuntime("default", "runtime_unavailable");
+    expect(closed).toEqual([created.sessionId]);
+    expect(owner.events).toEqual([
+      {
+        type: "error",
+        sessionId: created.sessionId,
+        message: "Runtime unavailable: default (runtime_unavailable)",
+      },
+      {
+        type: "session_closed",
+        sessionId: created.sessionId,
+        reason: "runtime_unavailable",
+      },
+    ]);
+
+    const stored = stateStore.getSession(created.sessionId);
+    expect(stored?.status).toBe("idle");
+  });
+
   it("approval_response forwards to session.respondToPermission", async () => {
     const { emit, events } = collectEvents();
     router.handleMessage({ type: "session_new" }, emit);
