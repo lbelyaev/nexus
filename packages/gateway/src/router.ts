@@ -1,4 +1,5 @@
 import type {
+  AuthAlgorithm,
   ClientMessage,
   EventCorrelation,
   GatewayEvent,
@@ -9,7 +10,7 @@ import type {
   RuntimeHealthStatus,
 } from "@nexus/types";
 import { estimateTokens } from "@nexus/types";
-import { createHash } from "node:crypto";
+import { createHash, createPublicKey, randomBytes, verify } from "node:crypto";
 import type { StateStore } from "@nexus/state";
 import type { AcpSession } from "@nexus/acp-bridge";
 import type { MemoryProvider } from "@nexus/memory";
@@ -53,6 +54,85 @@ export interface Router {
   closeSessionsByRuntime: (runtimeId: string, reason?: string) => string[];
   sweepIdleSessions: (now?: Date) => string[];
 }
+
+interface ConnectionPrincipal {
+  principalType: PrincipalType;
+  principalId: string;
+  verified: boolean;
+  publicKey?: string;
+  verifiedAt?: string;
+}
+
+interface AuthChallenge {
+  nonce: string;
+  issuedAtMs: number;
+  expiresAtMs: number;
+  algorithm: AuthAlgorithm;
+}
+
+interface SessionTransferRequest {
+  sessionId: string;
+  requesterConnectionId: string;
+  fromPrincipalType: PrincipalType;
+  fromPrincipalId: string;
+  targetPrincipalType: PrincipalType;
+  targetPrincipalId: string;
+  expiresAtMs: number;
+}
+
+const AUTH_CHALLENGE_TTL_MS = 60_000;
+const TRANSFER_MIN_TTL_MS = 5_000;
+const TRANSFER_MAX_TTL_MS = 10 * 60 * 1000;
+const TRANSFER_DEFAULT_TTL_MS = 60_000;
+
+const normalizePublicKey = (publicKey: string): string => {
+  const trimmed = publicKey.trim();
+  if (trimmed.includes("BEGIN PUBLIC KEY")) {
+    return trimmed;
+  }
+  const raw = trimmed.replace(/\s+/g, "");
+  const lines = raw.match(/.{1,64}/g)?.join("\n") ?? raw;
+  return `-----BEGIN PUBLIC KEY-----\n${lines}\n-----END PUBLIC KEY-----`;
+};
+
+const decodeSignature = (signature: string): Buffer | null => {
+  try {
+    return Buffer.from(signature, "base64");
+  } catch {
+    // fall through
+  }
+  try {
+    const normalized = signature.replace(/-/g, "+").replace(/_/g, "/");
+    const padding = normalized.length % 4 === 0 ? "" : "=".repeat(4 - (normalized.length % 4));
+    return Buffer.from(`${normalized}${padding}`, "base64");
+  } catch {
+    return null;
+  }
+};
+
+const buildAuthPayload = (
+  nonce: string,
+  principalType: PrincipalType,
+  principalId: string,
+): string => `${nonce}:${principalType}:${principalId}`;
+
+const verifyAuthProof = (
+  nonce: string,
+  principalType: PrincipalType,
+  principalId: string,
+  publicKey: string,
+  signature: string,
+): boolean => {
+  try {
+    const key = createPublicKey(normalizePublicKey(publicKey));
+    const payload = Buffer.from(buildAuthPayload(nonce, principalType, principalId), "utf8");
+    const signatureBytes = decodeSignature(signature);
+    if (!signatureBytes) return false;
+    return verify(null, payload, key, signatureBytes);
+  } catch {
+    return false;
+  }
+};
 
 const safeStringify = (value: unknown): string => {
   try {
@@ -200,6 +280,10 @@ export const createRouter = (deps: RouterDeps): Router => {
   const sessionToPendingRequests = new Map<string, Set<string>>();
   const activeConnections = new Map<string, EventEmitter>();
   const emitterConnectionIds = new WeakMap<EventEmitter, string>();
+  const connectionPrincipals = new Map<string, ConnectionPrincipal>();
+  const authChallenges = new Map<string, AuthChallenge>();
+  const consumedAuthChallenges = new Set<string>();
+  const sessionTransfers = new Map<string, SessionTransferRequest>();
   const runtimeHealth = new Map<string, RuntimeHealthInfo>(Object.entries(initialRuntimeHealth));
   const log = createLogger("gateway.router");
 
@@ -217,6 +301,29 @@ export const createRouter = (deps: RouterDeps): Router => {
     for (const emit of activeConnections.values()) {
       emitRuntimeHealth(emit, runtime);
     }
+  };
+
+  const resolvePrincipal = (connectionId?: string): ConnectionPrincipal | undefined => (
+    connectionId ? connectionPrincipals.get(connectionId) : undefined
+  );
+
+  const issueAuthChallenge = (connectionId: string, emit: EventEmitter): AuthChallenge => {
+    const issuedAtMs = Date.now();
+    const challenge: AuthChallenge = {
+      algorithm: "ed25519",
+      nonce: randomBytes(24).toString("base64url"),
+      issuedAtMs,
+      expiresAtMs: issuedAtMs + AUTH_CHALLENGE_TTL_MS,
+    };
+    authChallenges.set(connectionId, challenge);
+    emit({
+      type: "auth_challenge",
+      algorithm: challenge.algorithm,
+      nonce: challenge.nonce,
+      issuedAt: new Date(challenge.issuedAtMs).toISOString(),
+      expiresAt: new Date(challenge.expiresAtMs).toISOString(),
+    });
+    return challenge;
   };
 
   const touchSession = (sessionId: string, timestamp = Date.now()): void => {
@@ -291,6 +398,7 @@ export const createRouter = (deps: RouterDeps): Router => {
     sessionLastActivityMs.delete(sessionId);
     sessionInFlightTurns.delete(sessionId);
     sessionIdempotency.delete(sessionId);
+    sessionTransfers.delete(sessionId);
     clearSessionPendingApprovals(sessionId);
 
     try {
@@ -368,9 +476,31 @@ export const createRouter = (deps: RouterDeps): Router => {
     emit: EventEmitter,
     context?: RouterMessageContext,
   ): void => {
+    const connectionId = context?.connectionId ?? emitterConnectionIds.get(emit);
+    const connectionPrincipal = resolvePrincipal(connectionId);
     const workspaceId = msg.workspaceId?.trim() || defaultWorkspaceId;
-    const principalType: PrincipalType = msg.principalType ?? "user";
-    const principalId = msg.principalId?.trim() || "user:local";
+    const requestedPrincipalType = msg.principalType;
+    const requestedPrincipalId = msg.principalId?.trim();
+    if (
+      connectionPrincipal?.verified
+      && (
+        (requestedPrincipalType !== undefined && requestedPrincipalType !== connectionPrincipal.principalType)
+        || (requestedPrincipalId !== undefined && requestedPrincipalId !== connectionPrincipal.principalId)
+      )
+    ) {
+      emit({
+        type: "error",
+        sessionId: "",
+        message: "Authenticated principal does not match requested session principal.",
+      });
+      return;
+    }
+    const principalType: PrincipalType = connectionPrincipal?.verified
+      ? connectionPrincipal.principalType
+      : (requestedPrincipalType ?? "user");
+    const principalId = connectionPrincipal?.verified
+      ? connectionPrincipal.principalId
+      : (requestedPrincipalId || "user:local");
     const source: PromptSource = msg.source ?? "interactive";
     createAcpSession(msg.runtimeId, msg.model, emit).then(
       (acpSession) => {
@@ -436,6 +566,317 @@ export const createRouter = (deps: RouterDeps): Router => {
         });
       },
     );
+  };
+
+  const handleAuthProof = (
+    msg: Extract<ClientMessage, { type: "auth_proof" }>,
+    emit: EventEmitter,
+    context?: RouterMessageContext,
+  ): void => {
+    const connectionId = context?.connectionId ?? emitterConnectionIds.get(emit);
+    if (!connectionId) {
+      emit({
+        type: "auth_result",
+        ok: false,
+        message: "Unable to verify auth proof without connection context.",
+      });
+      return;
+    }
+
+    const principalType: PrincipalType = msg.principalType ?? "user";
+    const principalId = msg.principalId.trim();
+    if (!principalId) {
+      emit({
+        type: "auth_result",
+        ok: false,
+        message: "principalId is required for auth proof.",
+      });
+      return;
+    }
+
+    const nonceKey = `${connectionId}:${msg.nonce}`;
+    if (consumedAuthChallenges.has(nonceKey)) {
+      emit({
+        type: "auth_result",
+        ok: false,
+        principalType,
+        principalId,
+        message: "Auth nonce was already used.",
+      });
+      return;
+    }
+
+    const challenge = authChallenges.get(connectionId);
+    if (!challenge) {
+      issueAuthChallenge(connectionId, emit);
+      emit({
+        type: "auth_result",
+        ok: false,
+        principalType,
+        principalId,
+        message: "Auth challenge is missing or expired; requested a new challenge.",
+      });
+      return;
+    }
+
+    const nowMs = Date.now();
+    if (msg.nonce !== challenge.nonce) {
+      emit({
+        type: "auth_result",
+        ok: false,
+        principalType,
+        principalId,
+        message: "Auth nonce does not match active challenge.",
+      });
+      return;
+    }
+    if (nowMs > challenge.expiresAtMs) {
+      authChallenges.delete(connectionId);
+      issueAuthChallenge(connectionId, emit);
+      emit({
+        type: "auth_result",
+        ok: false,
+        principalType,
+        principalId,
+        message: "Auth challenge expired; requested a new challenge.",
+      });
+      return;
+    }
+
+    const verified = verifyAuthProof(
+      msg.nonce,
+      principalType,
+      principalId,
+      msg.publicKey,
+      msg.signature,
+    );
+
+    if (!verified) {
+      emit({
+        type: "auth_result",
+        ok: false,
+        principalType,
+        principalId,
+        message: "Invalid auth signature.",
+      });
+      return;
+    }
+
+    consumedAuthChallenges.add(nonceKey);
+    authChallenges.delete(connectionId);
+    connectionPrincipals.set(connectionId, {
+      principalType,
+      principalId,
+      verified: true,
+      publicKey: normalizePublicKey(msg.publicKey),
+      verifiedAt: new Date(nowMs).toISOString(),
+    });
+
+    emit({
+      type: "auth_result",
+      ok: true,
+      principalType,
+      principalId,
+      message: "Authenticated connection principal.",
+    });
+    log.info("connection_authenticated", {
+      connectionId,
+      principalType,
+      principalId,
+    });
+  };
+
+  const handleSessionTransferRequest = (
+    msg: Extract<ClientMessage, { type: "session_transfer_request" }>,
+    emit: EventEmitter,
+    context?: RouterMessageContext,
+  ): void => {
+    const session = sessions.get(msg.sessionId);
+    if (!session) {
+      emit({
+        type: "error",
+        sessionId: msg.sessionId,
+        message: `Session not found: ${msg.sessionId}`,
+      });
+      return;
+    }
+    if (!ensureSessionOwner(sessionOwners, msg.sessionId, emit)) {
+      emitSessionOwnershipError(emit, msg.sessionId);
+      return;
+    }
+
+    const connectionId = context?.connectionId ?? emitterConnectionIds.get(emit);
+    if (!connectionId) {
+      emit({
+        type: "error",
+        sessionId: msg.sessionId,
+        message: "Session transfer requires a registered connection.",
+      });
+      return;
+    }
+
+    const targetPrincipalId = msg.targetPrincipalId.trim();
+    if (!targetPrincipalId) {
+      emit({
+        type: "error",
+        sessionId: msg.sessionId,
+        message: "targetPrincipalId is required for session transfer.",
+      });
+      return;
+    }
+    const targetPrincipalType: PrincipalType = msg.targetPrincipalType ?? "user";
+    const sessionPrincipal = sessionPrincipals.get(msg.sessionId) ?? {
+      principalType: "user" as const,
+      principalId: "user:local",
+      source: "interactive" as const,
+    };
+    const expiresInMs = Math.max(
+      TRANSFER_MIN_TTL_MS,
+      Math.min(TRANSFER_MAX_TTL_MS, Math.floor(msg.expiresInMs ?? TRANSFER_DEFAULT_TTL_MS)),
+    );
+    const expiresAtMs = Date.now() + expiresInMs;
+
+    const transfer: SessionTransferRequest = {
+      sessionId: msg.sessionId,
+      requesterConnectionId: connectionId,
+      fromPrincipalType: sessionPrincipal.principalType,
+      fromPrincipalId: sessionPrincipal.principalId,
+      targetPrincipalType,
+      targetPrincipalId,
+      expiresAtMs,
+    };
+    sessionTransfers.set(msg.sessionId, transfer);
+
+    const requestedEvent: GatewayEvent = {
+      type: "session_transfer_requested",
+      sessionId: msg.sessionId,
+      fromPrincipalType: transfer.fromPrincipalType,
+      fromPrincipalId: transfer.fromPrincipalId,
+      targetPrincipalType: transfer.targetPrincipalType,
+      targetPrincipalId: transfer.targetPrincipalId,
+      expiresAt: new Date(transfer.expiresAtMs).toISOString(),
+    };
+
+    emit(requestedEvent);
+    for (const [activeConnectionId, activeEmit] of activeConnections) {
+      if (activeEmit === emit) continue;
+      const principal = resolvePrincipal(activeConnectionId);
+      if (!principal?.verified) continue;
+      if (principal.principalType !== targetPrincipalType || principal.principalId !== targetPrincipalId) continue;
+      activeEmit(requestedEvent);
+    }
+
+    log.info("session_transfer_requested", {
+      connectionId,
+      sessionId: msg.sessionId,
+      runtimeId: session.runtimeId,
+      fromPrincipalType: transfer.fromPrincipalType,
+      fromPrincipalId: transfer.fromPrincipalId,
+      targetPrincipalType,
+      targetPrincipalId,
+      expiresAt: new Date(expiresAtMs).toISOString(),
+    });
+  };
+
+  const handleSessionTransferAccept = (
+    msg: Extract<ClientMessage, { type: "session_transfer_accept" }>,
+    emit: EventEmitter,
+    context?: RouterMessageContext,
+  ): void => {
+    const session = sessions.get(msg.sessionId);
+    if (!session) {
+      emit({
+        type: "error",
+        sessionId: msg.sessionId,
+        message: `Session not found: ${msg.sessionId}`,
+      });
+      return;
+    }
+
+    const transfer = sessionTransfers.get(msg.sessionId);
+    if (!transfer) {
+      emit({
+        type: "error",
+        sessionId: msg.sessionId,
+        message: "No pending transfer for this session.",
+      });
+      return;
+    }
+
+    const connectionId = context?.connectionId ?? emitterConnectionIds.get(emit);
+    const principal = resolvePrincipal(connectionId);
+    if (!connectionId || !principal?.verified) {
+      emit({
+        type: "error",
+        sessionId: msg.sessionId,
+        message: "Session transfer acceptance requires authenticated connection principal.",
+      });
+      return;
+    }
+    if (Date.now() > transfer.expiresAtMs) {
+      sessionTransfers.delete(msg.sessionId);
+      emit({
+        type: "error",
+        sessionId: msg.sessionId,
+        message: "Pending transfer expired.",
+      });
+      return;
+    }
+    if (
+      principal.principalType !== transfer.targetPrincipalType
+      || principal.principalId !== transfer.targetPrincipalId
+    ) {
+      emit({
+        type: "error",
+        sessionId: msg.sessionId,
+        message: "Connection principal does not match transfer target.",
+      });
+      return;
+    }
+
+    const previousOwner = sessionOwners.get(msg.sessionId);
+    sessionOwners.set(msg.sessionId, emit);
+    sessionTransfers.delete(msg.sessionId);
+    sessionPrincipals.set(msg.sessionId, {
+      principalType: principal.principalType,
+      principalId: principal.principalId,
+      source: "interactive",
+    });
+    touchSession(msg.sessionId);
+    try {
+      stateStore.updateSession(msg.sessionId, {
+        principalType: principal.principalType,
+        principalId: principal.principalId,
+        source: "interactive",
+        lastActivityAt: new Date().toISOString(),
+      });
+    } catch {
+      // Session may already be gone from persistence if concurrently closed.
+    }
+
+    const transferredEvent: GatewayEvent = {
+      type: "session_transferred",
+      sessionId: msg.sessionId,
+      fromPrincipalType: transfer.fromPrincipalType,
+      fromPrincipalId: transfer.fromPrincipalId,
+      targetPrincipalType: transfer.targetPrincipalType,
+      targetPrincipalId: transfer.targetPrincipalId,
+      transferredAt: new Date().toISOString(),
+    };
+
+    if (previousOwner && previousOwner !== emit) {
+      previousOwner(transferredEvent);
+    }
+    emit(transferredEvent);
+    log.info("session_transferred", {
+      connectionId,
+      sessionId: msg.sessionId,
+      runtimeId: session.runtimeId,
+      fromPrincipalType: transfer.fromPrincipalType,
+      fromPrincipalId: transfer.fromPrincipalId,
+      targetPrincipalType: transfer.targetPrincipalType,
+      targetPrincipalId: transfer.targetPrincipalId,
+    });
   };
 
   const handlePrompt = (
@@ -1073,6 +1514,12 @@ export const createRouter = (deps: RouterDeps): Router => {
   const registerConnection = (connectionId: string, emit: EventEmitter): void => {
     activeConnections.set(connectionId, emit);
     emitterConnectionIds.set(emit, connectionId);
+    connectionPrincipals.set(connectionId, {
+      principalType: "user",
+      principalId: "user:local",
+      verified: false,
+    });
+    issueAuthChallenge(connectionId, emit);
     for (const runtime of listRuntimeHealth()) {
       emitRuntimeHealth(emit, runtime);
     }
@@ -1082,12 +1529,23 @@ export const createRouter = (deps: RouterDeps): Router => {
   const unregisterConnection = (connectionId: string, emit: EventEmitter): void => {
     activeConnections.delete(connectionId);
     emitterConnectionIds.delete(emit);
+    connectionPrincipals.delete(connectionId);
+    const challenge = authChallenges.get(connectionId);
+    if (challenge) {
+      consumedAuthChallenges.add(`${connectionId}:${challenge.nonce}`);
+      authChallenges.delete(connectionId);
+    }
 
     const released: string[] = [];
     for (const [sessionId, owner] of sessionOwners) {
       if (owner === emit) {
         sessionOwners.delete(sessionId);
         released.push(sessionId);
+      }
+    }
+    for (const [sessionId, transfer] of sessionTransfers) {
+      if (transfer.requesterConnectionId === connectionId) {
+        sessionTransfers.delete(sessionId);
       }
     }
 
@@ -1185,6 +1643,8 @@ export const createRouter = (deps: RouterDeps): Router => {
     switch (msg.type) {
       case "session_new":
         return handleSessionNew(msg, emit, context);
+      case "auth_proof":
+        return handleAuthProof(msg, emit, context);
       case "prompt":
         return handlePrompt(msg, emit, context);
       case "session_list":
@@ -1197,6 +1657,10 @@ export const createRouter = (deps: RouterDeps): Router => {
         return handleApprovalResponse(msg, emit, context);
       case "session_replay":
         return handleSessionReplay(msg, emit, context);
+      case "session_transfer_request":
+        return handleSessionTransferRequest(msg, emit, context);
+      case "session_transfer_accept":
+        return handleSessionTransferAccept(msg, emit, context);
       case "memory_query":
         return handleMemoryQuery(msg, emit, context);
     }

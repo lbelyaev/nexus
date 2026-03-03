@@ -96,6 +96,10 @@ Bridge interactive sessions to future scheduler/hooks/orchestration without rede
    - durable `executions` table with lifecycle state machine
    - `parentExecutionId` for delegation graphs
    - capability token binding at execution start
+6. Add principal-proof client identity + session handoff substrate:
+   - durable client keypair (device identity)
+   - nonce challenge + signature to bind WS connection to `principalId`
+   - explicit session transfer primitives (request/accept) keyed by principal, not raw connection
 
 ### Acceptance criteria
 
@@ -104,6 +108,9 @@ Bridge interactive sessions to future scheduler/hooks/orchestration without rede
 3. Duplicate prompt retries with the same idempotency key do not launch new runtime turns.
 4. Session metadata supports non-interactive principals (`service_account`) and non-chat sources.
 5. Contract tests validate protocol/runtime guards for all new fields.
+6. Mutating actions are attributable to an authenticated `principalId` proven via signed nonce handshake.
+7. Replay attempts with stale/used nonces are rejected deterministically.
+8. Session handoff supports explicit transfer across clients/principals with policy-enforced authorization checks.
 
 ### Non-goals
 

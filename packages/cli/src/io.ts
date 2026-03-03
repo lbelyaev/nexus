@@ -44,6 +44,14 @@ const serializePrettyEvent = (event: GatewayEvent): string => {
       return `[session_created] session=${event.sessionId} runtime=${event.runtimeId ?? "default"} model=${event.model} principal=${event.principalType ?? "user"}:${event.principalId ?? "user:local"} source=${event.source ?? "interactive"}`;
     case "session_closed":
       return `[session_closed] session=${event.sessionId} reason=${event.reason}`;
+    case "auth_challenge":
+      return `[auth_challenge] alg=${event.algorithm} expiresAt=${event.expiresAt}`;
+    case "auth_result":
+      return `[auth_result] ok=${event.ok}${event.principalId ? ` principal=${event.principalId}` : ""}${event.message ? ` message=${event.message}` : ""}`;
+    case "session_transfer_requested":
+      return `[session_transfer_requested] session=${event.sessionId} from=${event.fromPrincipalId} to=${event.targetPrincipalId} expiresAt=${event.expiresAt}`;
+    case "session_transferred":
+      return `[session_transferred] session=${event.sessionId} from=${event.fromPrincipalId} to=${event.targetPrincipalId} at=${event.transferredAt}`;
     case "runtime_health":
       return `[runtime_health] runtime=${event.runtime.runtimeId} status=${event.runtime.status}${event.runtime.reason ? ` reason=${event.runtime.reason}` : ""}`;
     case "text_delta":

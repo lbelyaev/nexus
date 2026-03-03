@@ -45,6 +45,29 @@ describe("isClientMessage", () => {
     expect(isClientMessage({ type: "session_replay", sessionId: "s1" })).toBe(true);
   });
 
+  it("validates auth_proof and session transfer messages", () => {
+    expect(isClientMessage({
+      type: "auth_proof",
+      principalId: "user:alice",
+      principalType: "user",
+      publicKey: "-----BEGIN PUBLIC KEY-----\nabc\n-----END PUBLIC KEY-----",
+      nonce: "nonce-1",
+      signature: "sig-1",
+      algorithm: "ed25519",
+    })).toBe(true);
+    expect(isClientMessage({
+      type: "session_transfer_request",
+      sessionId: "s1",
+      targetPrincipalId: "user:bob",
+      targetPrincipalType: "user",
+      expiresInMs: 30_000,
+    })).toBe(true);
+    expect(isClientMessage({
+      type: "session_transfer_accept",
+      sessionId: "s1",
+    })).toBe(true);
+  });
+
   it("validates a memory_query message", () => {
     expect(isClientMessage({ type: "memory_query", sessionId: "s1", action: "stats" })).toBe(true);
     expect(isClientMessage({
@@ -99,6 +122,22 @@ describe("isClientMessage", () => {
   it("rejects approval_response with wrong allow type", () => {
     expect(isClientMessage({ type: "approval_response", requestId: "r1", allow: "yes" })).toBe(false);
     expect(isClientMessage({ type: "approval_response", requestId: "r1" })).toBe(false);
+  });
+
+  it("rejects malformed auth_proof and session transfer messages", () => {
+    expect(isClientMessage({
+      type: "auth_proof",
+      principalId: "user:alice",
+      nonce: "nonce",
+      signature: "sig",
+    })).toBe(false);
+    expect(isClientMessage({
+      type: "session_transfer_request",
+      sessionId: "s1",
+      targetPrincipalId: "user:bob",
+      expiresInMs: 0,
+    })).toBe(false);
+    expect(isClientMessage({ type: "session_transfer_accept" })).toBe(false);
   });
 });
 
@@ -164,6 +203,40 @@ describe("isGatewayEvent", () => {
 
   it("validates session_closed", () => {
     expect(isGatewayEvent({ type: "session_closed", sessionId: "s1", reason: "client_close" })).toBe(true);
+  });
+
+  it("validates auth and transfer gateway events", () => {
+    expect(isGatewayEvent({
+      type: "auth_challenge",
+      algorithm: "ed25519",
+      nonce: "nonce-1",
+      issuedAt: "2026-01-01T00:00:00Z",
+      expiresAt: "2026-01-01T00:01:00Z",
+    })).toBe(true);
+    expect(isGatewayEvent({
+      type: "auth_result",
+      ok: true,
+      principalType: "user",
+      principalId: "user:alice",
+    })).toBe(true);
+    expect(isGatewayEvent({
+      type: "session_transfer_requested",
+      sessionId: "s1",
+      fromPrincipalType: "user",
+      fromPrincipalId: "user:alice",
+      targetPrincipalType: "user",
+      targetPrincipalId: "user:bob",
+      expiresAt: "2026-01-01T00:01:00Z",
+    })).toBe(true);
+    expect(isGatewayEvent({
+      type: "session_transferred",
+      sessionId: "s1",
+      fromPrincipalType: "user",
+      fromPrincipalId: "user:alice",
+      targetPrincipalType: "user",
+      targetPrincipalId: "user:bob",
+      transferredAt: "2026-01-01T00:00:30Z",
+    })).toBe(true);
   });
 
   it("validates runtime_health", () => {

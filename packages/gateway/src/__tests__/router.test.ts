@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createStateStore, type StateStore } from "@nexus/state";
 import type { PolicyConfig, GatewayEvent, ClientMessage } from "@nexus/types";
 import type { MemoryProvider } from "@nexus/memory";
+import { generateKeyPairSync, sign } from "node:crypto";
 import { createRouter, type Router, type EventEmitter, type ManagedAcpSession } from "../router.js";
 
 const mockAcpSession = (): ManagedAcpSession => ({
@@ -23,6 +24,30 @@ const collectEvents = (): { emit: EventEmitter; events: GatewayEvent[] } => {
   const events: GatewayEvent[] = [];
   const emit: EventEmitter = (event) => events.push(event);
   return { emit, events };
+};
+
+const createAuthProof = (params: {
+  nonce: string;
+  principalType?: "user" | "service_account";
+  principalId: string;
+}): Extract<ClientMessage, { type: "auth_proof" }> => {
+  const principalType = params.principalType ?? "user";
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  const payload = Buffer.from(
+    `${params.nonce}:${principalType}:${params.principalId}`,
+    "utf8",
+  );
+  const signature = sign(null, payload, privateKey).toString("base64");
+  const publicKeyPem = publicKey.export({ type: "spki", format: "pem" }).toString();
+  return {
+    type: "auth_proof",
+    principalType,
+    principalId: params.principalId,
+    publicKey: publicKeyPem,
+    nonce: params.nonce,
+    signature,
+    algorithm: "ed25519",
+  };
 };
 
 describe("createRouter", () => {
@@ -150,6 +175,63 @@ describe("createRouter", () => {
     expect(event.principalType).toBe("service_account");
     expect(event.principalId).toBe("svc:nightly");
     expect(event.source).toBe("schedule");
+  });
+
+  it("auth_proof binds a verified principal that session_new reuses", async () => {
+    const { emit, events } = collectEvents();
+    router.registerConnection("conn-1", emit);
+    const challenge = events.find((event) => event.type === "auth_challenge");
+    if (!challenge || challenge.type !== "auth_challenge") {
+      throw new Error("auth_challenge missing");
+    }
+
+    events.length = 0;
+    const proof = createAuthProof({
+      nonce: challenge.nonce,
+      principalId: "user:alice",
+    });
+    router.handleMessage(proof, emit, { connectionId: "conn-1" });
+    expect(events.some((event) => event.type === "auth_result")).toBe(true);
+    const authResult = events.find((event) => event.type === "auth_result");
+    if (!authResult || authResult.type !== "auth_result") throw new Error("expected auth_result");
+    expect(authResult.ok).toBe(true);
+    expect(authResult.principalId).toBe("user:alice");
+
+    events.length = 0;
+    router.handleMessage({ type: "session_new" }, emit, { connectionId: "conn-1" });
+    await vi.waitFor(() => {
+      expect(events.some((event) => event.type === "session_created")).toBe(true);
+    });
+    const created = events.find((event) => event.type === "session_created");
+    if (!created || created.type !== "session_created") throw new Error("expected session_created");
+    expect(created.principalId).toBe("user:alice");
+    expect(created.principalType).toBe("user");
+  });
+
+  it("auth_proof rejects nonce replay", () => {
+    const { emit, events } = collectEvents();
+    router.registerConnection("conn-1", emit);
+    const challenge = events.find((event) => event.type === "auth_challenge");
+    if (!challenge || challenge.type !== "auth_challenge") {
+      throw new Error("auth_challenge missing");
+    }
+    const proof = createAuthProof({
+      nonce: challenge.nonce,
+      principalId: "user:alice",
+    });
+
+    events.length = 0;
+    router.handleMessage(proof, emit, { connectionId: "conn-1" });
+    const first = events.find((event) => event.type === "auth_result");
+    if (!first || first.type !== "auth_result") throw new Error("expected auth_result");
+    expect(first.ok).toBe(true);
+
+    events.length = 0;
+    router.handleMessage(proof, emit, { connectionId: "conn-1" });
+    const second = events.find((event) => event.type === "auth_result");
+    if (!second || second.type !== "auth_result") throw new Error("expected auth_result");
+    expect(second.ok).toBe(false);
+    expect(second.message).toMatch(/already used/i);
   });
 
   it("prompt emits error event if sessionId not found", () => {
@@ -389,6 +471,72 @@ describe("createRouter", () => {
     );
     expect(other.events).toHaveLength(1);
     expect(other.events[0].type).toBe("transcript");
+  });
+
+  it("supports explicit session transfer between authenticated principals", async () => {
+    const owner = collectEvents();
+    const target = collectEvents();
+    router.registerConnection("conn-owner", owner.emit);
+    router.registerConnection("conn-target", target.emit);
+
+    const ownerChallenge = owner.events.find((event) => event.type === "auth_challenge");
+    const targetChallenge = target.events.find((event) => event.type === "auth_challenge");
+    if (!ownerChallenge || ownerChallenge.type !== "auth_challenge") throw new Error("owner auth_challenge missing");
+    if (!targetChallenge || targetChallenge.type !== "auth_challenge") throw new Error("target auth_challenge missing");
+
+    owner.events.length = 0;
+    target.events.length = 0;
+    router.handleMessage(createAuthProof({
+      nonce: ownerChallenge.nonce,
+      principalId: "user:alice",
+    }), owner.emit, { connectionId: "conn-owner" });
+    router.handleMessage(createAuthProof({
+      nonce: targetChallenge.nonce,
+      principalId: "user:bob",
+    }), target.emit, { connectionId: "conn-target" });
+
+    owner.events.length = 0;
+    target.events.length = 0;
+    router.handleMessage({ type: "session_new" }, owner.emit, { connectionId: "conn-owner" });
+    await vi.waitFor(() => {
+      expect(owner.events.some((event) => event.type === "session_created")).toBe(true);
+    });
+    const created = owner.events.find((event) => event.type === "session_created");
+    if (!created || created.type !== "session_created") throw new Error("expected session_created");
+
+    owner.events.length = 0;
+    target.events.length = 0;
+    router.handleMessage({
+      type: "session_transfer_request",
+      sessionId: created.sessionId,
+      targetPrincipalId: "user:bob",
+      targetPrincipalType: "user",
+    }, owner.emit, { connectionId: "conn-owner" });
+
+    expect(owner.events.some((event) => event.type === "session_transfer_requested")).toBe(true);
+    expect(target.events.some((event) => event.type === "session_transfer_requested")).toBe(true);
+
+    owner.events.length = 0;
+    target.events.length = 0;
+    router.handleMessage({
+      type: "session_transfer_accept",
+      sessionId: created.sessionId,
+    }, target.emit, { connectionId: "conn-target" });
+
+    expect(target.events.some((event) => event.type === "session_transferred")).toBe(true);
+    expect(owner.events.some((event) => event.type === "session_transferred")).toBe(true);
+
+    owner.events.length = 0;
+    target.events.length = 0;
+    router.handleMessage({ type: "session_replay", sessionId: created.sessionId }, owner.emit, { connectionId: "conn-owner" });
+    expect(owner.events).toHaveLength(1);
+    expect(owner.events[0].type).toBe("error");
+    if (owner.events[0].type === "error") {
+      expect(owner.events[0].message).toMatch(/owned by another connection/i);
+    }
+
+    router.handleMessage({ type: "session_replay", sessionId: created.sessionId }, target.emit, { connectionId: "conn-target" });
+    expect(target.events.some((event) => event.type === "transcript")).toBe(true);
   });
 
   it("sweepIdleSessions closes stale sessions", async () => {

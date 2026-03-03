@@ -14,6 +14,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { mergeContiguousMessages, type ChatMessage } from "../lib/chatMerge";
 import { inferRuntimeFromModel, resolveModelAlias } from "../lib/modelRouting";
+import { createWebAuthProofProvider } from "../lib/authProof";
 import { ScrollArea } from "./ui/ScrollArea";
 import { Separator } from "./ui/Separator";
 
@@ -204,7 +205,16 @@ const ConnectedClient = ({
     approvalRef.current?.handleEvent(event);
   }, []);
 
-  const { status, sendMessage, disconnect } = useConnection({ url, token, onEvent: handleEvent });
+  const authProvider = useMemo(() => createWebAuthProofProvider(), []);
+  const { status, sendMessage, disconnect } = useConnection({
+    url,
+    token,
+    onEvent: handleEvent,
+    auth: {
+      provider: authProvider,
+      autoRespondToChallenge: true,
+    },
+  });
   const session = useSession(sendMessage);
   const approval = useApproval(sendMessage);
 

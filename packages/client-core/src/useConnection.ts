@@ -12,6 +12,10 @@ export interface UseConnectionOptions {
   url: string;
   token: string;
   onEvent?: (event: GatewayEvent) => void;
+  auth?: {
+    provider?: AuthProofProvider;
+    autoRespondToChallenge?: boolean;
+  };
   reconnect?: {
     enabled?: boolean;
     initialDelayMs?: number;
@@ -26,6 +30,13 @@ export interface UseConnectionResult {
   disconnect: () => void;
 }
 
+export interface AuthProofProvider {
+  getAuthProof: (
+    challenge: Extract<GatewayEvent, { type: "auth_challenge" }>,
+  ) => Promise<Extract<ClientMessage, { type: "auth_proof" }> | null>;
+  onAuthResult?: (result: Extract<GatewayEvent, { type: "auth_result" }>) => void;
+}
+
 export const useConnection = (
   options: UseConnectionOptions,
 ): UseConnectionResult => {
@@ -37,18 +48,42 @@ export const useConnection = (
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   const wsRef = useRef<WebSocket | null>(null);
   const onEventRef = useRef(onEvent);
+  const authProviderRef = useRef(options.auth?.provider);
+  const autoAuthRef = useRef(options.auth?.autoRespondToChallenge ?? true);
   const reconnectAttemptRef = useRef(0);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const allowReconnectRef = useRef(true);
   onEventRef.current = onEvent;
+  authProviderRef.current = options.auth?.provider;
+  autoAuthRef.current = options.auth?.autoRespondToChallenge ?? true;
 
   useEffect(() => {
     const decoder = new TextDecoder();
-    const dispatchRaw = (raw: string): void => {
+    const dispatchEvent = (ws: WebSocket, event: GatewayEvent): void => {
+      if (event.type === "auth_challenge" && autoAuthRef.current) {
+        const provider = authProviderRef.current;
+        if (provider) {
+          void provider.getAuthProof(event)
+            .then((proof) => {
+              if (!proof) return;
+              if (ws.readyState !== WebSocket.OPEN) return;
+              ws.send(JSON.stringify(proof));
+            })
+            .catch(() => {
+              // Ignore auth proof errors to keep connection alive; caller sees auth_result failure.
+            });
+        }
+      } else if (event.type === "auth_result") {
+        authProviderRef.current?.onAuthResult?.(event);
+      }
+      onEventRef.current?.(event);
+    };
+
+    const dispatchRaw = (ws: WebSocket, raw: string): void => {
       try {
         const data = JSON.parse(raw);
-        if (isGatewayEvent(data) && onEventRef.current) {
-          onEventRef.current(data);
+        if (isGatewayEvent(data)) {
+          dispatchEvent(ws, data);
         }
       } catch {
         // Ignore malformed messages
@@ -97,24 +132,24 @@ export const useConnection = (
 
       ws.onmessage = (event: MessageEvent) => {
         if (typeof event.data === "string") {
-          dispatchRaw(event.data);
+          dispatchRaw(ws, event.data);
           return;
         }
 
         if (event.data instanceof ArrayBuffer) {
-          dispatchRaw(decoder.decode(new Uint8Array(event.data)));
+          dispatchRaw(ws, decoder.decode(new Uint8Array(event.data)));
           return;
         }
 
         if (ArrayBuffer.isView(event.data)) {
-          dispatchRaw(decoder.decode(event.data));
+          dispatchRaw(ws, decoder.decode(event.data));
           return;
         }
 
         if (typeof Blob !== "undefined" && event.data instanceof Blob) {
           event.data
             .text()
-            .then((text) => dispatchRaw(text))
+            .then((text) => dispatchRaw(ws, text))
             .catch(() => {});
           return;
         }
@@ -130,7 +165,7 @@ export const useConnection = (
             event.data as unknown as { text: () => Promise<string> }
           )
             .text()
-            .then((text) => dispatchRaw(text))
+            .then((text) => dispatchRaw(ws, text))
             .catch(() => {});
         }
       };

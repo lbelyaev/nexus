@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useRef } from "react";
+import React, { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import { Box, Text } from "ink";
 import { useConnection, useSession, useApproval } from "@nexus/client-core";
 import type { GatewayEvent } from "@nexus/types";
@@ -7,6 +7,7 @@ import { Chat, type ChatMessage } from "./components/Chat.js";
 import { Input } from "./components/Input.js";
 import { ToolStatus } from "./components/ToolStatus.js";
 import { ApprovalPrompt } from "./components/ApprovalPrompt.js";
+import { createTuiAuthProofProvider } from "./auth/provider.js";
 
 export interface AppProps {
   url: string;
@@ -132,7 +133,16 @@ export const App = ({ url, token }: AppProps) => {
     }
   }, []);
 
-  const { status, sendMessage } = useConnection({ url, token, onEvent: handleEvent });
+  const authProvider = useMemo(() => createTuiAuthProofProvider(), []);
+  const { status, sendMessage } = useConnection({
+    url,
+    token,
+    onEvent: handleEvent,
+    auth: {
+      provider: authProvider,
+      autoRespondToChallenge: true,
+    },
+  });
   const session = useSession(sendMessage);
   const approval = useApproval(sendMessage);
 

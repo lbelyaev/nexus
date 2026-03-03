@@ -26,6 +26,7 @@ export type MemoryScope = "session" | "workspace" | "hybrid";
 export type RuntimeHealthStatus = "starting" | "healthy" | "degraded" | "unavailable";
 export type PrincipalType = "user" | "service_account";
 export type PromptSource = "interactive" | "schedule" | "hook" | "api";
+export type AuthAlgorithm = "ed25519";
 
 export interface RuntimeHealthInfo {
   runtimeId: string;
@@ -56,6 +57,26 @@ export type ClientMessage =
     }
   | { type: "session_list" }
   | { type: "session_replay"; sessionId: string }
+  | {
+      type: "auth_proof";
+      principalType?: PrincipalType;
+      principalId: string;
+      publicKey: string;
+      nonce: string;
+      signature: string;
+      algorithm?: AuthAlgorithm;
+    }
+  | {
+      type: "session_transfer_request";
+      sessionId: string;
+      targetPrincipalId: string;
+      targetPrincipalType?: PrincipalType;
+      expiresInMs?: number;
+    }
+  | {
+      type: "session_transfer_accept";
+      sessionId: string;
+    }
   | {
       type: "memory_query";
       sessionId: string;
@@ -105,6 +126,38 @@ export type GatewayEvent =
       runtimeDefaults?: Record<string, string>;
     }
   | { type: "session_closed"; sessionId: string; reason: string }
+  | {
+      type: "auth_challenge";
+      algorithm: AuthAlgorithm;
+      nonce: string;
+      issuedAt: string;
+      expiresAt: string;
+    }
+  | {
+      type: "auth_result";
+      ok: boolean;
+      principalType?: PrincipalType;
+      principalId?: string;
+      message?: string;
+    }
+  | {
+      type: "session_transfer_requested";
+      sessionId: string;
+      fromPrincipalType: PrincipalType;
+      fromPrincipalId: string;
+      targetPrincipalType: PrincipalType;
+      targetPrincipalId: string;
+      expiresAt: string;
+    }
+  | {
+      type: "session_transferred";
+      sessionId: string;
+      fromPrincipalType: PrincipalType;
+      fromPrincipalId: string;
+      targetPrincipalType: PrincipalType;
+      targetPrincipalId: string;
+      transferredAt: string;
+    }
   | { type: "runtime_health"; runtime: RuntimeHealthInfo }
   | { type: "session_list"; sessions: SessionInfo[] }
   | { type: "transcript"; sessionId: string; messages: TranscriptMessage[] }
@@ -163,6 +216,9 @@ const CLIENT_MESSAGE_TYPES = new Set([
   "session_new",
   "session_list",
   "session_replay",
+  "auth_proof",
+  "session_transfer_request",
+  "session_transfer_accept",
   "memory_query",
 ]);
 
@@ -176,6 +232,10 @@ const GATEWAY_EVENT_TYPES = new Set([
   "error",
   "session_created",
   "session_closed",
+  "auth_challenge",
+  "auth_result",
+  "session_transfer_requested",
+  "session_transferred",
   "runtime_health",
   "session_list",
   "transcript",
@@ -278,6 +338,27 @@ export const isClientMessage = (value: unknown): value is ClientMessage => {
       return true;
     case "session_replay":
       return typeof obj.sessionId === "string";
+    case "auth_proof":
+      return (
+        typeof obj.principalId === "string"
+        && typeof obj.publicKey === "string"
+        && typeof obj.nonce === "string"
+        && typeof obj.signature === "string"
+        && (obj.principalType === undefined || (typeof obj.principalType === "string" && PRINCIPAL_TYPES.has(obj.principalType as PrincipalType)))
+        && (obj.algorithm === undefined || obj.algorithm === "ed25519")
+      );
+    case "session_transfer_request":
+      return (
+        typeof obj.sessionId === "string"
+        && typeof obj.targetPrincipalId === "string"
+        && (obj.targetPrincipalType === undefined || (typeof obj.targetPrincipalType === "string" && PRINCIPAL_TYPES.has(obj.targetPrincipalType as PrincipalType)))
+        && (
+          obj.expiresInMs === undefined
+          || (typeof obj.expiresInMs === "number" && Number.isFinite(obj.expiresInMs) && obj.expiresInMs > 0)
+        )
+      );
+    case "session_transfer_accept":
+      return typeof obj.sessionId === "string";
     case "memory_query":
       return (
         typeof obj.sessionId === "string"
@@ -374,6 +455,42 @@ export const isGatewayEvent = (value: unknown): value is GatewayEvent => {
       return (
         typeof obj.sessionId === "string"
         && typeof obj.reason === "string"
+      );
+    case "auth_challenge":
+      return (
+        obj.algorithm === "ed25519"
+        && typeof obj.nonce === "string"
+        && typeof obj.issuedAt === "string"
+        && typeof obj.expiresAt === "string"
+      );
+    case "auth_result":
+      return (
+        typeof obj.ok === "boolean"
+        && (obj.principalType === undefined || (typeof obj.principalType === "string" && PRINCIPAL_TYPES.has(obj.principalType as PrincipalType)))
+        && (obj.principalId === undefined || typeof obj.principalId === "string")
+        && (obj.message === undefined || typeof obj.message === "string")
+      );
+    case "session_transfer_requested":
+      return (
+        typeof obj.sessionId === "string"
+        && typeof obj.fromPrincipalType === "string"
+        && PRINCIPAL_TYPES.has(obj.fromPrincipalType as PrincipalType)
+        && typeof obj.fromPrincipalId === "string"
+        && typeof obj.targetPrincipalType === "string"
+        && PRINCIPAL_TYPES.has(obj.targetPrincipalType as PrincipalType)
+        && typeof obj.targetPrincipalId === "string"
+        && typeof obj.expiresAt === "string"
+      );
+    case "session_transferred":
+      return (
+        typeof obj.sessionId === "string"
+        && typeof obj.fromPrincipalType === "string"
+        && PRINCIPAL_TYPES.has(obj.fromPrincipalType as PrincipalType)
+        && typeof obj.fromPrincipalId === "string"
+        && typeof obj.targetPrincipalType === "string"
+        && PRINCIPAL_TYPES.has(obj.targetPrincipalType as PrincipalType)
+        && typeof obj.targetPrincipalId === "string"
+        && typeof obj.transferredAt === "string"
       );
     case "runtime_health":
       return (

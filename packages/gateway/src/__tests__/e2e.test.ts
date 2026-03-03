@@ -42,7 +42,19 @@ const waitForMessage = (messages: string[], timeout = 2000): Promise<string> =>
     const start = Date.now();
     const check = () => {
       if (messages.length > 0) {
-        resolve(messages.shift()!);
+        const next = messages.shift()!;
+        try {
+          const parsed = JSON.parse(next) as GatewayEvent;
+          // Connection-level auth/runtime bootstrap events can arrive before
+          // test-triggered session events; skip them in generic wait helper.
+          if (parsed.type === "auth_challenge" || parsed.type === "runtime_health") {
+            setTimeout(check, 0);
+            return;
+          }
+        } catch {
+          // Keep raw handling behavior if this is not parseable JSON.
+        }
+        resolve(next);
         return;
       }
       if (Date.now() - start > timeout) {

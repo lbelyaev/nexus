@@ -61,6 +61,9 @@ export interface UseSessionResult {
   modelCatalog: Record<string, string[]>;
   runtimeDefaults: Record<string, string>;
   runtimeHealth: Record<string, { status: "starting" | "healthy" | "degraded" | "unavailable"; updatedAt: string; reason?: string }>;
+  authStatus: "unverified" | "verifying" | "verified" | "failed";
+  authPrincipalType: "user" | "service_account" | null;
+  authPrincipalId: string | null;
   responseText: string;
   thinkingText: string;
   isStreaming: boolean;
@@ -74,6 +77,13 @@ export interface UseSessionResult {
   cancel: () => void;
   closeSession: () => void;
   requestReplay: (sessionId: string) => void;
+  requestSessionTransfer: (
+    targetPrincipalId: string,
+    targetPrincipalType?: "user" | "service_account",
+    expiresInMs?: number,
+    sessionId?: string,
+  ) => void;
+  acceptSessionTransfer: (sessionId?: string) => void;
   requestMemory: (query: MemoryQueryInput) => void;
   handleEvent: (event: GatewayEvent) => void;
 }
@@ -93,6 +103,9 @@ export const useSession = (
   const [modelCatalog, setModelCatalog] = useState<Record<string, string[]>>({});
   const [runtimeDefaults, setRuntimeDefaults] = useState<Record<string, string>>({});
   const [runtimeHealth, setRuntimeHealth] = useState<Record<string, { status: "starting" | "healthy" | "degraded" | "unavailable"; updatedAt: string; reason?: string }>>({});
+  const [authStatus, setAuthStatus] = useState<"unverified" | "verifying" | "verified" | "failed">("unverified");
+  const [authPrincipalType, setAuthPrincipalType] = useState<"user" | "service_account" | null>(null);
+  const [authPrincipalId, setAuthPrincipalId] = useState<string | null>(null);
   const [responseText, setResponseText] = useState("");
   const [thinkingText, setThinkingText] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
@@ -221,6 +234,18 @@ export const useSession = (
           },
         }));
         break;
+      case "auth_challenge":
+        setAuthStatus("verifying");
+        break;
+      case "auth_result":
+        if (event.ok) {
+          setAuthStatus("verified");
+          setAuthPrincipalType(event.principalType ?? "user");
+          setAuthPrincipalId(event.principalId ?? null);
+        } else {
+          setAuthStatus("failed");
+        }
+        break;
       case "text_delta":
         ignoreCancelledTurnEndRef.current = false;
         textBufferRef.current += event.delta;
@@ -347,6 +372,39 @@ export const useSession = (
     [sendMessage],
   );
 
+  const requestSessionTransfer = useCallback(
+    (
+      targetPrincipalId: string,
+      targetPrincipalType: "user" | "service_account" = "user",
+      expiresInMs?: number,
+      explicitSessionId?: string,
+    ) => {
+      const sid = explicitSessionId ?? sessionId;
+      const target = targetPrincipalId.trim();
+      if (!sid || !target) return;
+      sendMessage({
+        type: "session_transfer_request",
+        sessionId: sid,
+        targetPrincipalId: target,
+        targetPrincipalType,
+        ...(expiresInMs !== undefined ? { expiresInMs } : {}),
+      });
+    },
+    [sendMessage, sessionId],
+  );
+
+  const acceptSessionTransfer = useCallback(
+    (explicitSessionId?: string) => {
+      const sid = explicitSessionId ?? sessionId;
+      if (!sid) return;
+      sendMessage({
+        type: "session_transfer_accept",
+        sessionId: sid,
+      });
+    },
+    [sendMessage, sessionId],
+  );
+
   const requestMemory = useCallback(
     (query: MemoryQueryInput) => {
       if (!sessionId) return;
@@ -384,6 +442,9 @@ export const useSession = (
     modelCatalog,
     runtimeDefaults,
     runtimeHealth,
+    authStatus,
+    authPrincipalType,
+    authPrincipalId,
     responseText,
     thinkingText,
     isStreaming,
@@ -397,6 +458,8 @@ export const useSession = (
     cancel,
     closeSession,
     requestReplay,
+    requestSessionTransfer,
+    acceptSessionTransfer,
     requestMemory,
     handleEvent,
   };
