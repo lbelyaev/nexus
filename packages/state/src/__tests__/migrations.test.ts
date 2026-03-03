@@ -19,6 +19,9 @@ describe("initDatabase", () => {
 
     expect(columnNames).toContain("id");
     expect(columnNames).toContain("workspaceId");
+    expect(columnNames).toContain("principalType");
+    expect(columnNames).toContain("principalId");
+    expect(columnNames).toContain("source");
     expect(columnNames).toContain("runtimeId");
     expect(columnNames).toContain("acpSessionId");
     expect(columnNames).toContain("status");

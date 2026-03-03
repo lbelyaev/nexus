@@ -157,6 +157,18 @@ The CLI exists as a standalone tool (Option A), and the gateway exposes an admin
 
 ---
 
+## Execution Substrate Alignment (Current)
+
+Orchestration now runs on top of an execution-correlated substrate:
+
+1. `session_new` supports `principalType`, `principalId`, and `source` (`interactive | schedule | hook | api`).
+2. Turn stream events include correlation fields (`executionId`, `turnId`, `policySnapshotId`).
+3. Prompt retries can use `idempotencyKey` to suppress duplicate execution starts.
+
+This keeps Option A compatible with future scheduler/hook triggers without changing CLI semantics.
+
+---
+
 ## Immediate: `@nexus/cli` Spec
 
 ### Package: `@nexus/cli`

@@ -8,6 +8,9 @@ export interface SessionInfo {
   status: "active" | "idle";
   model: string;
   workspaceId?: string;
+  principalType?: PrincipalType;
+  principalId?: string;
+  source?: PromptSource;
   createdAt: string;
   lastActivityAt: string;
 }
@@ -20,12 +23,37 @@ export interface ApprovalOption {
 
 export type MemoryQueryAction = "stats" | "recent" | "search" | "context" | "clear";
 export type MemoryScope = "session" | "workspace" | "hybrid";
+export type RuntimeHealthStatus = "starting" | "healthy" | "degraded" | "unavailable";
+export type PrincipalType = "user" | "service_account";
+export type PromptSource = "interactive" | "schedule" | "hook" | "api";
+
+export interface RuntimeHealthInfo {
+  runtimeId: string;
+  status: RuntimeHealthStatus;
+  updatedAt: string;
+  reason?: string;
+}
+
+export interface EventCorrelation {
+  executionId?: string;
+  turnId?: string;
+  policySnapshotId?: string;
+}
 
 export type ClientMessage =
-  | { type: "prompt"; sessionId: string; text: string }
+  | { type: "prompt"; sessionId: string; text: string; idempotencyKey?: string }
   | { type: "approval_response"; requestId: string; allow?: boolean; optionId?: string }
   | { type: "cancel"; sessionId: string }
-  | { type: "session_new"; runtimeId?: string; model?: string; workspaceId?: string }
+  | { type: "session_close"; sessionId: string }
+  | {
+      type: "session_new";
+      runtimeId?: string;
+      model?: string;
+      workspaceId?: string;
+      principalType?: PrincipalType;
+      principalId?: string;
+      source?: PromptSource;
+    }
   | { type: "session_list" }
   | { type: "session_replay"; sessionId: string }
   | {
@@ -48,10 +76,10 @@ export interface MemoryContextSnapshot {
 }
 
 export type GatewayEvent =
-  | { type: "text_delta"; sessionId: string; delta: string }
-  | { type: "thinking_delta"; sessionId: string; delta: string }
-  | { type: "tool_start"; sessionId: string; tool: string; toolCallId?: string; params: unknown }
-  | { type: "tool_end"; sessionId: string; tool: string; toolCallId?: string; result?: string }
+  | ({ type: "text_delta"; sessionId: string; delta: string } & EventCorrelation)
+  | ({ type: "thinking_delta"; sessionId: string; delta: string } & EventCorrelation)
+  | ({ type: "tool_start"; sessionId: string; tool: string; toolCallId?: string; params: unknown } & EventCorrelation)
+  | ({ type: "tool_end"; sessionId: string; tool: string; toolCallId?: string; result?: string } & EventCorrelation)
   | {
       type: "approval_request";
       sessionId: string;
@@ -59,20 +87,25 @@ export type GatewayEvent =
       tool: string;
       description: string;
       options?: ApprovalOption[];
-    }
-  | { type: "turn_end"; sessionId: string; stopReason: string }
-  | { type: "error"; sessionId: string; message: string }
+    } & EventCorrelation
+  | ({ type: "turn_end"; sessionId: string; stopReason: string } & EventCorrelation)
+  | ({ type: "error"; sessionId: string; message: string } & EventCorrelation)
   | {
       type: "session_created";
       sessionId: string;
       model: string;
       runtimeId?: string;
       workspaceId?: string;
+      principalType?: PrincipalType;
+      principalId?: string;
+      source?: PromptSource;
       modelRouting?: Record<string, string>;
       modelAliases?: Record<string, string>;
       modelCatalog?: Record<string, string[]>;
       runtimeDefaults?: Record<string, string>;
     }
+  | { type: "session_closed"; sessionId: string; reason: string }
+  | { type: "runtime_health"; runtime: RuntimeHealthInfo }
   | { type: "session_list"; sessions: SessionInfo[] }
   | { type: "transcript"; sessionId: string; messages: TranscriptMessage[] }
   | {
@@ -126,6 +159,7 @@ const CLIENT_MESSAGE_TYPES = new Set([
   "prompt",
   "approval_response",
   "cancel",
+  "session_close",
   "session_new",
   "session_list",
   "session_replay",
@@ -141,6 +175,8 @@ const GATEWAY_EVENT_TYPES = new Set([
   "turn_end",
   "error",
   "session_created",
+  "session_closed",
+  "runtime_health",
   "session_list",
   "transcript",
   "memory_result",
@@ -158,6 +194,18 @@ const MEMORY_SCOPES = new Set<MemoryScope>([
   "session",
   "workspace",
   "hybrid",
+]);
+
+const PRINCIPAL_TYPES = new Set<PrincipalType>([
+  "user",
+  "service_account",
+]);
+
+const PROMPT_SOURCES = new Set<PromptSource>([
+  "interactive",
+  "schedule",
+  "hook",
+  "api",
 ]);
 
 const isStringRecord = (value: unknown): value is Record<string, string> => (
@@ -190,6 +238,12 @@ const isMemoryContextSnapshot = (value: unknown): value is MemoryContextSnapshot
   );
 };
 
+const hasValidCorrelation = (obj: Record<string, unknown>): boolean => (
+  (obj.executionId === undefined || typeof obj.executionId === "string")
+  && (obj.turnId === undefined || typeof obj.turnId === "string")
+  && (obj.policySnapshotId === undefined || typeof obj.policySnapshotId === "string")
+);
+
 export const isClientMessage = (value: unknown): value is ClientMessage => {
   if (typeof value !== "object" || value === null) return false;
   const obj = value as Record<string, unknown>;
@@ -197,7 +251,11 @@ export const isClientMessage = (value: unknown): value is ClientMessage => {
 
   switch (obj.type) {
     case "prompt":
-      return typeof obj.sessionId === "string" && typeof obj.text === "string";
+      return (
+        typeof obj.sessionId === "string"
+        && typeof obj.text === "string"
+        && (obj.idempotencyKey === undefined || typeof obj.idempotencyKey === "string")
+      );
     case "approval_response":
       return (
         typeof obj.requestId === "string" &&
@@ -205,11 +263,16 @@ export const isClientMessage = (value: unknown): value is ClientMessage => {
       );
     case "cancel":
       return typeof obj.sessionId === "string";
+    case "session_close":
+      return typeof obj.sessionId === "string";
     case "session_new":
       return (
         (obj.runtimeId === undefined || typeof obj.runtimeId === "string")
         && (obj.model === undefined || typeof obj.model === "string")
         && (obj.workspaceId === undefined || typeof obj.workspaceId === "string")
+        && (obj.principalType === undefined || (typeof obj.principalType === "string" && PRINCIPAL_TYPES.has(obj.principalType as PrincipalType)))
+        && (obj.principalId === undefined || typeof obj.principalId === "string")
+        && (obj.source === undefined || (typeof obj.source === "string" && PROMPT_SOURCES.has(obj.source as PromptSource)))
       );
     case "session_list":
       return true;
@@ -241,11 +304,23 @@ export const isGatewayEvent = (value: unknown): value is GatewayEvent => {
   switch (obj.type) {
     case "text_delta":
     case "thinking_delta":
-      return typeof obj.sessionId === "string" && typeof obj.delta === "string";
+      return (
+        typeof obj.sessionId === "string"
+        && typeof obj.delta === "string"
+        && hasValidCorrelation(obj)
+      );
     case "tool_start":
-      return typeof obj.sessionId === "string" && typeof obj.tool === "string";
+      return (
+        typeof obj.sessionId === "string"
+        && typeof obj.tool === "string"
+        && hasValidCorrelation(obj)
+      );
     case "tool_end":
-      return typeof obj.sessionId === "string" && typeof obj.tool === "string";
+      return (
+        typeof obj.sessionId === "string"
+        && typeof obj.tool === "string"
+        && hasValidCorrelation(obj)
+      );
     case "approval_request":
       return (
         typeof obj.sessionId === "string" &&
@@ -267,21 +342,56 @@ export const isGatewayEvent = (value: unknown): value is GatewayEvent => {
             )
           )
         )
+        && hasValidCorrelation(obj)
       );
     case "turn_end":
-      return typeof obj.sessionId === "string" && typeof obj.stopReason === "string";
+      return (
+        typeof obj.sessionId === "string"
+        && typeof obj.stopReason === "string"
+        && hasValidCorrelation(obj)
+      );
     case "error":
-      return typeof obj.sessionId === "string" && typeof obj.message === "string";
+      return (
+        typeof obj.sessionId === "string"
+        && typeof obj.message === "string"
+        && hasValidCorrelation(obj)
+      );
     case "session_created":
       return (
         typeof obj.sessionId === "string"
         && typeof obj.model === "string"
         && (obj.runtimeId === undefined || typeof obj.runtimeId === "string")
         && (obj.workspaceId === undefined || typeof obj.workspaceId === "string")
+        && (obj.principalType === undefined || (typeof obj.principalType === "string" && PRINCIPAL_TYPES.has(obj.principalType as PrincipalType)))
+        && (obj.principalId === undefined || typeof obj.principalId === "string")
+        && (obj.source === undefined || (typeof obj.source === "string" && PROMPT_SOURCES.has(obj.source as PromptSource)))
         && (obj.modelRouting === undefined || isStringRecord(obj.modelRouting))
         && (obj.modelAliases === undefined || isStringRecord(obj.modelAliases))
         && (obj.modelCatalog === undefined || isStringArrayRecord(obj.modelCatalog))
         && (obj.runtimeDefaults === undefined || isStringRecord(obj.runtimeDefaults))
+      );
+    case "session_closed":
+      return (
+        typeof obj.sessionId === "string"
+        && typeof obj.reason === "string"
+      );
+    case "runtime_health":
+      return (
+        typeof obj.runtime === "object"
+        && obj.runtime !== null
+        && typeof (obj.runtime as Record<string, unknown>).runtimeId === "string"
+        && typeof (obj.runtime as Record<string, unknown>).status === "string"
+        && (
+          (obj.runtime as Record<string, unknown>).status === "starting"
+          || (obj.runtime as Record<string, unknown>).status === "healthy"
+          || (obj.runtime as Record<string, unknown>).status === "degraded"
+          || (obj.runtime as Record<string, unknown>).status === "unavailable"
+        )
+        && typeof (obj.runtime as Record<string, unknown>).updatedAt === "string"
+        && (
+          (obj.runtime as Record<string, unknown>).reason === undefined
+          || typeof (obj.runtime as Record<string, unknown>).reason === "string"
+        )
       );
     case "session_list":
       return Array.isArray(obj.sessions);

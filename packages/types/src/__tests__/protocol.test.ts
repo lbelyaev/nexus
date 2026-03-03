@@ -4,6 +4,7 @@ import { isClientMessage, isGatewayEvent, parseClientMessage } from "../protocol
 describe("isClientMessage", () => {
   it("validates a prompt message", () => {
     expect(isClientMessage({ type: "prompt", sessionId: "s1", text: "hello" })).toBe(true);
+    expect(isClientMessage({ type: "prompt", sessionId: "s1", text: "hello", idempotencyKey: "req-123" })).toBe(true);
   });
 
   it("validates an approval_response message", () => {
@@ -16,11 +17,24 @@ describe("isClientMessage", () => {
     expect(isClientMessage({ type: "cancel", sessionId: "s1" })).toBe(true);
   });
 
+  it("validates a session_close message", () => {
+    expect(isClientMessage({ type: "session_close", sessionId: "s1" })).toBe(true);
+  });
+
   it("validates a session_new message", () => {
     expect(isClientMessage({ type: "session_new" })).toBe(true);
     expect(isClientMessage({ type: "session_new", runtimeId: "claude-code" })).toBe(true);
     expect(isClientMessage({ type: "session_new", runtimeId: "claude", model: "sonnet" })).toBe(true);
     expect(isClientMessage({ type: "session_new", runtimeId: "claude", model: "sonnet", workspaceId: "acme" })).toBe(true);
+    expect(isClientMessage({
+      type: "session_new",
+      runtimeId: "claude",
+      model: "sonnet",
+      workspaceId: "acme",
+      principalType: "service_account",
+      principalId: "svc:nightly",
+      source: "schedule",
+    })).toBe(true);
   });
 
   it("validates a session_list message", () => {
@@ -79,6 +93,7 @@ describe("isClientMessage", () => {
   it("rejects prompt with missing required fields", () => {
     expect(isClientMessage({ type: "prompt", sessionId: "s1" })).toBe(false);
     expect(isClientMessage({ type: "prompt", text: "hello" })).toBe(false);
+    expect(isClientMessage({ type: "prompt", sessionId: "s1", text: "hello", idempotencyKey: 123 })).toBe(false);
   });
 
   it("rejects approval_response with wrong allow type", () => {
@@ -90,6 +105,7 @@ describe("isClientMessage", () => {
 describe("isGatewayEvent", () => {
   it("validates text_delta", () => {
     expect(isGatewayEvent({ type: "text_delta", sessionId: "s1", delta: "hi" })).toBe(true);
+    expect(isGatewayEvent({ type: "text_delta", sessionId: "s1", delta: "hi", executionId: "exec-1", turnId: "turn-1" })).toBe(true);
   });
 
   it("validates tool_start", () => {
@@ -143,6 +159,21 @@ describe("isGatewayEvent", () => {
       modelAliases: { fast: "gpt-5.2-codex-mini" },
       modelCatalog: { codex: ["gpt-5.2-codex", "gpt-5.3-codex"] },
       runtimeDefaults: { codex: "gpt-5.2-codex" },
+    })).toBe(true);
+  });
+
+  it("validates session_closed", () => {
+    expect(isGatewayEvent({ type: "session_closed", sessionId: "s1", reason: "client_close" })).toBe(true);
+  });
+
+  it("validates runtime_health", () => {
+    expect(isGatewayEvent({
+      type: "runtime_health",
+      runtime: {
+        runtimeId: "codex",
+        status: "healthy",
+        updatedAt: "2026-01-01T00:00:00Z",
+      },
     })).toBe(true);
   });
 

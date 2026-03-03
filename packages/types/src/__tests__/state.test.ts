@@ -5,6 +5,9 @@ describe("isSessionRecord", () => {
   const validSession = {
     id: "sess-1",
     workspaceId: "default",
+    principalType: "user",
+    principalId: "user:local",
+    source: "interactive",
     runtimeId: "claude-code",
     acpSessionId: "acp-123",
     status: "active",

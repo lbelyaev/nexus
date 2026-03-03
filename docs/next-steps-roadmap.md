@@ -21,14 +21,20 @@ This document is execution-oriented: each milestone has scope, dependencies, and
 5. Headless orchestration Option A exists via `@nexus/cli`.
 6. Memory provider is wired with session + workspace scopes, and hybrid context retrieval is used on prompts.
 7. TUI includes `/workspace` and `/memory` operational commands for memory visibility and control.
+8. Session creation supports explicit principal metadata (`principalType`, `principalId`) and source (`interactive | schedule | hook | api`).
+9. Prompt and turn streams carry execution correlation fields (`executionId`, `turnId`, `policySnapshotId`) for tracing and audit joins.
+10. Prompt idempotency keys are supported for duplicate suppression (`stopReason: "idempotent_duplicate"`).
 
 Primary gaps:
 
 1. No external chat channels (Telegram/Discord).
-2. No scheduler/pipeline execution layer.
-3. Security is still PoC-level (auth scope, secrets, sandbox posture, audit completeness).
-4. Admin/observability surfaces are minimal.
-5. Workspace model is not yet fully first-class across policy/auth/secrets (memory is ahead of other subsystems).
+2. No persisted first-class `Execution` record/graph (`parentExecutionId`, durable state transitions) yet.
+3. No scheduler/pipeline execution layer.
+4. Security is still PoC-level (auth scope, secrets, sandbox posture, audit completeness).
+5. No capability-token binding model yet (principal ∩ policy ∩ runtime ∩ execution token).
+6. External secure hook ingress is not implemented.
+7. Admin/observability surfaces are minimal.
+8. Workspace model is not yet fully first-class across policy/auth/secrets (memory is ahead of other subsystems).
 
 ---
 
@@ -72,6 +78,38 @@ All later milestones depend on stable session lifecycle, runtime health handling
 
 1. Multi-tenant auth redesign.
 2. New channel adapters.
+
+---
+
+## M0.5 — Execution Substrate Common Ground
+
+### Why now
+Bridge interactive sessions to future scheduler/hooks/orchestration without redesigning the protocol later.
+
+### Scope
+
+1. Standardize principal/source envelope on session creation (`principalType`, `principalId`, `source`).
+2. Attach execution correlation to turn/tool/approval events (`executionId`, `turnId`, `policySnapshotId`).
+3. Add prompt idempotency key handling to prevent accidental duplicate execution starts.
+4. Persist execution context in audit details for approvals/tool calls/errors.
+5. Define and stage next substrate pieces:
+   - durable `executions` table with lifecycle state machine
+   - `parentExecutionId` for delegation graphs
+   - capability token binding at execution start
+
+### Acceptance criteria
+
+1. Every prompt run has stable execution/turn identifiers visible in logs and client events.
+2. Approval and tool events are joinable back to an execution ID and policy snapshot ID.
+3. Duplicate prompt retries with the same idempotency key do not launch new runtime turns.
+4. Session metadata supports non-interactive principals (`service_account`) and non-chat sources.
+5. Contract tests validate protocol/runtime guards for all new fields.
+
+### Non-goals
+
+1. Full execution DAG orchestration semantics in this milestone.
+2. Hook endpoint implementation.
+3. Scheduler UI/API.
 
 ---
 
@@ -278,7 +316,7 @@ Acceptance:
 
 ## 90-Day Suggested Plan
 
-1. Days 1-21: M0 (foundation), with strict regression testing.
+1. Days 1-21: M0 (foundation) + M0.5 protocol substrate (principal/source/correlation/idempotency).
 2. Days 22-50: M1 (memory/context) baseline provider + budget manager.
 3. Days 51-75: M2 (Discord then Telegram) + channel policy overlays.
 4. Days 76-90: M3 scheduler/pipeline MVP + M4 security tranche 1 kickoff.

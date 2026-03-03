@@ -7,6 +7,9 @@ import { createSessionStore } from "../sessions.js";
 const makeSession = (overrides: Partial<SessionRecord> = {}): SessionRecord => ({
   id: "sess-1",
   workspaceId: "default",
+  principalType: "user",
+  principalId: "user:local",
+  source: "interactive",
   runtimeId: "rt-1",
   acpSessionId: "acp-1",
   status: "active",

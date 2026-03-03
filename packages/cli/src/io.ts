@@ -24,7 +24,7 @@ export const normalizeClientMessage = (
   const type = typeof obj.type === "string" ? obj.type : "";
 
   const maybeWithSession = { ...obj };
-  if ((type === "prompt" || type === "cancel") && maybeWithSession.sessionId === undefined) {
+  if ((type === "prompt" || type === "cancel" || type === "session_close") && maybeWithSession.sessionId === undefined) {
     if (!activeSessionId) {
       throw new Error(`${type} message requires sessionId before session is created`);
     }
@@ -41,19 +41,23 @@ export const normalizeClientMessage = (
 const serializePrettyEvent = (event: GatewayEvent): string => {
   switch (event.type) {
     case "session_created":
-      return `[session_created] session=${event.sessionId} runtime=${event.runtimeId ?? "default"} model=${event.model}`;
+      return `[session_created] session=${event.sessionId} runtime=${event.runtimeId ?? "default"} model=${event.model} principal=${event.principalType ?? "user"}:${event.principalId ?? "user:local"} source=${event.source ?? "interactive"}`;
+    case "session_closed":
+      return `[session_closed] session=${event.sessionId} reason=${event.reason}`;
+    case "runtime_health":
+      return `[runtime_health] runtime=${event.runtime.runtimeId} status=${event.runtime.status}${event.runtime.reason ? ` reason=${event.runtime.reason}` : ""}`;
     case "text_delta":
       return event.delta;
     case "thinking_delta":
       return `[thinking] ${event.delta}`;
     case "tool_start":
-      return `[tool_start] ${event.tool}`;
+      return `[tool_start] ${event.tool}${event.executionId ? ` exec=${event.executionId}` : ""}${event.turnId ? ` turn=${event.turnId}` : ""}`;
     case "tool_end":
-      return `[tool_end] ${event.tool}`;
+      return `[tool_end] ${event.tool}${event.executionId ? ` exec=${event.executionId}` : ""}${event.turnId ? ` turn=${event.turnId}` : ""}`;
     case "approval_request":
       return `[approval_request] requestId=${event.requestId} tool=${event.tool}`;
     case "turn_end":
-      return `[turn_end] session=${event.sessionId} stopReason=${event.stopReason}`;
+      return `[turn_end] session=${event.sessionId} stopReason=${event.stopReason}${event.executionId ? ` exec=${event.executionId}` : ""}${event.turnId ? ` turn=${event.turnId}` : ""}`;
     case "error":
       return `[error] session=${event.sessionId} ${event.message}`;
     case "session_list":

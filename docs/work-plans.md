@@ -4,6 +4,24 @@ This document captures planned improvements, features, and architectural evoluti
 
 ---
 
+## Status Snapshot (March 2026)
+
+Recently completed and no longer future work:
+
+1. WebSocket reconnection with backoff in `@nexus/client-core`.
+2. Gateway/client heartbeat (ping/pong) and stale connection termination.
+3. Session lifecycle controls (`session_close`, idle timeout cleanup, ownership release on disconnect).
+4. Approval routing index (`requestId -> session`) for O(1) lookup.
+5. Runtime registry and per-session runtime/model routing.
+6. Execution correlation substrate (`executionId`, `turnId`, `policySnapshotId`) with prompt idempotency keys.
+7. Session principal/source metadata (`principalType`, `principalId`, `source`) persisted in state.
+
+Key remaining substrate gap:
+
+1. Persisted first-class execution graph (`executions` table, `parentExecutionId`, durable state machine, capability token binding).
+
+---
+
 ## Phase 1: Production Hardening
 
 ### 1.1 Reconnection & Resilience
@@ -132,9 +150,9 @@ These items should be addressed as the codebase grows:
 
 1. **RPC handlers are single-handler**: `onNotification` and `onRequest` each overwrite the previous handler. Should support multiple listeners.
 2. ~~**No input validation on gateway entry**: `start.ts` doesn't validate that the data directory exists or is writable.~~ RESOLVED — `start.ts` now creates `dataDir` with `mkdirSync({ recursive: true })`.
-3. **Approval routing is naive**: Iterates all sessions to find the one with a pending approval. The permission flow now tracks pending requests per-session via `pendingPermissions` map inside `createAcpSession`, but the router still iterates sessions.
+3. ~~**Approval routing is naive**: Iterates all sessions to find the one with a pending approval.~~ RESOLVED — router now maintains a `requestId -> session` index and applies approvals in O(1).
 4. **No graceful handling of ACP init failure**: If `initialize` fails, the gateway logs an error but continues running in a broken state.
-5. **TUI doesn't handle reconnection**: If the WS drops, the TUI shows "Disconnected" but doesn't attempt reconnection.
+5. ~~**TUI doesn't handle reconnection**: If the WS drops, the TUI shows "Disconnected" but doesn't attempt reconnection.~~ RESOLVED — reconnect with backoff is now implemented in `@nexus/client-core`.
 6. **No rate limiting**: No protection against clients flooding the gateway with messages.
-7. **Session cleanup**: Old sessions are never cleaned up from the in-memory map or SQLite.
+7. ~~**Session cleanup**: Old sessions are never cleaned up from the in-memory map or SQLite.~~ PARTIALLY RESOLVED — idle timeout + explicit close cleanup exists; long-term archival/retention policies are still pending.
 8. **Config path resolution**: `findRepoRoot()` walks up looking for `package.json` with `workspaces`. This works for the monorepo layout but would need adjustment for standalone deployments.

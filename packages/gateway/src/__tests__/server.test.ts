@@ -7,6 +7,16 @@ import type { GatewayEvent } from "@nexus/types";
 const TEST_TOKEN = "test-token-abc123";
 
 const mockRouter: Router = {
+  registerConnection: () => {},
+  unregisterConnection: () => {},
+  setRuntimeHealth: (runtimeId, status, reason) => ({
+    runtimeId,
+    status,
+    updatedAt: "2026-01-01T00:00:00Z",
+    ...(reason ? { reason } : {}),
+  }),
+  getRuntimeHealth: () => [],
+  sweepIdleSessions: () => [],
   handleMessage: (msg, emit) => {
     if (msg.type === "session_list") {
       emit({ type: "session_list", sessions: [] } as GatewayEvent);
@@ -111,6 +121,31 @@ describe("createGatewayServer", () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body).toEqual({ status: "ok" });
+  });
+
+  it("/health includes custom health payload when provided", async () => {
+    await server.stop();
+    stopped = true;
+    server = createGatewayServer({
+      port: 0,
+      host: "127.0.0.1",
+      token: TEST_TOKEN,
+      router: mockRouter,
+      healthProvider: () => ({
+        runtimes: [{ runtimeId: "claude", status: "healthy" }],
+      }),
+    });
+    const info = await server.start();
+    port = info.port;
+    stopped = false;
+
+    const res = await fetch(`http://127.0.0.1:${port}/health`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body).toEqual({
+      status: "ok",
+      runtimes: [{ runtimeId: "claude", status: "healthy" }],
+    });
   });
 
   it("WebSocket connection without token is rejected", async () => {

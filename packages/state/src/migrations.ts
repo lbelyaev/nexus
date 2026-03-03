@@ -10,6 +10,9 @@ export const initDatabase = (db: DatabaseAdapter): void => {
     CREATE TABLE IF NOT EXISTS sessions (
       id TEXT PRIMARY KEY,
       workspaceId TEXT NOT NULL DEFAULT 'default',
+      principalType TEXT NOT NULL DEFAULT 'user',
+      principalId TEXT NOT NULL DEFAULT 'user:local',
+      source TEXT NOT NULL DEFAULT 'interactive',
       runtimeId TEXT NOT NULL,
       acpSessionId TEXT NOT NULL,
       status TEXT NOT NULL,
@@ -68,6 +71,15 @@ export const initDatabase = (db: DatabaseAdapter): void => {
 
   if (!hasColumn(db, "sessions", "workspaceId")) {
     db.exec("ALTER TABLE sessions ADD COLUMN workspaceId TEXT NOT NULL DEFAULT 'default';");
+  }
+  if (!hasColumn(db, "sessions", "principalType")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN principalType TEXT NOT NULL DEFAULT 'user';");
+  }
+  if (!hasColumn(db, "sessions", "principalId")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN principalId TEXT NOT NULL DEFAULT 'user:local';");
+  }
+  if (!hasColumn(db, "sessions", "source")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'interactive';");
   }
   if (!hasColumn(db, "transcript_messages", "workspaceId")) {
     db.exec("ALTER TABLE transcript_messages ADD COLUMN workspaceId TEXT NOT NULL DEFAULT 'default';");

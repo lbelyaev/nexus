@@ -15,15 +15,29 @@ export const createGatewayServer = (deps: {
   host: string;
   token: string;
   router: Router;
+  healthProvider?: () => Record<string, unknown>;
+  wsPingIntervalMs?: number;
+  wsPongGraceMs?: number;
 }): GatewayServer => {
-  const { port, host, token, router } = deps;
+  const {
+    port,
+    host,
+    token,
+    router,
+    healthProvider,
+    wsPingIntervalMs = 20_000,
+    wsPongGraceMs = 10_000,
+  } = deps;
   const log = createLogger("gateway.server");
 
   const httpServer = createServer(
     (req: IncomingMessage, res: ServerResponse) => {
       if (req.url === "/health" && req.method === "GET") {
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "ok" }));
+        res.end(JSON.stringify({
+          status: "ok",
+          ...(healthProvider ? healthProvider() : {}),
+        }));
         return;
       }
       res.writeHead(404);
@@ -32,6 +46,7 @@ export const createGatewayServer = (deps: {
   );
 
   const wss = new WebSocketServer({ noServer: true });
+  const wsHeartbeatTimers = new WeakMap<WebSocket, ReturnType<typeof setTimeout>>();
 
   httpServer.on("upgrade", (req, socket, head) => {
     const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
@@ -58,7 +73,29 @@ export const createGatewayServer = (deps: {
       }
     };
 
+    router.registerConnection(connectionId, emit);
     log.info("ws_connected", { connectionId });
+
+    const schedulePongTimeout = (): void => {
+      const existing = wsHeartbeatTimers.get(ws);
+      if (existing) {
+        clearTimeout(existing);
+      }
+      const timer = setTimeout(() => {
+        log.warn("ws_pong_timeout_terminate", { connectionId });
+        ws.terminate();
+      }, wsPongGraceMs);
+      wsHeartbeatTimers.set(ws, timer);
+    };
+
+    ws.on("pong", () => {
+      const timer = wsHeartbeatTimers.get(ws);
+      if (timer) {
+        clearTimeout(timer);
+        wsHeartbeatTimers.delete(ws);
+      }
+      log.debug("ws_pong_received", { connectionId });
+    });
 
     ws.on("message", (data: Buffer | string) => {
       const raw = typeof data === "string" ? data : data.toString();
@@ -83,11 +120,35 @@ export const createGatewayServer = (deps: {
         emit(errorEvent);
         return;
       }
-      router.handleMessage(msg, emit);
+      router.handleMessage(msg, emit, { connectionId });
     });
 
     ws.on("close", () => {
+      const timer = wsHeartbeatTimers.get(ws);
+      if (timer) {
+        clearTimeout(timer);
+        wsHeartbeatTimers.delete(ws);
+      }
+      router.unregisterConnection(connectionId, emit);
       log.info("ws_disconnected", { connectionId });
+    });
+
+    ws.on("error", (error) => {
+      log.warn("ws_error", {
+        connectionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+
+    const pingTimer = setInterval(() => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      schedulePongTimeout();
+      ws.ping();
+      log.debug("ws_ping_sent", { connectionId });
+    }, Math.max(1_000, wsPingIntervalMs));
+
+    ws.on("close", () => {
+      clearInterval(pingTimer);
     });
   });
 

@@ -1,8 +1,13 @@
+import type { PrincipalType, PromptSource } from "./protocol.js";
+
 // State record types
 
 export interface SessionRecord {
   id: string;
   workspaceId: string;
+  principalType: PrincipalType;
+  principalId: string;
+  source: PromptSource;
   runtimeId: string;
   acpSessionId: string;
   status: "active" | "idle";
@@ -30,6 +35,9 @@ export const isSessionRecord = (value: unknown): value is SessionRecord => {
   return (
     typeof obj.id === "string" &&
     typeof obj.workspaceId === "string" &&
+    (obj.principalType === "user" || obj.principalType === "service_account") &&
+    typeof obj.principalId === "string" &&
+    (obj.source === "interactive" || obj.source === "schedule" || obj.source === "hook" || obj.source === "api") &&
     typeof obj.runtimeId === "string" &&
     typeof obj.acpSessionId === "string" &&
     typeof obj.status === "string" &&

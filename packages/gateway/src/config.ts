@@ -69,6 +69,10 @@ export const loadConfig = (configPath?: string): NexusConfig => {
     modelAliases: raw.modelAliases as Record<string, string> | undefined,
     modelCatalog: raw.modelCatalog as Record<string, string[]> | undefined,
     workspaceDefaultId: raw.workspaceDefaultId as string | undefined,
+    sessionIdleTimeoutMs: raw.sessionIdleTimeoutMs as number | undefined,
+    sessionSweepIntervalMs: raw.sessionSweepIntervalMs as number | undefined,
+    wsPingIntervalMs: raw.wsPingIntervalMs as number | undefined,
+    wsPongGraceMs: raw.wsPongGraceMs as number | undefined,
     memory: raw.memory as MemoryConfig | undefined,
     dataDir: (raw.dataDir as string) ?? DEFAULTS.dataDir,
   };
@@ -176,6 +180,19 @@ export const loadConfig = (configPath?: string): NexusConfig => {
       throw new Error("Invalid config: workspaceDefaultId must be a non-empty string");
     }
     config.workspaceDefaultId = config.workspaceDefaultId.trim();
+  }
+
+  const positiveNumericRootFields: Array<keyof NexusConfig> = [
+    "sessionIdleTimeoutMs",
+    "sessionSweepIntervalMs",
+    "wsPingIntervalMs",
+    "wsPongGraceMs",
+  ];
+  for (const field of positiveNumericRootFields) {
+    const value = config[field];
+    if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value) || value <= 0)) {
+      throw new Error(`Invalid config: ${field} must be a positive number`);
+    }
   }
 
   return config;

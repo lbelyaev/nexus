@@ -1,7 +1,7 @@
 import { readFileSync, mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { loadConfig, repoRoot } from "./config.js";
-import { createRouter, type EventEmitter, type ManagedAcpSession } from "./router.js";
+import { createRouter, type EventEmitter, type ManagedAcpSession, type Router } from "./router.js";
 import { createGatewayServer } from "./server.js";
 import { createStateStore } from "@nexus/state";
 import { loadPolicyFromString } from "@nexus/policy";
@@ -9,7 +9,7 @@ import { spawnAgent, createAcpSession } from "@nexus/acp-bridge";
 import type { AgentProcess } from "@nexus/acp-bridge";
 import { evaluatePolicy } from "@nexus/policy";
 import { createSqliteMemoryProvider, type MemoryProvider } from "@nexus/memory";
-import type { NexusConfig, RuntimeProfile } from "@nexus/types";
+import type { NexusConfig, RuntimeHealthInfo, RuntimeHealthStatus, RuntimeProfile } from "@nexus/types";
 import { createLogger } from "./logger.js";
 
 const inferRuntimeId = (command: string[]): string => {
@@ -118,6 +118,26 @@ export const startGateway = async (configPath?: string) => {
   const config = loadConfig(configPath);
   const runtimeRegistry = normalizeRuntimeRegistry(config);
   const runtimeAgents = new Map<string, { profile: RuntimeProfile; agent: AgentProcess }>();
+  const runtimeHealth = new Map<string, RuntimeHealthInfo>();
+  let routerRef: Router | null = null;
+
+  const setRuntimeHealth = (
+    runtimeId: string,
+    status: RuntimeHealthStatus,
+    reason?: string,
+  ): RuntimeHealthInfo => {
+    const next: RuntimeHealthInfo = {
+      runtimeId,
+      status,
+      updatedAt: new Date().toISOString(),
+      ...(reason ? { reason } : {}),
+    };
+    runtimeHealth.set(runtimeId, next);
+    if (routerRef) {
+      routerRef.setRuntimeHealth(runtimeId, status, reason);
+    }
+    return next;
+  };
 
   log.info("gateway_boot", {
     repoRoot,
@@ -127,6 +147,8 @@ export const startGateway = async (configPath?: string) => {
     runtimeProfiles: Object.keys(runtimeRegistry.profiles),
     defaultRuntimeId: runtimeRegistry.defaultRuntimeId,
     workspaceDefaultId: config.workspaceDefaultId ?? "default",
+    sessionIdleTimeoutMs: config.sessionIdleTimeoutMs ?? 30 * 60 * 1000,
+    sessionSweepIntervalMs: config.sessionSweepIntervalMs ?? 30_000,
   });
   if (Object.keys(runtimeRegistry.modelAliases).length > 0) {
     log.info("model_aliases_loaded", {
@@ -184,6 +206,7 @@ export const startGateway = async (configPath?: string) => {
   for (const [runtimeProfileId, profile] of Object.entries(runtimeRegistry.profiles)) {
     const inferred = inferRuntimeId(profile.command);
     const authSource = inferAuthSource(runtimeProfileId, profile.command, profile.env);
+    setRuntimeHealth(runtimeProfileId, "starting", "boot");
     log.info("runtime_spawning", {
       runtimeProfileId,
       inferred,
@@ -214,14 +237,21 @@ export const startGateway = async (configPath?: string) => {
 
     agent.onExit((code) => {
       log.error("runtime_exited", { runtimeProfileId, code });
+      setRuntimeHealth(runtimeProfileId, "unavailable", `process_exit:${code ?? "null"}`);
     });
 
     log.info("runtime_initializing", { runtimeProfileId });
-    const initResult = await agent.rpc.sendRequest("initialize", {
-      protocolVersion: 1,
-      clientCapabilities: {},
-    });
-    log.info("runtime_initialized", { runtimeProfileId, initResult });
+    try {
+      const initResult = await agent.rpc.sendRequest("initialize", {
+        protocolVersion: 1,
+        clientCapabilities: {},
+      });
+      setRuntimeHealth(runtimeProfileId, "healthy");
+      log.info("runtime_initialized", { runtimeProfileId, initResult });
+    } catch (error) {
+      setRuntimeHealth(runtimeProfileId, "unavailable", "initialize_failed");
+      throw error;
+    }
 
     runtimeAgents.set(runtimeProfileId, { profile, agent });
   }
@@ -272,6 +302,7 @@ export const startGateway = async (configPath?: string) => {
       const runtimeId = resolveRuntimeId(requestedRuntimeId, requestedModel);
       const runtime = runtimeAgents.get(runtimeId);
       if (!runtime) {
+        setRuntimeHealth(runtimeId, "unavailable", "missing_runtime_agent");
         throw new Error(`Runtime not available: ${runtimeId}`);
       }
 
@@ -306,14 +337,21 @@ export const startGateway = async (configPath?: string) => {
       } catch (error) {
         modelParamAccepted = false;
         const message = error instanceof Error ? error.message : String(error);
+        setRuntimeHealth(runtimeId, "degraded", "session_new_model_rejected_retry");
         log.warn("runtime_rejected_session_new_model_retrying_without_model", {
           runtimeId,
           requestedModel: modelSelection.requested,
           resolvedModel: modelSelection.resolved,
           error: message,
         });
-        result = await runtime.agent.rpc.sendRequest("session/new", baseSessionParams) as { sessionId: string; model?: string };
+        try {
+          result = await runtime.agent.rpc.sendRequest("session/new", baseSessionParams) as { sessionId: string; model?: string };
+        } catch (retryError) {
+          setRuntimeHealth(runtimeId, "unavailable", "session_new_failed");
+          throw retryError;
+        }
       }
+      setRuntimeHealth(runtimeId, "healthy");
 
       const acpSessionId = result.sessionId;
       const runtimeReportedModel = typeof result.model === "string" ? result.model : undefined;
@@ -352,7 +390,10 @@ export const startGateway = async (configPath?: string) => {
     policyConfig,
     memoryProvider,
     defaultWorkspaceId: config.workspaceDefaultId ?? "default",
+    sessionIdleTimeoutMs: config.sessionIdleTimeoutMs ?? 30 * 60 * 1000,
+    initialRuntimeHealth: Object.fromEntries(runtimeHealth),
   });
+  routerRef = router;
 
   // Server
   const server = createGatewayServer({
@@ -360,7 +401,25 @@ export const startGateway = async (configPath?: string) => {
     host: config.host,
     token: config.auth.token,
     router,
+    healthProvider: () => ({
+      runtimes: router.getRuntimeHealth(),
+      activeSessions: stateStore.listSessions().filter((s) => s.status === "active").length,
+    }),
+    wsPingIntervalMs: config.wsPingIntervalMs ?? 20_000,
+    wsPongGraceMs: config.wsPongGraceMs ?? 10_000,
   });
+
+  const sessionSweepIntervalMs = config.sessionSweepIntervalMs ?? 30_000;
+  const sweepTimer = setInterval(() => {
+    const closed = router.sweepIdleSessions();
+    if (closed.length > 0) {
+      log.info("idle_session_sweep", {
+        closedCount: closed.length,
+        sessionIds: closed,
+      });
+    }
+  }, Math.max(1_000, sessionSweepIntervalMs));
+  sweepTimer.unref?.();
 
   const { port } = await server.start();
   log.info("gateway_listening", { host: config.host, port });
@@ -372,6 +431,7 @@ export const startGateway = async (configPath?: string) => {
   // Graceful shutdown
   const shutdown = async () => {
     log.info("gateway_shutdown_start");
+    clearInterval(sweepTimer);
     await server.stop();
     for (const [runtimeProfileId, runtime] of runtimeAgents) {
       log.info("runtime_stopping", { runtimeProfileId });

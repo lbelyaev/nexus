@@ -93,6 +93,9 @@ describe("createRouter", () => {
       expect(event.model).toBe("claude");
       expect(event.runtimeId).toBe("default");
       expect(event.workspaceId).toBe("default");
+      expect(event.principalType).toBe("user");
+      expect(event.principalId).toBe("user:local");
+      expect(event.source).toBe("interactive");
       expect(event.modelRouting?.sonnet).toBe("claude");
       expect(event.modelAliases?.fast).toBe("gpt-5.2-codex-mini");
       expect(event.modelCatalog?.codex).toContain("gpt-5.3-codex");
@@ -128,6 +131,25 @@ describe("createRouter", () => {
 
     const stored = stateStore.getSession(event.sessionId);
     expect(stored?.workspaceId).toBe("acme");
+  });
+
+  it("session_new uses provided principal and source", async () => {
+    const { emit, events } = collectEvents();
+    router.handleMessage({
+      type: "session_new",
+      principalType: "service_account",
+      principalId: "svc:nightly",
+      source: "schedule",
+    }, emit);
+
+    await vi.waitFor(() => {
+      expect(events).toHaveLength(1);
+    });
+    const event = events[0];
+    if (event.type !== "session_created") throw new Error("expected session_created");
+    expect(event.principalType).toBe("service_account");
+    expect(event.principalId).toBe("svc:nightly");
+    expect(event.source).toBe("schedule");
   });
 
   it("prompt emits error event if sessionId not found", () => {
@@ -167,6 +189,48 @@ describe("createRouter", () => {
     await vi.waitFor(() => {
       expect(events.some((e) => e.type === "turn_end")).toBe(true);
     });
+
+    const turnEnd = events.find((e) => e.type === "turn_end");
+    if (!turnEnd || turnEnd.type !== "turn_end") throw new Error("expected turn_end");
+    expect(turnEnd.executionId).toBeDefined();
+    expect(turnEnd.turnId).toBeDefined();
+    expect(turnEnd.policySnapshotId).toBeDefined();
+  });
+
+  it("prompt deduplicates by idempotencyKey", async () => {
+    const { emit, events } = collectEvents();
+    router.handleMessage({ type: "session_new" }, emit);
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === "session_created")).toBe(true);
+    });
+    const sessionCreated = events.find((e) => e.type === "session_created");
+    if (!sessionCreated || sessionCreated.type !== "session_created") throw new Error("session_created missing");
+
+    events.length = 0;
+    router.handleMessage({
+      type: "prompt",
+      sessionId: sessionCreated.sessionId,
+      text: "hello",
+      idempotencyKey: "dup-1",
+    }, emit);
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === "turn_end")).toBe(true);
+    });
+    const callCountAfterFirst = (acpSession.prompt as ReturnType<typeof vi.fn>).mock.calls.length;
+
+    events.length = 0;
+    router.handleMessage({
+      type: "prompt",
+      sessionId: sessionCreated.sessionId,
+      text: "hello",
+      idempotencyKey: "dup-1",
+    }, emit);
+
+    expect((acpSession.prompt as ReturnType<typeof vi.fn>).mock.calls.length).toBe(callCountAfterFirst);
+    expect(events.some((e) => e.type === "turn_end")).toBe(true);
+    const duplicateTurnEnd = events.find((e) => e.type === "turn_end");
+    if (!duplicateTurnEnd || duplicateTurnEnd.type !== "turn_end") throw new Error("turn_end missing");
+    expect(duplicateTurnEnd.stopReason).toBe("idempotent_duplicate");
   });
 
   it("prompt emits text_delta when prompt result has a single content block object", async () => {
@@ -265,6 +329,103 @@ describe("createRouter", () => {
     expect(acpSession.cancel).toHaveBeenCalled();
     expect(events).toHaveLength(1);
     expect(events[0].type).toBe("session_created");
+  });
+
+  it("session_close closes session and emits session_closed", async () => {
+    const { emit, events } = collectEvents();
+    router.registerConnection("conn-1", emit);
+    router.handleMessage({ type: "session_new" }, emit, { connectionId: "conn-1" });
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === "session_created")).toBe(true);
+    });
+
+    const sessionCreated = events.find((e) => e.type === "session_created");
+    if (!sessionCreated || sessionCreated.type !== "session_created") throw new Error("expected session_created");
+    events.length = 0;
+
+    router.handleMessage(
+      { type: "session_close", sessionId: sessionCreated.sessionId },
+      emit,
+      { connectionId: "conn-1" },
+    );
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toEqual({
+      type: "session_closed",
+      sessionId: sessionCreated.sessionId,
+      reason: "client_close",
+    });
+  });
+
+  it("releases ownership on disconnect and allows takeover on reconnect", async () => {
+    const owner = collectEvents();
+    const other = collectEvents();
+    router.registerConnection("conn-owner", owner.emit);
+    router.registerConnection("conn-other", other.emit);
+    router.handleMessage({ type: "session_new" }, owner.emit, { connectionId: "conn-owner" });
+
+    await vi.waitFor(() => {
+      expect(owner.events.some((e) => e.type === "session_created")).toBe(true);
+    });
+    const sessionCreated = owner.events.find((e) => e.type === "session_created");
+    if (!sessionCreated || sessionCreated.type !== "session_created") throw new Error("expected session_created");
+
+    other.events.length = 0;
+    router.handleMessage(
+      { type: "session_replay", sessionId: sessionCreated.sessionId },
+      other.emit,
+      { connectionId: "conn-other" },
+    );
+    expect(other.events).toHaveLength(1);
+    expect(other.events[0].type).toBe("error");
+
+    other.events.length = 0;
+    router.unregisterConnection("conn-owner", owner.emit);
+    router.handleMessage(
+      { type: "session_replay", sessionId: sessionCreated.sessionId },
+      other.emit,
+      { connectionId: "conn-other" },
+    );
+    expect(other.events).toHaveLength(1);
+    expect(other.events[0].type).toBe("transcript");
+  });
+
+  it("sweepIdleSessions closes stale sessions", async () => {
+    const { emit, events } = collectEvents();
+    router = createRouter({
+      createAcpSession: createAcpSessionMock,
+      stateStore,
+      policyConfig,
+      memoryProvider,
+      defaultWorkspaceId: "default",
+      sessionIdleTimeoutMs: 1_000,
+    });
+    router.registerConnection("conn-1", emit);
+    router.handleMessage({ type: "session_new" }, emit, { connectionId: "conn-1" });
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === "session_created")).toBe(true);
+    });
+    const sessionCreated = events.find((e) => e.type === "session_created");
+    if (!sessionCreated || sessionCreated.type !== "session_created") throw new Error("expected session_created");
+
+    const closed = router.sweepIdleSessions(new Date(Date.now() + 10_000));
+    expect(closed).toContain(sessionCreated.sessionId);
+  });
+
+  it("broadcasts runtime health updates to connected clients", () => {
+    const a = collectEvents();
+    const b = collectEvents();
+    router.registerConnection("conn-a", a.emit);
+    router.registerConnection("conn-b", b.emit);
+
+    const updated = router.setRuntimeHealth("codex", "degraded", "rpc_timeout");
+    expect(updated.runtimeId).toBe("codex");
+    expect(updated.status).toBe("degraded");
+
+    expect(a.events.some((e) => e.type === "runtime_health")).toBe(true);
+    expect(b.events.some((e) => e.type === "runtime_health")).toBe(true);
   });
 
   it("approval_response forwards to session.respondToPermission", async () => {

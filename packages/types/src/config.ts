@@ -32,6 +32,10 @@ export interface NexusConfig {
   modelAliases?: Record<string, string>;
   modelCatalog?: Record<string, string[]>;
   workspaceDefaultId?: string;
+  sessionIdleTimeoutMs?: number;
+  sessionSweepIntervalMs?: number;
+  wsPingIntervalMs?: number;
+  wsPongGraceMs?: number;
   memory?: MemoryConfig;
   dataDir: string;
 }

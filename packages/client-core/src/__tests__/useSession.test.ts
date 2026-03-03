@@ -28,6 +28,10 @@ describe("useSession", () => {
     expect(result.current.sessionModel).toBeNull();
     expect(result.current.sessionRuntimeId).toBeNull();
     expect(result.current.sessionWorkspaceId).toBeNull();
+    expect(result.current.sessionPrincipalType).toBeNull();
+    expect(result.current.sessionPrincipalId).toBeNull();
+    expect(result.current.sessionSource).toBeNull();
+    expect(result.current.runtimeHealth).toEqual({});
     expect(result.current.responseText).toBe("");
     expect(result.current.isStreaming).toBe(false);
     expect(result.current.activeTools).toEqual([]);
@@ -51,6 +55,9 @@ describe("useSession", () => {
     expect(result.current.sessionModel).toBe("claude-4");
     expect(result.current.sessionRuntimeId).toBeNull();
     expect(result.current.sessionWorkspaceId).toBe("default");
+    expect(result.current.sessionPrincipalType).toBe("user");
+    expect(result.current.sessionPrincipalId).toBe("user:local");
+    expect(result.current.sessionSource).toBe("interactive");
   });
 
   it("accumulates text_delta into responseText", () => {
@@ -321,6 +328,48 @@ describe("useSession", () => {
       type: "cancel",
       sessionId: "sess-1",
     });
+  });
+
+  it("closeSession sends session_close message", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_created",
+        sessionId: "sess-1",
+        model: "claude-4",
+      });
+    });
+
+    act(() => {
+      result.current.closeSession();
+    });
+
+    expect(sendMessage).toHaveBeenCalledWith({
+      type: "session_close",
+      sessionId: "sess-1",
+    });
+  });
+
+  it("updates runtime health state from runtime_health events", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "runtime_health",
+        runtime: {
+          runtimeId: "codex",
+          status: "degraded",
+          updatedAt: "2026-01-01T00:00:00Z",
+          reason: "rpc_timeout",
+        },
+      });
+    });
+
+    expect(result.current.runtimeHealth.codex?.status).toBe("degraded");
+    expect(result.current.runtimeHealth.codex?.reason).toBe("rpc_timeout");
   });
 
   it("steer while idle sends a prompt immediately", () => {

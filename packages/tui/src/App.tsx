@@ -112,6 +112,7 @@ export const App = ({ url, token }: AppProps) => {
   const markdownRenderer = process.env.NEXUS_TUI_MARKDOWN_RENDERER === "plain"
     ? "plain"
     : "basic";
+  const creatingSessionRef = useRef(false);
 
   // Use refs to break the circular dependency between handleEvent and hooks
   const sessionRef = useRef<ReturnType<typeof useSession>>(null!);
@@ -176,11 +177,33 @@ export const App = ({ url, token }: AppProps) => {
     [preferredWorkspaceId, sendMessage],
   );
 
-  // Auto-create session on connect
+  // On first connect: create a session. On reconnect: replay current session transcript.
+  const previousStatusRef = useRef(status);
   useEffect(() => {
-    if (status === "connected" && !session.sessionId) {
-      createSession(preferredRuntimeId, preferredModel);
+    const wasConnected = previousStatusRef.current === "connected";
+    const isConnected = status === "connected";
+    previousStatusRef.current = status;
+    if (!isConnected || wasConnected) return;
+
+    if (session.sessionId) {
+      session.requestReplay(session.sessionId);
     }
+  }, [session.sessionId, session.requestReplay, status]);
+
+  useEffect(() => {
+    if (status !== "connected") {
+      creatingSessionRef.current = false;
+      return;
+    }
+    if (session.sessionId) {
+      creatingSessionRef.current = false;
+      return;
+    }
+    if (creatingSessionRef.current) {
+      return;
+    }
+    creatingSessionRef.current = true;
+    createSession(preferredRuntimeId, preferredModel);
   }, [createSession, preferredModel, preferredRuntimeId, session.sessionId, status]);
 
   const handleRuntimeCommand = useCallback(
@@ -291,9 +314,13 @@ export const App = ({ url, token }: AppProps) => {
     const activeRuntime = session.sessionRuntimeId ?? preferredRuntimeId ?? "default";
     const activeWorkspace = session.sessionWorkspaceId ?? preferredWorkspaceId;
     const activeModel = session.sessionModel ?? preferredModel ?? "(unknown)";
+    const activePrincipalType = session.sessionPrincipalType ?? "user";
+    const activePrincipalId = session.sessionPrincipalId ?? "user:local";
+    const activeSource = session.sessionSource ?? "interactive";
     const catalogRuntimes = Object.keys(session.modelCatalog).length;
     const catalogModels = Object.values(session.modelCatalog).reduce((acc, models) => acc + models.length, 0);
     const aliasCount = Object.keys(session.modelAliases).length + Object.keys(localAliases).length;
+    const runtimeHealthLines = Object.entries(session.runtimeHealth);
 
     setMessages((prev) => [
       ...prev,
@@ -301,6 +328,8 @@ export const App = ({ url, token }: AppProps) => {
       { role: "system", text: `    connection=${status}` },
       { role: "system", text: `    session=${session.sessionId ?? "(none)"}` },
       { role: "system", text: `    workspace=${activeWorkspace}` },
+      { role: "system", text: `    principal=${activePrincipalType}:${activePrincipalId}` },
+      { role: "system", text: `    source=${activeSource}` },
       { role: "system", text: `    runtime=${activeRuntime}` },
       { role: "system", text: `    model=${activeModel}` },
       { role: "system", text: `    streaming=${session.isStreaming ? "yes" : "no"}` },
@@ -308,6 +337,14 @@ export const App = ({ url, token }: AppProps) => {
       { role: "system", text: `    pending_approvals=${approval.pendingApprovals.length}` },
       { role: "system", text: `    catalog=runtimes:${catalogRuntimes}, models:${catalogModels}` },
       { role: "system", text: `    aliases=gateway:${Object.keys(session.modelAliases).length}, local:${Object.keys(localAliases).length}, total:${aliasCount}` },
+      ...(runtimeHealthLines.length === 0
+        ? [{ role: "system" as const, text: "    runtime_health=(none reported yet)" }]
+        : runtimeHealthLines
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([runtimeId, health]) => ({
+            role: "system" as const,
+            text: `    runtime_health.${runtimeId}=${health.status}${health.reason ? ` (${health.reason})` : ""}`,
+          }))),
     ]);
   }, [
     approval.pendingApprovals.length,
@@ -319,9 +356,13 @@ export const App = ({ url, token }: AppProps) => {
     session.isStreaming,
     session.modelAliases,
     session.modelCatalog,
+    session.runtimeHealth,
+    session.sessionPrincipalId,
+    session.sessionPrincipalType,
     session.sessionId,
     session.sessionModel,
     session.sessionRuntimeId,
+    session.sessionSource,
     session.sessionWorkspaceId,
     status,
   ]);
@@ -537,6 +578,16 @@ export const App = ({ url, token }: AppProps) => {
         return;
       }
 
+      if (text.startsWith("/close")) {
+        if (!session.sessionId) {
+          setMessages((prev) => [...prev, { role: "system", text: "  No active session to close." }]);
+          return;
+        }
+        session.closeSession();
+        setMessages((prev) => [...prev, { role: "system", text: `  Closing session ${session.sessionId}...` }]);
+        return;
+      }
+
       setMessages((prev) => [...prev, { role: "user", text }]);
       if (session.isStreaming) {
         session.steer(text);
@@ -544,7 +595,7 @@ export const App = ({ url, token }: AppProps) => {
         session.sendPrompt(text);
       }
     },
-    [handleAliasCommand, handleMemoryCommand, handleModelCommand, handleModelsCommand, handleRuntimeCommand, handleStatusCommand, handleWorkspaceCommand, session.isStreaming, session.sendPrompt, session.steer],
+    [handleAliasCommand, handleMemoryCommand, handleModelCommand, handleModelsCommand, handleRuntimeCommand, handleStatusCommand, handleWorkspaceCommand, session],
   );
 
   const handleCancelTurn = useCallback(() => {
@@ -620,7 +671,7 @@ export const App = ({ url, token }: AppProps) => {
         <Text color="gray">Enter = steer, Esc = cancel current turn</Text>
       ) : null}
       {!session.isStreaming ? (
-        <Text color="gray">Commands: /workspace &lt;id&gt;, /runtime &lt;id&gt;, /model &lt;name&gt;, /models, /alias &lt;nick&gt; &lt;model-id&gt;, /status, /memory ...</Text>
+        <Text color="gray">Commands: /workspace &lt;id&gt;, /runtime &lt;id&gt;, /model &lt;name&gt;, /models, /alias &lt;nick&gt; &lt;model-id&gt;, /status, /memory ..., /close</Text>
       ) : null}
     </Box>
   );

@@ -283,4 +283,39 @@ describe("loadConfig", () => {
 
     expect(() => loadConfig(configPath)).toThrow(/workspaceDefaultId/);
   });
+
+  it("supports lifecycle and heartbeat settings", () => {
+    const configPath = join(tmpDir, "nexus.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        auth: { token: "mytoken" },
+        runtime: { command: ["npx", "@zed-industries/claude-agent-acp"] },
+        sessionIdleTimeoutMs: 600000,
+        sessionSweepIntervalMs: 30000,
+        wsPingIntervalMs: 20000,
+        wsPongGraceMs: 10000,
+      }),
+    );
+
+    const config = loadConfig(configPath);
+    expect(config.sessionIdleTimeoutMs).toBe(600000);
+    expect(config.sessionSweepIntervalMs).toBe(30000);
+    expect(config.wsPingIntervalMs).toBe(20000);
+    expect(config.wsPongGraceMs).toBe(10000);
+  });
+
+  it("rejects invalid lifecycle and heartbeat settings", () => {
+    const configPath = join(tmpDir, "nexus.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        auth: { token: "mytoken" },
+        runtime: { command: ["npx", "@zed-industries/claude-agent-acp"] },
+        sessionIdleTimeoutMs: -1,
+      }),
+    );
+
+    expect(() => loadConfig(configPath)).toThrow(/sessionIdleTimeoutMs/);
+  });
 });

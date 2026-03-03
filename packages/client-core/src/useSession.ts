@@ -53,10 +53,14 @@ export interface UseSessionResult {
   sessionModel: string | null;
   sessionRuntimeId: string | null;
   sessionWorkspaceId: string | null;
+  sessionPrincipalType: "user" | "service_account" | null;
+  sessionPrincipalId: string | null;
+  sessionSource: "interactive" | "schedule" | "hook" | "api" | null;
   modelRouting: Record<string, string>;
   modelAliases: Record<string, string>;
   modelCatalog: Record<string, string[]>;
   runtimeDefaults: Record<string, string>;
+  runtimeHealth: Record<string, { status: "starting" | "healthy" | "degraded" | "unavailable"; updatedAt: string; reason?: string }>;
   responseText: string;
   thinkingText: string;
   isStreaming: boolean;
@@ -68,6 +72,7 @@ export interface UseSessionResult {
   sendPrompt: (text: string) => void;
   steer: (text: string) => void;
   cancel: () => void;
+  closeSession: () => void;
   requestReplay: (sessionId: string) => void;
   requestMemory: (query: MemoryQueryInput) => void;
   handleEvent: (event: GatewayEvent) => void;
@@ -80,10 +85,14 @@ export const useSession = (
   const [sessionModel, setSessionModel] = useState<string | null>(null);
   const [sessionRuntimeId, setSessionRuntimeId] = useState<string | null>(null);
   const [sessionWorkspaceId, setSessionWorkspaceId] = useState<string | null>(null);
+  const [sessionPrincipalType, setSessionPrincipalType] = useState<"user" | "service_account" | null>(null);
+  const [sessionPrincipalId, setSessionPrincipalId] = useState<string | null>(null);
+  const [sessionSource, setSessionSource] = useState<"interactive" | "schedule" | "hook" | "api" | null>(null);
   const [modelRouting, setModelRouting] = useState<Record<string, string>>({});
   const [modelAliases, setModelAliases] = useState<Record<string, string>>({});
   const [modelCatalog, setModelCatalog] = useState<Record<string, string[]>>({});
   const [runtimeDefaults, setRuntimeDefaults] = useState<Record<string, string>>({});
+  const [runtimeHealth, setRuntimeHealth] = useState<Record<string, { status: "starting" | "healthy" | "degraded" | "unavailable"; updatedAt: string; reason?: string }>>({});
   const [responseText, setResponseText] = useState("");
   const [thinkingText, setThinkingText] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
@@ -155,10 +164,37 @@ export const useSession = (
         setSessionModel(event.model);
         setSessionRuntimeId(event.runtimeId ?? null);
         setSessionWorkspaceId(event.workspaceId ?? "default");
+        setSessionPrincipalType(event.principalType ?? "user");
+        setSessionPrincipalId(event.principalId ?? "user:local");
+        setSessionSource(event.source ?? "interactive");
         setModelRouting(event.modelRouting ?? {});
         setModelAliases(event.modelAliases ?? {});
         setModelCatalog(event.modelCatalog ?? {});
         setRuntimeDefaults(event.runtimeDefaults ?? {});
+        break;
+      case "session_closed":
+        if (event.sessionId === sessionId) {
+          setSessionId(null);
+          setSessionModel(null);
+          setSessionRuntimeId(null);
+          setSessionWorkspaceId(null);
+          setSessionPrincipalType(null);
+          setSessionPrincipalId(null);
+          setSessionSource(null);
+          setIsStreaming(false);
+          setActiveTools([]);
+          setToolCalls([]);
+        }
+        break;
+      case "runtime_health":
+        setRuntimeHealth((prev) => ({
+          ...prev,
+          [event.runtime.runtimeId]: {
+            status: event.runtime.status,
+            updatedAt: event.runtime.updatedAt,
+            ...(event.runtime.reason ? { reason: event.runtime.reason } : {}),
+          },
+        }));
         break;
       case "text_delta":
         ignoreCancelledTurnEndRef.current = false;
@@ -291,15 +327,27 @@ export const useSession = (
     }
   }, [sessionId, sendMessage]);
 
+  const closeSession = useCallback(() => {
+    queuedSteerRef.current = null;
+    ignoreCancelledTurnEndRef.current = false;
+    if (sessionId) {
+      sendMessage({ type: "session_close", sessionId });
+    }
+  }, [sessionId, sendMessage]);
+
   return {
     sessionId,
     sessionModel,
     sessionRuntimeId,
     sessionWorkspaceId,
+    sessionPrincipalType,
+    sessionPrincipalId,
+    sessionSource,
     modelRouting,
     modelAliases,
     modelCatalog,
     runtimeDefaults,
+    runtimeHealth,
     responseText,
     thinkingText,
     isStreaming,
@@ -311,6 +359,7 @@ export const useSession = (
     sendPrompt,
     steer,
     cancel,
+    closeSession,
     requestReplay,
     requestMemory,
     handleEvent,
