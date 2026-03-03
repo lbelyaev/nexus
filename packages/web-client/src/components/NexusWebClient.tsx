@@ -130,6 +130,19 @@ const WaitingFirstToken = () => (
   </div>
 );
 
+const SendIcon = () => (
+  <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+    <path d="M22 2 11 13" />
+    <path d="M22 2 15 22 11 13 2 9 22 2z" />
+  </svg>
+);
+
+const StopIcon = () => (
+  <svg viewBox="0 0 24 24" className="h-4 w-4" fill="currentColor" aria-hidden>
+    <rect x="6" y="6" width="12" height="12" rx="2" />
+  </svg>
+);
+
 const ConnectedClient = ({
   url,
   token,
@@ -363,26 +376,6 @@ const ConnectedClient = ({
     startSessionWithSelection,
   ]);
 
-  const handleRecoverStream = useCallback(() => {
-    if (!session.sessionId) {
-      appendSystem("No active session to recover.");
-      return;
-    }
-    const fallbackRuntime = preferredRuntimeId ?? session.sessionRuntimeId ?? undefined;
-    const fallbackModel = preferredModel ?? session.sessionModel ?? undefined;
-    createSession(fallbackRuntime, fallbackModel, preferredWorkspaceId);
-    appendSystem("Recovery: started a fresh session to clear stuck streaming state.");
-  }, [
-    appendSystem,
-    createSession,
-    preferredModel,
-    preferredRuntimeId,
-    preferredWorkspaceId,
-    session.sessionId,
-    session.sessionModel,
-    session.sessionRuntimeId,
-  ]);
-
   const handleSendPrompt = useCallback(
     (event: React.FormEvent<HTMLFormElement>) => {
       event.preventDefault();
@@ -435,7 +428,7 @@ const ConnectedClient = ({
             return;
           }
           if (session.isStreaming) {
-            appendSystem("Cannot switch runtime while streaming. Cancel or recover first.");
+            appendSystem("Cannot switch runtime while streaming. Cancel current turn first.");
             setPromptInput("");
             return;
           }
@@ -453,7 +446,7 @@ const ConnectedClient = ({
             return;
           }
           if (session.isStreaming) {
-            appendSystem("Cannot switch model while streaming. Cancel or recover first.");
+            appendSystem("Cannot switch model while streaming. Cancel current turn first.");
             setPromptInput("");
             return;
           }
@@ -476,7 +469,7 @@ const ConnectedClient = ({
             return;
           }
           if (session.isStreaming) {
-            appendSystem("Cannot switch workspace while streaming. Cancel or recover first.");
+            appendSystem("Cannot switch workspace while streaming. Cancel current turn first.");
             setPromptInput("");
             return;
           }
@@ -771,9 +764,19 @@ const ConnectedClient = ({
         </div>
       </aside> : null}
 
-      <section className="panel flex min-h-0 flex-col p-4">
+      <section className="flex h-full min-h-0 flex-col p-4">
         <div className="mb-3 flex items-center justify-between">
-          <div>
+          <div className="flex items-center gap-2">
+            <span
+              className={`status-dot ${
+                isSessionInitializing
+                  ? "status-dot-warn"
+                  : status === "connected" && session.sessionId
+                    ? "status-dot-ready"
+                    : "status-dot-idle"
+              }`}
+              aria-hidden
+            />
             <h1 className="panel-title">Nexus</h1>
           </div>
           <div className="ml-auto flex items-center gap-2">
@@ -901,8 +904,8 @@ const ConnectedClient = ({
           </div>
         ) : null}
 
-        <div className="mt-3 border-t border-white/10 pt-3">
-          <form onSubmit={handleSendPrompt} className="grid gap-2 sm:grid-cols-[1fr_auto_auto_auto]">
+        <div className="mt-auto border-t border-white/10 pt-3">
+          <form onSubmit={handleSendPrompt} className="grid gap-2 sm:grid-cols-[1fr_auto]">
             <input
               className="input"
               value={promptInput}
@@ -910,14 +913,15 @@ const ConnectedClient = ({
               placeholder={promptPlaceholder}
               disabled={promptIsDisabled}
             />
-            <button type="submit" className="button-primary" disabled={promptIsDisabled}>
-              {session.isStreaming ? "Steer" : "Send"}
-            </button>
-            <button type="button" className="button-secondary" onClick={handleCancel} disabled={!session.isStreaming}>
-              Cancel
-            </button>
-            <button type="button" className="button-secondary" onClick={handleRecoverStream}>
-              Recover
+            <button
+              type={session.isStreaming ? "button" : "submit"}
+              className="button-icon"
+              onClick={session.isStreaming ? handleCancel : undefined}
+              disabled={session.isStreaming ? false : promptIsDisabled}
+              aria-label={session.isStreaming ? "Stop response" : "Send prompt"}
+              title={session.isStreaming ? "Stop" : "Send"}
+            >
+              {session.isStreaming ? <StopIcon /> : <SendIcon />}
             </button>
           </form>
         </div>

@@ -523,6 +523,59 @@ describe("createRouter", () => {
     expect(acpSession.respondToPermission).toHaveBeenCalledWith("req-2", "allow_always");
   });
 
+  it("approval_response ignores unknown request ids without emitting error", () => {
+    const { emit, events } = collectEvents();
+
+    router.handleMessage(
+      { type: "approval_response", requestId: "missing-req", allow: true },
+      emit,
+    );
+
+    expect(acpSession.respondToPermission).not.toHaveBeenCalled();
+    expect(events.filter((event) => event.type === "error")).toHaveLength(0);
+  });
+
+  it("approval_response ignores stale pending requests without emitting error", async () => {
+    (acpSession.prompt as ReturnType<typeof vi.fn>).mockImplementationOnce(
+      () => new Promise(() => {}),
+    );
+    (acpSession.respondToPermission as ReturnType<typeof vi.fn>).mockReturnValueOnce(false);
+
+    const { emit, events } = collectEvents();
+    router.handleMessage({ type: "session_new" }, emit);
+
+    await vi.waitFor(() => {
+      expect(events).toHaveLength(1);
+    });
+
+    const sessionId = (events[0] as Extract<GatewayEvent, { type: "session_created" }>).sessionId;
+    router.handleMessage(
+      { type: "prompt", sessionId, text: "needs approval" },
+      emit,
+    );
+    const eventHandler = (acpSession.onEvent as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as EventEmitter;
+    eventHandler({
+      type: "approval_request",
+      sessionId,
+      requestId: "stale-req",
+      tool: "Bash",
+      description: "run command",
+    });
+
+    events.length = 0;
+    router.handleMessage(
+      {
+        type: "approval_response",
+        requestId: "stale-req",
+        optionId: "allow_once",
+      },
+      emit,
+    );
+
+    expect(acpSession.respondToPermission).toHaveBeenCalledWith("stale-req", "allow_once");
+    expect(events.filter((event) => event.type === "error")).toHaveLength(0);
+  });
+
   it("prompt records user message to transcript", async () => {
     const { emit, events } = collectEvents();
     router.handleMessage({ type: "session_new" }, emit);

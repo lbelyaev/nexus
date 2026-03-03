@@ -810,14 +810,9 @@ export const createRouter = (deps: RouterDeps): Router => {
 
     const requestMeta = requestToSession.get(msg.requestId);
     if (!requestMeta) {
-      log.warn("approval_response_unknown_request", {
+      log.info("approval_response_stale_unknown_request_ignored", {
         connectionId: context?.connectionId ?? emitterConnectionIds.get(emit) ?? null,
         requestId: msg.requestId,
-      });
-      emit({
-        type: "error",
-        sessionId: "",
-        message: `No session found for approval request: ${msg.requestId}`,
       });
       return;
     }
@@ -836,26 +831,22 @@ export const createRouter = (deps: RouterDeps): Router => {
     const session = sessions.get(sessionId);
     if (!session) {
       clearPendingApproval(sessionId, msg.requestId);
-      emit({
-        type: "error",
+      log.info("approval_response_stale_session_ignored", {
+        connectionId: context?.connectionId ?? emitterConnectionIds.get(emit) ?? null,
         sessionId,
-        message: `Session not found: ${sessionId}`,
+        requestId: msg.requestId,
       });
       return;
     }
 
     const found = session.respondToPermission(msg.requestId, optionId);
     if (!found) {
+      clearPendingApproval(sessionId, msg.requestId);
       log.warn("approval_response_no_pending_permission", {
         connectionId: context?.connectionId ?? emitterConnectionIds.get(emit) ?? null,
         sessionId,
         turnId: requestMeta.turnId ?? null,
         requestId: msg.requestId,
-      });
-      emit({
-        type: "error",
-        sessionId,
-        message: `No pending approval request: ${msg.requestId}`,
       });
       return;
     }

@@ -63,6 +63,10 @@ body {
     @apply rounded-md border border-red-300/30 bg-red-300/10 px-3 py-2 text-sm font-medium text-red-100 transition hover:bg-red-300/15;
   }
 
+  .button-icon {
+    @apply inline-flex h-10 w-10 items-center justify-center rounded-md border border-white/20 bg-white/10 text-white transition hover:bg-white/20 disabled:cursor-not-allowed disabled:opacity-40;
+  }
+
   .chip {
     @apply rounded-full border border-white/20 px-3 py-1 text-[11px] text-white/80;
   }
@@ -159,6 +163,28 @@ body {
   font-style: italic;
 }
 
+.status-dot {
+  display: inline-block;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 9999px;
+}
+
+.status-dot-ready {
+  background: #34d399;
+  box-shadow: 0 0 0 0.1rem rgba(52, 211, 153, 0.25);
+}
+
+.status-dot-warn {
+  background: #facc15;
+  box-shadow: 0 0 0 0.1rem rgba(250, 204, 21, 0.25);
+  animation: status-dot-blink 1s steps(1, end) infinite;
+}
+
+.status-dot-idle {
+  background: rgba(220, 227, 239, 0.45);
+}
+
 .waiting-dots span {
   opacity: 0.2;
   animation: waiting-dot 1s infinite;
@@ -180,5 +206,16 @@ body {
   }
   40% {
     opacity: 1;
+  }
+}
+
+@keyframes status-dot-blink {
+  0%,
+  50% {
+    opacity: 1;
+  }
+  50.01%,
+  100% {
+    opacity: 0.25;
   }
 }
