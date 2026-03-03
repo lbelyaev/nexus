@@ -18,6 +18,7 @@ describe("initDatabase", () => {
     const columnNames = columns.map((c) => c.name);
 
     expect(columnNames).toContain("id");
+    expect(columnNames).toContain("workspaceId");
     expect(columnNames).toContain("runtimeId");
     expect(columnNames).toContain("acpSessionId");
     expect(columnNames).toContain("status");
@@ -53,6 +54,7 @@ describe("initDatabase", () => {
     const columnNames = columns.map((c) => c.name);
 
     expect(columnNames).toContain("id");
+    expect(columnNames).toContain("workspaceId");
     expect(columnNames).toContain("sessionId");
     expect(columnNames).toContain("role");
     expect(columnNames).toContain("content");
@@ -100,8 +102,11 @@ describe("initDatabase", () => {
 
     expect(indexNames).toContain("idx_audit_events_sessionId");
     expect(indexNames).toContain("idx_sessions_status");
+    expect(indexNames).toContain("idx_sessions_workspaceId");
     expect(indexNames).toContain("idx_transcript_sessionId");
+    expect(indexNames).toContain("idx_transcript_workspaceId_session");
     expect(indexNames).toContain("idx_memory_items_session_kind_createdAt");
     expect(indexNames).toContain("idx_memory_items_session_lastAccessedAt");
+    expect(indexNames).toContain("idx_memory_items_workspace_kind_createdAt");
   });
 });

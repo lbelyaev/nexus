@@ -26,6 +26,7 @@ describe("createSqliteMemoryProvider", () => {
     });
 
     provider.recordTurn({
+      workspaceId: "ws-1",
       sessionId: "sess-1",
       userText: "I use Telegram for urgent alerts.",
       assistantText: "You use Telegram for urgent alerts and prefer concise updates.",
@@ -68,6 +69,7 @@ describe("createSqliteMemoryProvider", () => {
     });
 
     const results = provider.search({
+      workspaceId: "ws-1",
       sessionId: "sess-1",
       query: "telegram alerts",
       limit: 1,
@@ -124,6 +126,7 @@ describe("createSqliteMemoryProvider", () => {
     });
 
     const context = provider.getContext({
+      workspaceId: "ws-1",
       sessionId: "sess-1",
       prompt: "When do we deploy?",
       budgetTokens: 40,
@@ -136,6 +139,54 @@ describe("createSqliteMemoryProvider", () => {
     expect(context.rendered).toContain("# Memory Context");
     expect(context.rendered).toContain("Recent Transcript");
     expect(context.rendered).toContain("Relevant Facts");
+    store.close();
+  });
+
+  it("returns stats/recent and supports clear", () => {
+    const store = createStateStore(":memory:");
+    const provider = createSqliteMemoryProvider(store);
+
+    store.appendMessage({
+      sessionId: "sess-1",
+      role: "user",
+      content: "use telegram",
+      timestamp: "2026-01-01T00:00:00Z",
+      tokenEstimate: 3,
+    });
+    store.appendMemoryItem({
+      sessionId: "sess-1",
+      kind: "fact",
+      content: "Uses Telegram for alerts",
+      source: "manual",
+      confidence: 0.8,
+      keywords: ["telegram", "alerts"],
+      createdAt: "2026-01-01T00:00:01Z",
+      tokenEstimate: 6,
+    });
+    store.appendMemoryItem({
+      sessionId: "sess-1",
+      kind: "summary",
+      content: "user prefers telegram",
+      source: "manual",
+      confidence: 0.9,
+      keywords: ["telegram"],
+      createdAt: "2026-01-01T00:00:02Z",
+      tokenEstimate: 5,
+    });
+
+    const stats = provider.getStats({ workspaceId: "ws-1", sessionId: "sess-1" });
+    expect(stats.total).toBe(2);
+    expect(stats.facts).toBe(1);
+    expect(stats.summaries).toBe(1);
+    expect(stats.transcriptMessages).toBe(1);
+
+    const recent = provider.getRecent({ workspaceId: "ws-1", sessionId: "sess-1", limit: 1 });
+    expect(recent).toHaveLength(1);
+    expect(recent[0].content).toContain("telegram");
+
+    const deleted = provider.clear({ workspaceId: "ws-1", sessionId: "sess-1" });
+    expect(deleted).toBe(2);
+    expect(store.getMemoryItems("sess-1")).toHaveLength(0);
     store.close();
   });
 });

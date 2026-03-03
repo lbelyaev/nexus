@@ -4,7 +4,7 @@ import { initDatabase } from "../migrations.js";
 import { createMemoryStore } from "../memory.js";
 import type { MemoryItem } from "@nexus/types";
 
-type MemoryInput = Omit<MemoryItem, "id" | "lastAccessedAt"> & { lastAccessedAt?: string };
+type MemoryInput = Omit<MemoryItem, "id" | "lastAccessedAt"> & { workspaceId?: string; lastAccessedAt?: string };
 
 const makeMemoryItem = (overrides: Partial<MemoryInput> = {}): MemoryInput => ({
   sessionId: "sess-1",
@@ -85,5 +85,25 @@ describe("MemoryStore", () => {
 
     expect(store.getMemoryItems("sess-1")).toHaveLength(0);
     expect(store.getMemoryItems("sess-2")).toHaveLength(1);
+  });
+
+  it("workspace-level queries aggregate across sessions", () => {
+    store.appendMemoryItem(makeMemoryItem({ sessionId: "sess-1", workspaceId: "ws-1", content: "telegram alerts" }));
+    store.appendMemoryItem(makeMemoryItem({ sessionId: "sess-2", workspaceId: "ws-1", content: "discord alerts" }));
+    store.appendMemoryItem(makeMemoryItem({ sessionId: "sess-3", workspaceId: "ws-2", content: "other workspace" }));
+
+    const wsItems = store.getWorkspaceMemoryItems("ws-1");
+    expect(wsItems).toHaveLength(2);
+
+    const search = store.searchWorkspaceMemory("ws-1", "alerts");
+    expect(search).toHaveLength(2);
+
+    const excluding = store.getWorkspaceMemoryItems("ws-1", { excludeSessionId: "sess-2" });
+    expect(excluding).toHaveLength(1);
+    expect(excluding[0].sessionId).toBe("sess-1");
+
+    store.deleteWorkspaceMemory("ws-1");
+    expect(store.getWorkspaceMemoryItems("ws-1")).toHaveLength(0);
+    expect(store.getWorkspaceMemoryItems("ws-2")).toHaveLength(1);
   });
 });

@@ -29,6 +29,7 @@ export interface RouterDeps {
   stateStore: StateStore;
   policyConfig: PolicyConfig;
   memoryProvider?: MemoryProvider;
+  defaultWorkspaceId?: string;
 }
 
 export interface Router {
@@ -69,6 +70,7 @@ const ensureSessionOwner = (
  * Accumulates text_delta chunks and flushes a single assistant message at turn_end.
  */
 export const createRecordingEmitter = (
+  workspaceId: string,
   sessionId: string,
   stateStore: StateStore,
   downstream: EventEmitter,
@@ -90,6 +92,7 @@ export const createRecordingEmitter = (
         {
           const content = safeStringify(event.params);
           stateStore.appendMessage({
+            workspaceId,
             sessionId,
             role: "tool",
             content,
@@ -102,6 +105,7 @@ export const createRecordingEmitter = (
         break;
       case "tool_end":
         stateStore.appendMessage({
+          workspaceId,
           sessionId,
           role: "tool",
           content: event.result ?? "",
@@ -118,6 +122,7 @@ export const createRecordingEmitter = (
         if (assistantBuffer) {
           options?.onAssistantMessage?.(assistantBuffer);
           stateStore.appendMessage({
+            workspaceId,
             sessionId,
             role: "assistant",
             content: assistantBuffer,
@@ -133,8 +138,15 @@ export const createRecordingEmitter = (
 };
 
 export const createRouter = (deps: RouterDeps): Router => {
-  const { createAcpSession, stateStore, policyConfig, memoryProvider } = deps;
+  const {
+    createAcpSession,
+    stateStore,
+    policyConfig,
+    memoryProvider,
+    defaultWorkspaceId = "default",
+  } = deps;
   const sessions = new Map<string, ManagedAcpSession>();
+  const sessionWorkspaces = new Map<string, string>();
   const sessionOwners = new Map<string, EventEmitter>();
   const requestToSessionId = new Map<string, string>();
   const sessionToPendingRequests = new Map<string, Set<string>>();
@@ -170,6 +182,7 @@ export const createRouter = (deps: RouterDeps): Router => {
     msg: Extract<ClientMessage, { type: "session_new" }>,
     emit: EventEmitter,
   ): void => {
+    const workspaceId = msg.workspaceId?.trim() || defaultWorkspaceId;
     createAcpSession(msg.runtimeId, msg.model, emit).then(
       (acpSession) => {
         const sessionId = acpSession.id;
@@ -177,6 +190,7 @@ export const createRouter = (deps: RouterDeps): Router => {
 
         stateStore.createSession({
           id: sessionId,
+          workspaceId,
           runtimeId: acpSession.runtimeId,
           acpSessionId: acpSession.acpSessionId,
           status: "active",
@@ -187,12 +201,14 @@ export const createRouter = (deps: RouterDeps): Router => {
         });
 
         sessions.set(sessionId, acpSession);
+        sessionWorkspaces.set(sessionId, workspaceId);
         sessionOwners.set(sessionId, emit);
         emit({
           type: "session_created",
           sessionId,
           model: acpSession.model,
           runtimeId: acpSession.runtimeId,
+          workspaceId,
           modelRouting: acpSession.modelRouting,
           modelAliases: acpSession.modelAliases,
           modelCatalog: acpSession.modelCatalog,
@@ -241,7 +257,9 @@ export const createRouter = (deps: RouterDeps): Router => {
     });
 
     // Record user prompt to transcript
+    const workspaceId = sessionWorkspaces.get(msg.sessionId) ?? defaultWorkspaceId;
     stateStore.appendMessage({
+      workspaceId,
       sessionId: msg.sessionId,
       role: "user",
       content: msg.text,
@@ -252,7 +270,7 @@ export const createRouter = (deps: RouterDeps): Router => {
     // Wrap emit with recording layer to capture streaming events
     let sawStreamedText = false;
     let assistantMessageForTurn = "";
-    const recordingEmitWithHooks = createRecordingEmitter(msg.sessionId, stateStore, emit, {
+    const recordingEmitWithHooks = createRecordingEmitter(workspaceId, msg.sessionId, stateStore, emit, {
       onTextDelta: () => {
         sawStreamedText = true;
       },
@@ -268,8 +286,10 @@ export const createRouter = (deps: RouterDeps): Router => {
     if (memoryProvider) {
       try {
         const context = memoryProvider.getContext({
+          workspaceId,
           sessionId: msg.sessionId,
           prompt: msg.text,
+          scope: "hybrid",
         });
         if (context.rendered) {
           promptText = `${context.rendered}\n\n# User Prompt\n${msg.text}`;
@@ -339,6 +359,7 @@ export const createRouter = (deps: RouterDeps): Router => {
         if (memoryProvider) {
           try {
             memoryProvider.recordTurn({
+              workspaceId,
               sessionId: msg.sessionId,
               userText: msg.text,
               assistantText: assistantMessageForTurn,
@@ -471,6 +492,138 @@ export const createRouter = (deps: RouterDeps): Router => {
     });
   };
 
+  const handleMemoryQuery = (
+    msg: Extract<ClientMessage, { type: "memory_query" }>,
+    emit: EventEmitter,
+  ): void => {
+    if (!memoryProvider) {
+      emit({
+        type: "error",
+        sessionId: msg.sessionId,
+        message: "Memory is not enabled for this gateway.",
+      });
+      return;
+    }
+
+    const session = sessions.get(msg.sessionId);
+    if (!session) {
+      emit({
+        type: "error",
+        sessionId: msg.sessionId,
+        message: `Session not found: ${msg.sessionId}`,
+      });
+      return;
+    }
+    if (!ensureSessionOwner(sessionOwners, msg.sessionId, emit)) {
+      emitSessionOwnershipError(emit, msg.sessionId);
+      return;
+    }
+    const workspaceId = sessionWorkspaces.get(msg.sessionId) ?? defaultWorkspaceId;
+
+    const limit = Math.max(1, Math.min(50, Math.floor(msg.limit ?? 10)));
+    const scope = msg.scope ?? "session";
+
+    switch (msg.action) {
+      case "stats": {
+        const stats = memoryProvider.getStats({ workspaceId, sessionId: msg.sessionId, scope: scope === "workspace" ? "workspace" : "session" });
+        emit({
+          type: "memory_result",
+          sessionId: msg.sessionId,
+          action: "stats",
+          scope: scope === "workspace" ? "workspace" : "session",
+          stats,
+        });
+        return;
+      }
+      case "recent": {
+        const items = memoryProvider.getRecent({
+          workspaceId,
+          sessionId: msg.sessionId,
+          scope: scope === "workspace" ? "workspace" : "session",
+          limit,
+        });
+        emit({
+          type: "memory_result",
+          sessionId: msg.sessionId,
+          action: "recent",
+          scope: scope === "workspace" ? "workspace" : "session",
+          limit,
+          items,
+        });
+        return;
+      }
+      case "search": {
+        const query = msg.query?.trim() ?? "";
+        if (!query) {
+          emit({
+            type: "error",
+            sessionId: msg.sessionId,
+            message: "Memory search query is required.",
+          });
+          return;
+        }
+        const items = memoryProvider.search({
+          workspaceId,
+          sessionId: msg.sessionId,
+          scope: scope === "workspace" ? "workspace" : "session",
+          query,
+          limit,
+        });
+        emit({
+          type: "memory_result",
+          sessionId: msg.sessionId,
+          action: "search",
+          scope: scope === "workspace" ? "workspace" : "session",
+          query,
+          limit,
+          items,
+        });
+        return;
+      }
+      case "context": {
+        const contextScope = msg.scope ?? "hybrid";
+        const prompt = msg.prompt?.trim()
+          || stateStore
+            .getTranscript(msg.sessionId)
+            .filter((entry) => entry.role === "user")
+            .slice(-1)[0]
+            ?.content
+          || "(no prompt)";
+        const context = memoryProvider.getContext({
+          workspaceId,
+          sessionId: msg.sessionId,
+          prompt,
+          scope: contextScope === "workspace" || contextScope === "session" || contextScope === "hybrid"
+            ? contextScope
+            : "hybrid",
+        });
+        emit({
+          type: "memory_result",
+          sessionId: msg.sessionId,
+          action: "context",
+          scope: contextScope === "workspace" || contextScope === "session" || contextScope === "hybrid"
+            ? contextScope
+            : "hybrid",
+          prompt,
+          context,
+        });
+        return;
+      }
+      case "clear": {
+        const effectiveScope = scope === "workspace" ? "workspace" : "session";
+        const deleted = memoryProvider.clear({ workspaceId, sessionId: msg.sessionId, scope: effectiveScope });
+        emit({
+          type: "memory_result",
+          sessionId: msg.sessionId,
+          action: "clear",
+          scope: effectiveScope,
+          deleted,
+        });
+        return;
+      }
+    }
+  };
+
   const handleMessage = (msg: ClientMessage, emit: EventEmitter): void => {
     switch (msg.type) {
       case "session_new":
@@ -485,6 +638,8 @@ export const createRouter = (deps: RouterDeps): Router => {
         return handleApprovalResponse(msg, emit);
       case "session_replay":
         return handleSessionReplay(msg, emit);
+      case "memory_query":
+        return handleMemoryQuery(msg, emit);
     }
   };
 

@@ -40,6 +40,15 @@ describe("createRouter", () => {
     acpSession = mockAcpSession();
     memoryProvider = {
       id: "test-memory",
+      getStats: vi.fn(() => ({
+        facts: 2,
+        summaries: 1,
+        total: 3,
+        transcriptMessages: 4,
+        memoryTokens: 30,
+        transcriptTokens: 50,
+      })),
+      getRecent: vi.fn(() => []),
       getContext: vi.fn(() => ({
         sessionId: "gw-session-1",
         budgetTokens: 1000,
@@ -51,6 +60,7 @@ describe("createRouter", () => {
       })),
       search: vi.fn(() => []),
       recordTurn: vi.fn(),
+      clear: vi.fn(() => 0),
     };
     createAcpSessionMock = vi.fn(async (_runtimeId, _model, _onEvent: EventEmitter) => acpSession);
     router = createRouter({
@@ -58,6 +68,7 @@ describe("createRouter", () => {
       stateStore,
       policyConfig,
       memoryProvider,
+      defaultWorkspaceId: "default",
     });
   });
 
@@ -81,6 +92,7 @@ describe("createRouter", () => {
       expect(typeof event.sessionId).toBe("string");
       expect(event.model).toBe("claude");
       expect(event.runtimeId).toBe("default");
+      expect(event.workspaceId).toBe("default");
       expect(event.modelRouting?.sonnet).toBe("claude");
       expect(event.modelAliases?.fast).toBe("gpt-5.2-codex-mini");
       expect(event.modelCatalog?.codex).toContain("gpt-5.3-codex");
@@ -101,6 +113,21 @@ describe("createRouter", () => {
     });
 
     expect(createAcpSessionMock).toHaveBeenCalledWith("codex", "gpt-5", emit);
+  });
+
+  it("session_new uses provided workspaceId", async () => {
+    const { emit, events } = collectEvents();
+    router.handleMessage({ type: "session_new", workspaceId: "acme" }, emit);
+
+    await vi.waitFor(() => {
+      expect(events).toHaveLength(1);
+    });
+    const event = events[0];
+    if (event.type !== "session_created") throw new Error("expected session_created");
+    expect(event.workspaceId).toBe("acme");
+
+    const stored = stateStore.getSession(event.sessionId);
+    expect(stored?.workspaceId).toBe("acme");
   });
 
   it("prompt emits error event if sessionId not found", () => {
@@ -460,8 +487,10 @@ describe("createRouter", () => {
     expect((acpSession.prompt as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain("# Memory Context");
     expect((acpSession.prompt as ReturnType<typeof vi.fn>).mock.calls[0][0]).toContain("# User Prompt");
     expect(memoryProvider.getContext).toHaveBeenCalledWith({
+      workspaceId: "default",
       sessionId,
       prompt: "current question",
+      scope: "hybrid",
     });
   });
 
@@ -493,9 +522,54 @@ describe("createRouter", () => {
     });
 
     expect(memoryProvider.recordTurn).toHaveBeenCalledWith({
+      workspaceId: "default",
       sessionId,
       userText: "remember this",
       assistantText: "assistant answer",
     });
+  });
+
+  it("memory_query stats returns memory_result", async () => {
+    const { emit, events } = collectEvents();
+    router.handleMessage({ type: "session_new" }, emit);
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === "session_created")).toBe(true);
+    });
+
+    const sessionId = (events[0] as Extract<GatewayEvent, { type: "session_created" }>).sessionId;
+    events.length = 0;
+    router.handleMessage({ type: "memory_query", sessionId, action: "stats" }, emit);
+
+    expect(memoryProvider.getStats).toHaveBeenCalledWith({
+      workspaceId: "default",
+      sessionId,
+      scope: "session",
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0].type).toBe("memory_result");
+    if (events[0].type === "memory_result") {
+      expect(events[0].action).toBe("stats");
+      expect(events[0].scope).toBe("session");
+    }
+  });
+
+  it("memory_query search validates query text", async () => {
+    const { emit, events } = collectEvents();
+    router.handleMessage({ type: "session_new" }, emit);
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === "session_created")).toBe(true);
+    });
+
+    const sessionId = (events[0] as Extract<GatewayEvent, { type: "session_created" }>).sessionId;
+    events.length = 0;
+    router.handleMessage({ type: "memory_query", sessionId, action: "search", query: " " }, emit);
+
+    expect(events).toHaveLength(1);
+    expect(events[0].type).toBe("error");
+    if (events[0].type === "error") {
+      expect(events[0].message).toMatch(/query is required/i);
+    }
   });
 });

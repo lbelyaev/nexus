@@ -10,6 +10,7 @@ export interface SessionStore {
 
 interface SessionRow {
   id: string;
+  workspaceId: string;
   runtimeId: string;
   acpSessionId: string;
   status: string;
@@ -22,6 +23,7 @@ interface SessionRow {
 
 const rowToRecord = (row: SessionRow): SessionRecord => ({
   id: row.id,
+  workspaceId: row.workspaceId,
   runtimeId: row.runtimeId,
   acpSessionId: row.acpSessionId,
   status: row.status as SessionRecord["status"],
@@ -35,14 +37,15 @@ const rowToInfo = (row: SessionRow): SessionInfo => ({
   id: row.id,
   status: row.status as SessionInfo["status"],
   model: row.model,
+  workspaceId: row.workspaceId,
   createdAt: row.createdAt,
   lastActivityAt: row.lastActivityAt,
 });
 
 export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
   const insertStmt = db.prepare(
-    `INSERT INTO sessions (id, runtimeId, acpSessionId, status, createdAt, lastActivityAt, tokenInput, tokenOutput, model)
-     VALUES (@id, @runtimeId, @acpSessionId, @status, @createdAt, @lastActivityAt, @tokenInput, @tokenOutput, @model)`,
+    `INSERT INTO sessions (id, workspaceId, runtimeId, acpSessionId, status, createdAt, lastActivityAt, tokenInput, tokenOutput, model)
+     VALUES (@id, @workspaceId, @runtimeId, @acpSessionId, @status, @createdAt, @lastActivityAt, @tokenInput, @tokenOutput, @model)`,
   );
 
   const getStmt = db.prepare("SELECT * FROM sessions WHERE id = ?");
@@ -54,6 +57,7 @@ export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
   const createSession = (session: SessionRecord): void => {
     insertStmt.run({
       id: session.id,
+      workspaceId: session.workspaceId,
       runtimeId: session.runtimeId,
       acpSessionId: session.acpSessionId,
       status: session.status,
@@ -89,6 +93,10 @@ export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
     if (patch.runtimeId !== undefined) {
       setClauses.push("runtimeId = @runtimeId");
       params.runtimeId = patch.runtimeId;
+    }
+    if (patch.workspaceId !== undefined) {
+      setClauses.push("workspaceId = @workspaceId");
+      params.workspaceId = patch.workspaceId;
     }
     if (patch.acpSessionId !== undefined) {
       setClauses.push("acpSessionId = @acpSessionId");

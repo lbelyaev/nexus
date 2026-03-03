@@ -27,10 +27,12 @@ describe("useSession", () => {
     expect(result.current.sessionId).toBeNull();
     expect(result.current.sessionModel).toBeNull();
     expect(result.current.sessionRuntimeId).toBeNull();
+    expect(result.current.sessionWorkspaceId).toBeNull();
     expect(result.current.responseText).toBe("");
     expect(result.current.isStreaming).toBe(false);
     expect(result.current.activeTools).toEqual([]);
     expect(result.current.error).toBeNull();
+    expect(result.current.memoryResults).toEqual([]);
   });
 
   it("sets sessionId on session_created event", () => {
@@ -48,6 +50,7 @@ describe("useSession", () => {
     expect(result.current.sessionId).toBe("sess-123");
     expect(result.current.sessionModel).toBe("claude-4");
     expect(result.current.sessionRuntimeId).toBeNull();
+    expect(result.current.sessionWorkspaceId).toBe("default");
   });
 
   it("accumulates text_delta into responseText", () => {
@@ -505,6 +508,31 @@ describe("useSession", () => {
     });
   });
 
+  it("requestMemory sends memory_query for active session", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_created",
+        sessionId: "sess-42",
+        model: "claude-4",
+      });
+    });
+
+    act(() => {
+      result.current.requestMemory({ action: "search", query: "telegram", limit: 3 });
+    });
+
+    expect(sendMessage).toHaveBeenCalledWith({
+      type: "memory_query",
+      sessionId: "sess-42",
+      action: "search",
+      query: "telegram",
+      limit: 3,
+    });
+  });
+
   it("sets transcript on transcript event", () => {
     const sendMessage = vi.fn();
     const { result } = renderHook(() => useSession(sendMessage));
@@ -530,6 +558,31 @@ describe("useSession", () => {
     const { result } = renderHook(() => useSession(sendMessage));
 
     expect(result.current.transcript).toEqual([]);
+  });
+
+  it("stores memory_result events", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "memory_result",
+        sessionId: "sess-1",
+        action: "stats",
+        scope: "session",
+        stats: {
+          facts: 1,
+          summaries: 1,
+          total: 2,
+          transcriptMessages: 3,
+          memoryTokens: 14,
+          transcriptTokens: 20,
+        },
+      });
+    });
+
+    expect(result.current.memoryResults).toHaveLength(1);
+    expect(result.current.memoryResults[0].action).toBe("stats");
   });
 
   it("ignores stale cancelled turn_end after steer reprompt", () => {

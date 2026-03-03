@@ -68,6 +68,7 @@ export const loadConfig = (configPath?: string): NexusConfig => {
     modelRouting: raw.modelRouting as Record<string, string> | undefined,
     modelAliases: raw.modelAliases as Record<string, string> | undefined,
     modelCatalog: raw.modelCatalog as Record<string, string[]> | undefined,
+    workspaceDefaultId: raw.workspaceDefaultId as string | undefined,
     memory: raw.memory as MemoryConfig | undefined,
     dataDir: (raw.dataDir as string) ?? DEFAULTS.dataDir,
   };
@@ -147,6 +148,8 @@ export const loadConfig = (configPath?: string): NexusConfig => {
       "hotMessageCount",
       "warmSummaryCount",
       "coldFactCount",
+      "workspaceSummaryCount",
+      "workspaceFactCount",
       "maxFactsPerTurn",
       "maxFactLength",
       "summaryWindowMessages",
@@ -167,6 +170,12 @@ export const loadConfig = (configPath?: string): NexusConfig => {
 
   if (!config.auth.token) {
     config.auth.token = generateToken();
+  }
+  if (config.workspaceDefaultId !== undefined) {
+    if (typeof config.workspaceDefaultId !== "string" || !config.workspaceDefaultId.trim()) {
+      throw new Error("Invalid config: workspaceDefaultId must be a non-empty string");
+    }
+    config.workspaceDefaultId = config.workspaceDefaultId.trim();
   }
 
   return config;

@@ -40,10 +40,70 @@ const inferRuntimeFromModel = (
   return undefined;
 };
 
+const compact = (text: string, max: number = 110): string => {
+  const cleaned = text.replace(/\s+/g, " ").trim();
+  if (cleaned.length <= max) return cleaned;
+  return `${cleaned.slice(0, max - 3)}...`;
+};
+
+const formatMemoryResult = (
+  event: ReturnType<typeof useSession>["memoryResults"][number],
+): ChatMessage[] => {
+  const scopeLabel = `scope=${event.scope}`;
+  switch (event.action) {
+    case "stats":
+      return [
+        { role: "system", text: `  Memory stats (${scopeLabel}):` },
+        {
+          role: "system",
+          text: `    memory=facts:${event.stats.facts}, summaries:${event.stats.summaries}, total:${event.stats.total}, tokens:${event.stats.memoryTokens}`,
+        },
+        {
+          role: "system",
+          text: `    transcript=messages:${event.stats.transcriptMessages}, tokens:${event.stats.transcriptTokens}`,
+        },
+      ];
+    case "recent":
+      if (event.items.length === 0) {
+        return [{ role: "system", text: `  No memory items found (recent ${event.limit}, ${scopeLabel}).` }];
+      }
+      return [
+        { role: "system", text: `  Recent memory (${event.items.length}/${event.limit}, ${scopeLabel}):` },
+        ...event.items.map((item) => ({
+          role: "system" as const,
+          text: `    - [${item.kind}] c=${item.confidence.toFixed(2)} ${compact(item.content)}`,
+        })),
+      ];
+    case "search":
+      if (event.items.length === 0) {
+        return [{ role: "system", text: `  No memory matches for "${event.query}" (${scopeLabel}).` }];
+      }
+      return [
+        { role: "system", text: `  Memory search "${event.query}" (${event.items.length}/${event.limit}, ${scopeLabel}):` },
+        ...event.items.map((item) => ({
+          role: "system" as const,
+          text: `    - [${item.kind}] c=${item.confidence.toFixed(2)} ${compact(item.content)}`,
+        })),
+      ];
+    case "context":
+      return [
+        {
+          role: "system",
+          text: `  Memory context (${scopeLabel}) for "${compact(event.prompt, 80)}": tokens=${event.context.totalTokens}/${event.context.budgetTokens}, hot=${event.context.hot.length}, warm=${event.context.warm.length}, cold=${event.context.cold.length}`,
+        },
+      ];
+    case "clear":
+      return [{ role: "system", text: `  Cleared ${event.deleted} memory item(s) (${scopeLabel}).` }];
+  }
+};
+
 export const App = ({ url, token }: AppProps) => {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [preferredRuntimeId, setPreferredRuntimeId] = useState<string | undefined>(
     process.env.NEXUS_RUNTIME?.trim() || undefined,
+  );
+  const [preferredWorkspaceId, setPreferredWorkspaceId] = useState<string>(
+    process.env.NEXUS_WORKSPACE?.trim() || "default",
   );
   const [preferredModel, setPreferredModel] = useState<string | undefined>(
     process.env.NEXUS_MODEL?.trim() || undefined,
@@ -81,6 +141,7 @@ export const App = ({ url, token }: AppProps) => {
 
   // Finalize response into messages when streaming stops
   const prevStreamingRef = useRef(false);
+  const processedMemoryResultsRef = useRef(0);
   useEffect(() => {
     if (prevStreamingRef.current && !session.isStreaming) {
       setMessages((prev) => {
@@ -100,11 +161,19 @@ export const App = ({ url, token }: AppProps) => {
     prevStreamingRef.current = session.isStreaming;
   }, [session.isStreaming, session.responseText, session.toolCalls]);
 
+  useEffect(() => {
+    if (session.memoryResults.length <= processedMemoryResultsRef.current) return;
+    const next = session.memoryResults.slice(processedMemoryResultsRef.current);
+    processedMemoryResultsRef.current = session.memoryResults.length;
+    const rendered = next.flatMap((event) => formatMemoryResult(event));
+    setMessages((prev) => [...prev, ...rendered]);
+  }, [session.memoryResults]);
+
   const createSession = useCallback(
-    (runtimeId?: string, model?: string) => {
-      sendMessage({ type: "session_new", runtimeId, model });
+    (runtimeId?: string, model?: string, workspaceId?: string) => {
+      sendMessage({ type: "session_new", runtimeId, model, workspaceId: workspaceId ?? preferredWorkspaceId });
     },
-    [sendMessage],
+    [preferredWorkspaceId, sendMessage],
   );
 
   // Auto-create session on connect
@@ -134,9 +203,9 @@ export const App = ({ url, token }: AppProps) => {
         return;
       }
       setMessages((prev) => [...prev, { role: "system", text: `  Runtime set to ${runtimeId}. Starting new session...` }]);
-      createSession(runtimeId, preferredModel);
+      createSession(runtimeId, preferredModel, preferredWorkspaceId);
     },
-    [createSession, preferredModel, preferredRuntimeId, status],
+    [createSession, preferredModel, preferredRuntimeId, preferredWorkspaceId, status],
   );
 
   const resolveModelInput = useCallback(
@@ -220,6 +289,7 @@ export const App = ({ url, token }: AppProps) => {
 
   const handleStatusCommand = useCallback(() => {
     const activeRuntime = session.sessionRuntimeId ?? preferredRuntimeId ?? "default";
+    const activeWorkspace = session.sessionWorkspaceId ?? preferredWorkspaceId;
     const activeModel = session.sessionModel ?? preferredModel ?? "(unknown)";
     const catalogRuntimes = Object.keys(session.modelCatalog).length;
     const catalogModels = Object.values(session.modelCatalog).reduce((acc, models) => acc + models.length, 0);
@@ -230,6 +300,7 @@ export const App = ({ url, token }: AppProps) => {
       { role: "system", text: "  Status:" },
       { role: "system", text: `    connection=${status}` },
       { role: "system", text: `    session=${session.sessionId ?? "(none)"}` },
+      { role: "system", text: `    workspace=${activeWorkspace}` },
       { role: "system", text: `    runtime=${activeRuntime}` },
       { role: "system", text: `    model=${activeModel}` },
       { role: "system", text: `    streaming=${session.isStreaming ? "yes" : "no"}` },
@@ -243,6 +314,7 @@ export const App = ({ url, token }: AppProps) => {
     localAliases,
     preferredModel,
     preferredRuntimeId,
+    preferredWorkspaceId,
     session.activeTools.length,
     session.isStreaming,
     session.modelAliases,
@@ -250,8 +322,127 @@ export const App = ({ url, token }: AppProps) => {
     session.sessionId,
     session.sessionModel,
     session.sessionRuntimeId,
+    session.sessionWorkspaceId,
     status,
   ]);
+
+  const parseMemoryScope = (
+    value: string | undefined,
+  ): "session" | "workspace" | "hybrid" | undefined => {
+    const normalized = value?.trim().toLowerCase();
+    if (!normalized) return undefined;
+    if (normalized === "session" || normalized === "workspace" || normalized === "hybrid") {
+      return normalized;
+    }
+    return undefined;
+  };
+
+  const handleWorkspaceCommand = useCallback(
+    (workspaceArg: string) => {
+      const workspaceId = workspaceArg.trim();
+      if (!workspaceId) {
+        setMessages((prev) => [...prev, { role: "system", text: `  Workspace: ${preferredWorkspaceId}` }]);
+        return;
+      }
+      setPreferredWorkspaceId(workspaceId);
+      if (status !== "connected") {
+        setMessages((prev) => [...prev, { role: "system", text: `  Workspace set to ${workspaceId}. Will apply when connected.` }]);
+        return;
+      }
+      setMessages((prev) => [...prev, { role: "system", text: `  Workspace set to ${workspaceId}. Starting new session...` }]);
+      createSession(preferredRuntimeId, preferredModel, workspaceId);
+    },
+    [createSession, preferredModel, preferredRuntimeId, preferredWorkspaceId, status],
+  );
+
+  const handleMemoryCommand = useCallback(
+    (memoryArg: string) => {
+      if (!session.sessionId) {
+        setMessages((prev) => [...prev, { role: "system", text: "  No active session for memory commands." }]);
+        return;
+      }
+
+      const parts = memoryArg.trim().split(/\s+/).filter(Boolean);
+      const sub = parts[0]?.toLowerCase();
+      if (!sub) {
+        setMessages((prev) => [...prev, { role: "system", text: "  Usage: /memory stats [session|workspace] | recent [n] [session|workspace] | search <query> [session|workspace] | context [prompt] [session|workspace|hybrid] | clear [session|workspace]" }]);
+        return;
+      }
+
+      if (sub === "stats") {
+        const scope = parseMemoryScope(parts[1]);
+        if (parts[1] && !scope) {
+          setMessages((prev) => [...prev, { role: "system", text: "  Usage: /memory stats [session|workspace]" }]);
+          return;
+        }
+        session.requestMemory({ action: "stats", scope: scope === "hybrid" ? "session" : scope });
+        return;
+      }
+
+      if (sub === "recent") {
+        let parsedLimit: number | undefined;
+        let scopeRaw: string | undefined;
+        const firstArg = parts[1];
+        const firstScope = parseMemoryScope(firstArg);
+        if (firstArg && firstScope) {
+          scopeRaw = firstArg;
+        } else if (firstArg) {
+          parsedLimit = Number.parseInt(firstArg, 10);
+          if (!Number.isFinite(parsedLimit) || parsedLimit <= 0) {
+            setMessages((prev) => [...prev, { role: "system", text: "  Usage: /memory recent [n] [session|workspace]" }]);
+            return;
+          }
+          scopeRaw = parts[2];
+        }
+        const scope = parseMemoryScope(scopeRaw);
+        if (scopeRaw && !scope) {
+          setMessages((prev) => [...prev, { role: "system", text: "  Usage: /memory recent [n] [session|workspace]" }]);
+          return;
+        }
+        session.requestMemory({ action: "recent", limit: parsedLimit, scope: scope === "hybrid" ? "session" : scope });
+        return;
+      }
+
+      if (sub === "search") {
+        const query = parts.slice(1).join(" ").trim();
+        if (!query) {
+          setMessages((prev) => [...prev, { role: "system", text: "  Usage: /memory search <query>" }]);
+          return;
+        }
+        const maybeScope = parseMemoryScope(parts.slice(-1)[0]);
+        const consumedScope = maybeScope ? parts.slice(-1)[0] : undefined;
+        const queryParts = consumedScope ? parts.slice(1, -1) : parts.slice(1);
+        const scopedQuery = queryParts.join(" ").trim();
+        if (!scopedQuery) {
+          setMessages((prev) => [...prev, { role: "system", text: "  Usage: /memory search <query> [session|workspace]" }]);
+          return;
+        }
+        session.requestMemory({ action: "search", query: scopedQuery, scope: maybeScope === "hybrid" ? "session" : maybeScope });
+        return;
+      }
+
+      if (sub === "context") {
+        const maybeScope = parseMemoryScope(parts.slice(-1)[0]);
+        const promptParts = maybeScope ? parts.slice(1, -1) : parts.slice(1);
+        const prompt = promptParts.join(" ").trim();
+        session.requestMemory({ action: "context", prompt: prompt || undefined, scope: maybeScope });
+        return;
+      }
+
+      if (sub === "clear") {
+        const scope = parseMemoryScope(parts[1]);
+        if (parts[1] && !scope) {
+          setMessages((prev) => [...prev, { role: "system", text: "  Usage: /memory clear [session|workspace]" }]);
+          return;
+        }
+        session.requestMemory({ action: "clear", scope: scope === "hybrid" ? "session" : scope });
+        return;
+      }
+
+      setMessages((prev) => [...prev, { role: "system", text: "  Usage: /memory stats [session|workspace] | recent [n] [session|workspace] | search <query> [session|workspace] | context [prompt] [session|workspace|hybrid] | clear [session|workspace]" }]);
+    },
+    [session],
+  );
 
   const handleModelCommand = useCallback(
     (modelArg: string) => {
@@ -287,10 +478,10 @@ export const App = ({ url, token }: AppProps) => {
         },
       ]);
       if (status === "connected") {
-        createSession(mappedRuntime ?? preferredRuntimeId, resolved.resolved);
+        createSession(mappedRuntime ?? preferredRuntimeId, resolved.resolved, preferredWorkspaceId);
       }
     },
-    [createSession, preferredModel, preferredRuntimeId, resolveModelInput, session.modelRouting, status],
+    [createSession, preferredModel, preferredRuntimeId, preferredWorkspaceId, resolveModelInput, session.modelRouting, status],
   );
 
   const handleSubmit = useCallback(
@@ -313,6 +504,15 @@ export const App = ({ url, token }: AppProps) => {
         return;
       }
 
+      if (text.startsWith("/workspace")) {
+        if (session.isStreaming) {
+          setMessages((prev) => [...prev, { role: "system", text: "  Can't switch workspace while streaming. Press Esc to cancel current turn." }]);
+          return;
+        }
+        handleWorkspaceCommand(text.replace("/workspace", ""));
+        return;
+      }
+
       if (text.startsWith("/models")) {
         handleModelsCommand();
         return;
@@ -332,6 +532,11 @@ export const App = ({ url, token }: AppProps) => {
         return;
       }
 
+      if (text.startsWith("/memory")) {
+        handleMemoryCommand(text.replace("/memory", ""));
+        return;
+      }
+
       setMessages((prev) => [...prev, { role: "user", text }]);
       if (session.isStreaming) {
         session.steer(text);
@@ -339,7 +544,7 @@ export const App = ({ url, token }: AppProps) => {
         session.sendPrompt(text);
       }
     },
-    [handleAliasCommand, handleModelCommand, handleModelsCommand, handleRuntimeCommand, handleStatusCommand, session.isStreaming, session.sendPrompt, session.steer],
+    [handleAliasCommand, handleMemoryCommand, handleModelCommand, handleModelsCommand, handleRuntimeCommand, handleStatusCommand, handleWorkspaceCommand, session.isStreaming, session.sendPrompt, session.steer],
   );
 
   const handleCancelTurn = useCallback(() => {
@@ -380,9 +585,9 @@ export const App = ({ url, token }: AppProps) => {
         status={status}
         model={
           session.sessionModel
-            ? `${session.sessionRuntimeId ?? preferredRuntimeId ?? "default"}:${session.sessionModel}`
+            ? `${session.sessionWorkspaceId ?? preferredWorkspaceId}/${session.sessionRuntimeId ?? preferredRuntimeId ?? "default"}:${session.sessionModel}`
             : preferredModel
-              ? `${preferredRuntimeId ?? "default"}:${preferredModel}`
+              ? `${preferredWorkspaceId}/${preferredRuntimeId ?? "default"}:${preferredModel}`
               : undefined
         }
       />
@@ -415,7 +620,7 @@ export const App = ({ url, token }: AppProps) => {
         <Text color="gray">Enter = steer, Esc = cancel current turn</Text>
       ) : null}
       {!session.isStreaming ? (
-        <Text color="gray">Commands: /runtime &lt;id&gt;, /model &lt;name&gt;, /models, /alias &lt;nick&gt; &lt;model-id&gt;, /status</Text>
+        <Text color="gray">Commands: /workspace &lt;id&gt;, /runtime &lt;id&gt;, /model &lt;name&gt;, /models, /alias &lt;nick&gt; &lt;model-id&gt;, /status, /memory ...</Text>
       ) : null}
     </Box>
   );

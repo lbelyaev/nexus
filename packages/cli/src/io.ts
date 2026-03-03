@@ -60,6 +60,19 @@ const serializePrettyEvent = (event: GatewayEvent): string => {
       return `[session_list] ${event.sessions.length} session(s)`;
     case "transcript":
       return `[transcript] session=${event.sessionId} messages=${event.messages.length}`;
+    case "memory_result":
+      switch (event.action) {
+        case "stats":
+          return `[memory] stats scope=${event.scope} facts=${event.stats.facts} summaries=${event.stats.summaries} total=${event.stats.total}`;
+        case "recent":
+          return `[memory] recent scope=${event.scope} count=${event.items.length} limit=${event.limit}`;
+        case "search":
+          return `[memory] search scope=${event.scope} query="${event.query}" count=${event.items.length} limit=${event.limit}`;
+        case "context":
+          return `[memory] context scope=${event.scope} tokens=${event.context.totalTokens}/${event.context.budgetTokens} hot=${event.context.hot.length} warm=${event.context.warm.length} cold=${event.context.cold.length}`;
+        case "clear":
+          return `[memory] clear scope=${event.scope} deleted=${event.deleted}`;
+      }
     default: {
       const _exhaustive: never = event;
       return `[event] ${JSON.stringify(_exhaustive)}`;

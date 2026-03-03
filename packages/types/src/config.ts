@@ -14,6 +14,8 @@ export interface MemoryConfig {
   hotMessageCount?: number;
   warmSummaryCount?: number;
   coldFactCount?: number;
+  workspaceSummaryCount?: number;
+  workspaceFactCount?: number;
   maxFactsPerTurn?: number;
   maxFactLength?: number;
   summaryWindowMessages?: number;
@@ -29,6 +31,7 @@ export interface NexusConfig {
   modelRouting?: Record<string, string>;
   modelAliases?: Record<string, string>;
   modelCatalog?: Record<string, string[]>;
+  workspaceDefaultId?: string;
   memory?: MemoryConfig;
   dataDir: string;
 }

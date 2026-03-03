@@ -126,6 +126,7 @@ export const startGateway = async (configPath?: string) => {
     tokenPreview: `${config.auth.token.slice(0, 8)}...`,
     runtimeProfiles: Object.keys(runtimeRegistry.profiles),
     defaultRuntimeId: runtimeRegistry.defaultRuntimeId,
+    workspaceDefaultId: config.workspaceDefaultId ?? "default",
   });
   if (Object.keys(runtimeRegistry.modelAliases).length > 0) {
     log.info("model_aliases_loaded", {
@@ -153,6 +154,8 @@ export const startGateway = async (configPath?: string) => {
       hotMessageCount: memoryConfig?.hotMessageCount,
       warmSummaryCount: memoryConfig?.warmSummaryCount,
       coldFactCount: memoryConfig?.coldFactCount,
+      workspaceSummaryCount: memoryConfig?.workspaceSummaryCount,
+      workspaceFactCount: memoryConfig?.workspaceFactCount,
       maxFactsPerTurn: memoryConfig?.maxFactsPerTurn,
       maxFactLength: memoryConfig?.maxFactLength,
       summaryWindowMessages: memoryConfig?.summaryWindowMessages,
@@ -348,6 +351,7 @@ export const startGateway = async (configPath?: string) => {
     stateStore,
     policyConfig,
     memoryProvider,
+    defaultWorkspaceId: config.workspaceDefaultId ?? "default",
   });
 
   // Server

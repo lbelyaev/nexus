@@ -35,6 +35,7 @@ describe("createStateStore", () => {
 
     store.createSession({
       id: "sess-1",
+      workspaceId: "default",
       runtimeId: "rt-1",
       acpSessionId: "acp-1",
       status: "active",

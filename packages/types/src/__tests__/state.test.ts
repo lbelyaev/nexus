@@ -4,6 +4,7 @@ import { isSessionRecord, isAuditEvent } from "../state.js";
 describe("isSessionRecord", () => {
   const validSession = {
     id: "sess-1",
+    workspaceId: "default",
     runtimeId: "claude-code",
     acpSessionId: "acp-123",
     status: "active",

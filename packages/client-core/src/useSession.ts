@@ -14,6 +14,16 @@ export interface ToolCall {
   status: "running" | "completed" | "failed";
 }
 
+export interface MemoryQueryInput {
+  action: "stats" | "recent" | "search" | "context" | "clear";
+  scope?: "session" | "workspace" | "hybrid";
+  query?: string;
+  prompt?: string;
+  limit?: number;
+}
+
+export type MemoryResultEvent = Extract<GatewayEvent, { type: "memory_result" }>;
+
 const createToolMatcher = (
   event: Extract<GatewayEvent, { type: "tool_end" }>,
   running: Array<{ tool: string; toolCallId?: string; status?: "running" | "completed" | "failed" }>,
@@ -42,6 +52,7 @@ export interface UseSessionResult {
   sessionId: string | null;
   sessionModel: string | null;
   sessionRuntimeId: string | null;
+  sessionWorkspaceId: string | null;
   modelRouting: Record<string, string>;
   modelAliases: Record<string, string>;
   modelCatalog: Record<string, string[]>;
@@ -52,11 +63,13 @@ export interface UseSessionResult {
   activeTools: ActiveTool[];
   toolCalls: ToolCall[];
   transcript: TranscriptMessage[];
+  memoryResults: MemoryResultEvent[];
   error: string | null;
   sendPrompt: (text: string) => void;
   steer: (text: string) => void;
   cancel: () => void;
   requestReplay: (sessionId: string) => void;
+  requestMemory: (query: MemoryQueryInput) => void;
   handleEvent: (event: GatewayEvent) => void;
 }
 
@@ -66,6 +79,7 @@ export const useSession = (
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [sessionModel, setSessionModel] = useState<string | null>(null);
   const [sessionRuntimeId, setSessionRuntimeId] = useState<string | null>(null);
+  const [sessionWorkspaceId, setSessionWorkspaceId] = useState<string | null>(null);
   const [modelRouting, setModelRouting] = useState<Record<string, string>>({});
   const [modelAliases, setModelAliases] = useState<Record<string, string>>({});
   const [modelCatalog, setModelCatalog] = useState<Record<string, string[]>>({});
@@ -76,6 +90,7 @@ export const useSession = (
   const [activeTools, setActiveTools] = useState<ActiveTool[]>([]);
   const [toolCalls, setToolCalls] = useState<ToolCall[]>([]);
   const [transcript, setTranscript] = useState<TranscriptMessage[]>([]);
+  const [memoryResults, setMemoryResults] = useState<MemoryResultEvent[]>([]);
   const [error, setError] = useState<string | null>(null);
   const queuedSteerRef = useRef<string | null>(null);
   const ignoreCancelledTurnEndRef = useRef(false);
@@ -139,6 +154,7 @@ export const useSession = (
         setSessionId(event.sessionId);
         setSessionModel(event.model);
         setSessionRuntimeId(event.runtimeId ?? null);
+        setSessionWorkspaceId(event.workspaceId ?? "default");
         setModelRouting(event.modelRouting ?? {});
         setModelAliases(event.modelAliases ?? {});
         setModelCatalog(event.modelCatalog ?? {});
@@ -213,6 +229,9 @@ export const useSession = (
       case "transcript":
         setTranscript(event.messages);
         break;
+      case "memory_result":
+        setMemoryResults((prev) => [...prev, event]);
+        break;
       case "error":
         ignoreCancelledTurnEndRef.current = false;
         setError(event.message);
@@ -256,6 +275,14 @@ export const useSession = (
     [sendMessage],
   );
 
+  const requestMemory = useCallback(
+    (query: MemoryQueryInput) => {
+      if (!sessionId) return;
+      sendMessage({ type: "memory_query", sessionId, ...query });
+    },
+    [sendMessage, sessionId],
+  );
+
   const cancel = useCallback(() => {
     queuedSteerRef.current = null;
     ignoreCancelledTurnEndRef.current = false;
@@ -268,6 +295,7 @@ export const useSession = (
     sessionId,
     sessionModel,
     sessionRuntimeId,
+    sessionWorkspaceId,
     modelRouting,
     modelAliases,
     modelCatalog,
@@ -278,11 +306,13 @@ export const useSession = (
     activeTools,
     toolCalls,
     transcript,
+    memoryResults,
     error,
     sendPrompt,
     steer,
     cancel,
     requestReplay,
+    requestMemory,
     handleEvent,
   };
 };

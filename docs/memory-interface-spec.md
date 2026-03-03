@@ -32,8 +32,11 @@ Core files:
 interface MemoryProvider {
   id: string;
   recordTurn(input: MemoryTurnInput): void;
+  getStats(input: MemoryStatsInput): MemoryStatsOutput;
+  getRecent(input: MemoryRecentInput): MemoryItem[];
   search(input: MemorySearchInput): MemoryItem[];
   getContext(input: MemoryContextInput): MemoryContextOutput;
+  clear(input: MemoryClearInput): number;
 }
 ```
 
@@ -41,6 +44,7 @@ interface MemoryProvider {
 
 ```ts
 interface MemoryTurnInput {
+  workspaceId: string;
   sessionId: string;
   userText: string;
   assistantText?: string;
@@ -52,10 +56,34 @@ interface MemoryTurnInput {
 
 ```ts
 interface MemorySearchInput {
+  workspaceId: string;
   sessionId: string;
+  scope?: "session" | "workspace";
   query: string;
   limit?: number;
   kinds?: Array<"fact" | "summary">;
+}
+```
+
+```ts
+interface MemoryStatsInput {
+  workspaceId: string;
+  sessionId: string;
+  scope?: "session" | "workspace";
+}
+
+interface MemoryRecentInput {
+  workspaceId: string;
+  sessionId: string;
+  scope?: "session" | "workspace";
+  limit?: number;
+  kinds?: Array<"fact" | "summary">;
+}
+
+interface MemoryClearInput {
+  workspaceId: string;
+  sessionId: string;
+  scope?: "session" | "workspace";
 }
 ```
 
@@ -63,8 +91,10 @@ interface MemorySearchInput {
 
 ```ts
 interface MemoryContextInput {
+  workspaceId: string;
   sessionId: string;
   prompt: string;
+  scope?: "session" | "workspace" | "hybrid";
   budgetTokens?: number;
 }
 
@@ -133,8 +163,8 @@ Behavior:
 3. `getContext`:
    - builds budgeted context from:
      - hot: recent transcript
-     - warm: summaries
-     - cold: query-relevant facts
+     - warm: summaries (session/workspace depending on scope)
+     - cold: query-relevant facts (session/workspace depending on scope)
    - returns a rendered context fragment for prompt injection
 
 ---
@@ -151,6 +181,9 @@ Router usage:
 1. `getContext` before `session.prompt`
 2. injects rendered context if non-empty
 3. `recordTurn` after turn completion
+4. workspace-aware scope:
+   - prompt path uses `scope: "hybrid"`
+   - TUI `/memory` commands can query `session` or `workspace` scopes
 
 Failure handling:
 
@@ -172,6 +205,8 @@ Gateway config supports:
     "hotMessageCount": 8,
     "warmSummaryCount": 4,
     "coldFactCount": 8,
+    "workspaceSummaryCount": 3,
+    "workspaceFactCount": 8,
     "maxFactsPerTurn": 6,
     "maxFactLength": 240,
     "summaryWindowMessages": 10

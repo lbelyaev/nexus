@@ -79,6 +79,7 @@ This document captures planned improvements, features, and architectural evoluti
 - **Gateway-side transcript storage**: Store conversation messages in SQLite for persistence across client reconnects.
 - **Context windowing**: Track token usage and implement context summarization triggers.
 - **Search/retrieval**: Allow querying past conversations for relevant context.
+- **Workspace boundaries**: Add first-class `workspaceId` scoping so shared memory can be retrieved across sessions inside a workspace while preventing cross-workspace bleed.
 
 ### 5.2 MCP Integration
 - **MCP server hosting**: Gateway hosts MCP servers that agents can use for memory, tools, and resources.

@@ -19,14 +19,16 @@ This document is execution-oriented: each milestone has scope, dependencies, and
 3. Runtime registry exists (Claude/Codex), with per-session runtime/model selection.
 4. TUI commands now include runtime/model controls and status visibility.
 5. Headless orchestration Option A exists via `@nexus/cli`.
+6. Memory provider is wired with session + workspace scopes, and hybrid context retrieval is used on prompts.
+7. TUI includes `/workspace` and `/memory` operational commands for memory visibility and control.
 
 Primary gaps:
 
-1. No pluggable long-term memory or context intelligence.
-2. No external chat channels (Telegram/Discord).
-3. No scheduler/pipeline execution layer.
-4. Security is still PoC-level (auth scope, secrets, sandbox posture, audit completeness).
-5. Admin/observability surfaces are minimal.
+1. No external chat channels (Telegram/Discord).
+2. No scheduler/pipeline execution layer.
+3. Security is still PoC-level (auth scope, secrets, sandbox posture, audit completeness).
+4. Admin/observability surfaces are minimal.
+5. Workspace model is not yet fully first-class across policy/auth/secrets (memory is ahead of other subsystems).
 
 ---
 
@@ -91,8 +93,12 @@ All later milestones depend on stable session lifecycle, runtime health handling
    - hot: recent exact context
    - warm: summaries
    - cold: searchable historical memory
-4. Expose memory through tools (ACP/MCP-facing), not prompt blob injection.
-5. Add memory observability:
+4. Workspace boundary support:
+   - session scope memory
+   - workspace-shared scope memory
+   - hybrid retrieval for prompt context
+5. Expose memory through tools (ACP/MCP-facing), not prompt blob injection.
+6. Add memory observability:
    - retrieval hit rate
    - summary count
    - token budget usage by tier
@@ -108,7 +114,8 @@ All later milestones depend on stable session lifecycle, runtime health handling
 2. Agent can retrieve relevant facts via tool call during a turn.
 3. Context assembly remains under configurable token budget.
 4. Summaries preserve provenance (where fact came from).
-5. Tests cover provider contract and tiered context selection.
+5. Session and workspace memory scopes are independently queryable.
+6. Tests cover provider contract and tiered context selection.
 
 ### Non-goals
 

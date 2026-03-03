@@ -1,10 +1,14 @@
 import type { StateStore } from "@nexus/state";
 import { estimateTokens, type MemoryItem, type MemoryItemKind, type TranscriptMessage } from "@nexus/types";
 import type {
+  MemoryClearInput,
   MemoryContextInput,
   MemoryContextOutput,
   MemoryProvider,
+  MemoryRecentInput,
   MemorySearchInput,
+  MemoryStatsInput,
+  MemoryStatsOutput,
   MemoryTurnInput,
   NormalizedMemoryConfig,
   SqliteMemoryProviderConfig,
@@ -15,6 +19,8 @@ const DEFAULT_CONFIG: NormalizedMemoryConfig = {
   hotMessageCount: 8,
   warmSummaryCount: 4,
   coldFactCount: 8,
+  workspaceSummaryCount: 3,
+  workspaceFactCount: 8,
   maxFactsPerTurn: 6,
   maxFactLength: 240,
   summaryWindowMessages: 10,
@@ -25,6 +31,8 @@ const normalizeConfig = (config?: SqliteMemoryProviderConfig): NormalizedMemoryC
   hotMessageCount: config?.hotMessageCount ?? DEFAULT_CONFIG.hotMessageCount,
   warmSummaryCount: config?.warmSummaryCount ?? DEFAULT_CONFIG.warmSummaryCount,
   coldFactCount: config?.coldFactCount ?? DEFAULT_CONFIG.coldFactCount,
+  workspaceSummaryCount: config?.workspaceSummaryCount ?? DEFAULT_CONFIG.workspaceSummaryCount,
+  workspaceFactCount: config?.workspaceFactCount ?? DEFAULT_CONFIG.workspaceFactCount,
   maxFactsPerTurn: config?.maxFactsPerTurn ?? DEFAULT_CONFIG.maxFactsPerTurn,
   maxFactLength: config?.maxFactLength ?? DEFAULT_CONFIG.maxFactLength,
   summaryWindowMessages: config?.summaryWindowMessages ?? DEFAULT_CONFIG.summaryWindowMessages,
@@ -101,6 +109,17 @@ const includeByBudget = <T extends { tokenEstimate: number }>(
   return included;
 };
 
+const dedupeMemoryItems = (items: MemoryItem[]): MemoryItem[] => {
+  const seen = new Set<number>();
+  const result: MemoryItem[] = [];
+  for (const item of items) {
+    if (seen.has(item.id)) continue;
+    seen.add(item.id);
+    result.push(item);
+  }
+  return result;
+};
+
 const renderContext = (
   hot: TranscriptMessage[],
   warm: MemoryItem[],
@@ -139,7 +158,51 @@ export const createSqliteMemoryProvider = (
 ): MemoryProvider => {
   const cfg = normalizeConfig(config);
 
+  const getStats = (input: MemoryStatsInput): MemoryStatsOutput => {
+    const scope = input.scope ?? "session";
+    const memoryItems = scope === "workspace"
+      ? stateStore.getWorkspaceMemoryItems(input.workspaceId)
+      : stateStore.getMemoryItems(input.sessionId);
+    const facts = memoryItems.filter((item) => item.kind === "fact").length;
+    const summaries = memoryItems.filter((item) => item.kind === "summary").length;
+    const memoryTokens = memoryItems.reduce((sum, item) => sum + item.tokenEstimate, 0);
+    const transcriptMessages = scope === "workspace"
+      ? stateStore.countWorkspaceMessages(input.workspaceId)
+      : stateStore.getTranscript(input.sessionId).length;
+    const transcriptTokens = scope === "workspace"
+      ? stateStore.getWorkspaceTokenEstimate(input.workspaceId)
+      : stateStore.getSessionTokenEstimate(input.sessionId);
+    return {
+      facts,
+      summaries,
+      total: memoryItems.length,
+      transcriptMessages,
+      memoryTokens,
+      transcriptTokens,
+    };
+  };
+
+  const getRecent = (input: MemoryRecentInput): MemoryItem[] => {
+    const scope = input.scope ?? "session";
+    const limit = input.limit ?? 10;
+    const kinds = input.kinds;
+    const all = scope === "workspace"
+      ? stateStore.getWorkspaceMemoryItems(input.workspaceId, {
+          newestFirst: true,
+          limit: Math.max(limit * 3, limit),
+        })
+      : stateStore.getMemoryItems(input.sessionId, {
+          newestFirst: true,
+          limit: Math.max(limit * 3, limit),
+        });
+    const filtered = kinds && kinds.length > 0
+      ? all.filter((item) => kinds.includes(item.kind))
+      : all;
+    return filtered.slice(0, limit);
+  };
+
   const search = (input: MemorySearchInput): MemoryItem[] => {
+    const scope = input.scope ?? "session";
     const limit = input.limit ?? cfg.coldFactCount;
     const kinds = input.kinds ?? (["fact", "summary"] satisfies MemoryItemKind[]);
     const queryTokens = new Set(tokenize(input.query));
@@ -148,10 +211,15 @@ export const createSqliteMemoryProvider = (
 
     for (const term of queryTerms) {
       if (!term) continue;
-      const rows = stateStore.searchMemory(input.sessionId, term, {
-        limit: Math.max(limit * 3, limit),
-        kinds,
-      });
+      const rows = scope === "workspace"
+        ? stateStore.searchWorkspaceMemory(input.workspaceId, term, {
+            limit: Math.max(limit * 3, limit),
+            kinds,
+          })
+        : stateStore.searchMemory(input.sessionId, term, {
+            limit: Math.max(limit * 3, limit),
+            kinds,
+          });
       for (const row of rows) {
         candidates.set(row.id, row);
       }
@@ -173,20 +241,48 @@ export const createSqliteMemoryProvider = (
   };
 
   const getContext = (input: MemoryContextInput): MemoryContextOutput => {
+    const scope = input.scope ?? "hybrid";
     const budgetTokens = input.budgetTokens ?? cfg.contextBudgetTokens;
     const transcript = stateStore.getTranscript(input.sessionId);
     const hotPool = transcript.slice(-cfg.hotMessageCount);
-    const warmPool = stateStore.getMemoryItems(input.sessionId, {
+    const sessionWarmPool = stateStore.getMemoryItems(input.sessionId, {
       kind: "summary",
       newestFirst: true,
       limit: cfg.warmSummaryCount,
     });
-    const coldPool = search({
+    const workspaceWarmPool = stateStore.getWorkspaceMemoryItems(input.workspaceId, {
+      kind: "summary",
+      newestFirst: true,
+      excludeSessionId: input.sessionId,
+      limit: cfg.workspaceSummaryCount,
+    });
+    const sessionColdPool = search({
+      workspaceId: input.workspaceId,
       sessionId: input.sessionId,
+      scope: "session",
       query: input.prompt,
       limit: cfg.coldFactCount,
       kinds: ["fact"],
     });
+    const workspaceColdPool = search({
+      workspaceId: input.workspaceId,
+      sessionId: input.sessionId,
+      scope: "workspace",
+      query: input.prompt,
+      limit: Math.max(cfg.workspaceFactCount * 3, cfg.workspaceFactCount),
+      kinds: ["fact"],
+    }).filter((item) => item.sessionId !== input.sessionId).slice(0, cfg.workspaceFactCount);
+
+    const warmPool = scope === "workspace"
+      ? workspaceWarmPool
+      : scope === "session"
+        ? sessionWarmPool
+        : dedupeMemoryItems([...sessionWarmPool, ...workspaceWarmPool]);
+    const coldPool = scope === "workspace"
+      ? workspaceColdPool
+      : scope === "session"
+        ? sessionColdPool
+        : dedupeMemoryItems([...sessionColdPool, ...workspaceColdPool]);
 
     const remaining = { value: budgetTokens };
     const hot = includeByBudget(hotPool, remaining);
@@ -214,6 +310,7 @@ export const createSqliteMemoryProvider = (
 
     for (const fact of userFacts) {
       stateStore.appendMemoryItem({
+        workspaceId: input.workspaceId,
         sessionId: input.sessionId,
         kind: "fact",
         content: fact,
@@ -227,6 +324,7 @@ export const createSqliteMemoryProvider = (
 
     for (const fact of assistantFacts) {
       stateStore.appendMemoryItem({
+        workspaceId: input.workspaceId,
         sessionId: input.sessionId,
         kind: "fact",
         content: fact,
@@ -253,6 +351,7 @@ export const createSqliteMemoryProvider = (
     }
 
     stateStore.appendMemoryItem({
+      workspaceId: input.workspaceId,
       sessionId: input.sessionId,
       kind: "summary",
       content: summary,
@@ -264,11 +363,27 @@ export const createSqliteMemoryProvider = (
     });
   };
 
+  const clear = (input: MemoryClearInput): number => {
+    const scope = input.scope ?? "session";
+    const current = scope === "workspace"
+      ? stateStore.getWorkspaceMemoryItems(input.workspaceId)
+      : stateStore.getMemoryItems(input.sessionId);
+    if (scope === "workspace") {
+      stateStore.deleteWorkspaceMemory(input.workspaceId);
+    } else {
+      stateStore.deleteMemory(input.sessionId);
+    }
+    return current.length;
+  };
+
   return {
     id: "sqlite-memory",
     recordTurn,
+    getStats,
+    getRecent,
     search,
     getContext,
+    clear,
   };
 };
 

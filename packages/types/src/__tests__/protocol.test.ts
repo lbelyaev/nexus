@@ -20,6 +20,7 @@ describe("isClientMessage", () => {
     expect(isClientMessage({ type: "session_new" })).toBe(true);
     expect(isClientMessage({ type: "session_new", runtimeId: "claude-code" })).toBe(true);
     expect(isClientMessage({ type: "session_new", runtimeId: "claude", model: "sonnet" })).toBe(true);
+    expect(isClientMessage({ type: "session_new", runtimeId: "claude", model: "sonnet", workspaceId: "acme" })).toBe(true);
   });
 
   it("validates a session_list message", () => {
@@ -28,6 +29,32 @@ describe("isClientMessage", () => {
 
   it("validates a session_replay message", () => {
     expect(isClientMessage({ type: "session_replay", sessionId: "s1" })).toBe(true);
+  });
+
+  it("validates a memory_query message", () => {
+    expect(isClientMessage({ type: "memory_query", sessionId: "s1", action: "stats" })).toBe(true);
+    expect(isClientMessage({
+      type: "memory_query",
+      sessionId: "s1",
+      action: "search",
+      query: "telegram",
+      limit: 5,
+      scope: "workspace",
+    })).toBe(true);
+    expect(isClientMessage({
+      type: "memory_query",
+      sessionId: "s1",
+      action: "context",
+      prompt: "What do we know?",
+      scope: "hybrid",
+    })).toBe(true);
+  });
+
+  it("rejects invalid memory_query message", () => {
+    expect(isClientMessage({ type: "memory_query", sessionId: "s1" })).toBe(false);
+    expect(isClientMessage({ type: "memory_query", sessionId: "s1", action: "bogus" })).toBe(false);
+    expect(isClientMessage({ type: "memory_query", sessionId: "s1", action: "recent", limit: 0 })).toBe(false);
+    expect(isClientMessage({ type: "memory_query", sessionId: "s1", action: "recent", scope: "global" })).toBe(false);
   });
 
   it("rejects session_replay with missing sessionId", () => {
@@ -106,6 +133,7 @@ describe("isGatewayEvent", () => {
   it("validates session_created", () => {
     expect(isGatewayEvent({ type: "session_created", sessionId: "s1", model: "claude-4" })).toBe(true);
     expect(isGatewayEvent({ type: "session_created", sessionId: "s1", model: "sonnet", runtimeId: "claude" })).toBe(true);
+    expect(isGatewayEvent({ type: "session_created", sessionId: "s1", model: "sonnet", runtimeId: "claude", workspaceId: "acme" })).toBe(true);
     expect(isGatewayEvent({
       type: "session_created",
       sessionId: "s1",
@@ -128,6 +156,52 @@ describe("isGatewayEvent", () => {
       type: "transcript",
       sessionId: "s1",
       messages: [{ id: 1, sessionId: "s1", role: "user", content: "hi", timestamp: "2026-01-01T00:00:00Z", tokenEstimate: 1 }],
+    })).toBe(true);
+  });
+
+  it("validates memory_result stats", () => {
+    expect(isGatewayEvent({
+      type: "memory_result",
+      sessionId: "s1",
+      action: "stats",
+      scope: "workspace",
+      stats: {
+        facts: 3,
+        summaries: 1,
+        total: 4,
+        transcriptMessages: 6,
+        memoryTokens: 48,
+        transcriptTokens: 120,
+      },
+    })).toBe(true);
+  });
+
+  it("validates memory_result context", () => {
+    expect(isGatewayEvent({
+      type: "memory_result",
+      sessionId: "s1",
+      action: "context",
+      scope: "hybrid",
+      prompt: "deploy day",
+      context: {
+        budgetTokens: 500,
+        totalTokens: 120,
+        hot: [{ id: 1, sessionId: "s1", role: "user", content: "When do we deploy?", timestamp: "2026-01-01T00:00:00Z", tokenEstimate: 6 }],
+        warm: [{
+          id: 1,
+          sessionId: "s1",
+          kind: "summary",
+          content: "deploy day is friday",
+          source: "turn_summary",
+          confidence: 0.9,
+          keywords: ["deploy", "friday"],
+          createdAt: "2026-01-01T00:00:00Z",
+          lastAccessedAt: "2026-01-01T00:00:00Z",
+          tokenEstimate: 8,
+        }],
+        cold: [],
+        rendered: "# Memory Context",
+      },
     })).toBe(true);
   });
 

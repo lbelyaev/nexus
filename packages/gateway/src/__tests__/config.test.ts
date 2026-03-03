@@ -224,6 +224,8 @@ describe("loadConfig", () => {
           provider: "sqlite",
           contextBudgetTokens: 900,
           hotMessageCount: 6,
+          workspaceSummaryCount: 3,
+          workspaceFactCount: 10,
         },
       }),
     );
@@ -233,6 +235,8 @@ describe("loadConfig", () => {
     expect(config.memory?.provider).toBe("sqlite");
     expect(config.memory?.contextBudgetTokens).toBe(900);
     expect(config.memory?.hotMessageCount).toBe(6);
+    expect(config.memory?.workspaceSummaryCount).toBe(3);
+    expect(config.memory?.workspaceFactCount).toBe(10);
   });
 
   it("rejects invalid memory numeric settings", () => {
@@ -249,5 +253,34 @@ describe("loadConfig", () => {
     );
 
     expect(() => loadConfig(configPath)).toThrow(/memory.contextBudgetTokens/);
+  });
+
+  it("supports workspaceDefaultId", () => {
+    const configPath = join(tmpDir, "nexus.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        auth: { token: "mytoken" },
+        runtime: { command: ["npx", "@zed-industries/claude-agent-acp"] },
+        workspaceDefaultId: "acme-core",
+      }),
+    );
+
+    const config = loadConfig(configPath);
+    expect(config.workspaceDefaultId).toBe("acme-core");
+  });
+
+  it("rejects empty workspaceDefaultId", () => {
+    const configPath = join(tmpDir, "nexus.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        auth: { token: "mytoken" },
+        runtime: { command: ["npx", "@zed-industries/claude-agent-acp"] },
+        workspaceDefaultId: " ",
+      }),
+    );
+
+    expect(() => loadConfig(configPath)).toThrow(/workspaceDefaultId/);
   });
 });
