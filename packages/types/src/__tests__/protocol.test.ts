@@ -5,6 +5,12 @@ describe("isClientMessage", () => {
   it("validates a prompt message", () => {
     expect(isClientMessage({ type: "prompt", sessionId: "s1", text: "hello" })).toBe(true);
     expect(isClientMessage({ type: "prompt", sessionId: "s1", text: "hello", idempotencyKey: "req-123" })).toBe(true);
+    expect(isClientMessage({
+      type: "prompt",
+      sessionId: "s1",
+      text: "describe this",
+      images: [{ url: "https://example.com/img.png", mediaType: "image/png" }],
+    })).toBe(true);
   });
 
   it("validates an approval_response message", () => {
@@ -117,6 +123,8 @@ describe("isClientMessage", () => {
     expect(isClientMessage({ type: "prompt", sessionId: "s1" })).toBe(false);
     expect(isClientMessage({ type: "prompt", text: "hello" })).toBe(false);
     expect(isClientMessage({ type: "prompt", sessionId: "s1", text: "hello", idempotencyKey: 123 })).toBe(false);
+    expect(isClientMessage({ type: "prompt", sessionId: "s1", text: "hello", images: [{ url: "" }] })).toBe(false);
+    expect(isClientMessage({ type: "prompt", sessionId: "s1", text: "hello", images: [{ url: "https://x", mediaType: 123 }] })).toBe(false);
   });
 
   it("rejects approval_response with wrong allow type", () => {

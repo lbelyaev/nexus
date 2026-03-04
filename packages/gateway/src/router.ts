@@ -924,6 +924,10 @@ export const createRouter = (deps: RouterDeps): Router => {
     const connectionId = context?.connectionId ?? emitterConnectionIds.get(emit) ?? null;
     const executionId = `exec-${msg.sessionId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const turnId = `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const imageInputs = msg.images ?? [];
+    const promptBody = msg.text.trim().length > 0
+      ? msg.text
+      : (imageInputs.length > 0 ? "(image input)" : "");
     const correlation: EventCorrelation = {
       executionId,
       turnId,
@@ -977,6 +981,7 @@ export const createRouter = (deps: RouterDeps): Router => {
       source: principal.source,
       idempotencyKey: idempotencyKey ?? null,
       textPreview: msg.text.slice(0, 50),
+      imageCount: imageInputs.length,
     });
     touchSession(msg.sessionId);
     const emitWithCorrelation: EventEmitter = (event) => {
@@ -985,13 +990,16 @@ export const createRouter = (deps: RouterDeps): Router => {
 
     // Record user prompt to transcript
     const workspaceId = sessionWorkspaces.get(msg.sessionId) ?? defaultWorkspaceId;
+    const promptRecordContent = imageInputs.length > 0
+      ? `${msg.text}${msg.text ? "\n\n" : ""}${imageInputs.map((image) => `[image] ${image.url}`).join("\n")}`
+      : msg.text;
     stateStore.appendMessage({
       workspaceId,
       sessionId: msg.sessionId,
       role: "user",
-      content: msg.text,
+      content: promptRecordContent,
       timestamp: new Date().toISOString(),
-      tokenEstimate: estimateTokens(msg.text),
+      tokenEstimate: estimateTokens(promptRecordContent),
     });
 
     // Wrap emit with recording layer to capture streaming events
@@ -1041,11 +1049,11 @@ export const createRouter = (deps: RouterDeps): Router => {
         const context = memoryProvider.getContext({
           workspaceId,
           sessionId: msg.sessionId,
-          prompt: msg.text,
+          prompt: promptBody,
           scope: "hybrid",
         });
         if (context.rendered) {
-          promptText = `${context.rendered}\n\n# User Prompt\n${msg.text}`;
+          promptText = `${context.rendered}\n\n# User Prompt\n${promptBody}`;
         }
         log.debug("memory_context_applied", {
           connectionId,
@@ -1080,7 +1088,7 @@ export const createRouter = (deps: RouterDeps): Router => {
 
     // ACP streaming events flow via session.onEvent → emit
     // prompt() resolves when the turn ends (PromptResponse with stopReason)
-    session.prompt(promptText).then(
+    session.prompt(promptText, imageInputs).then(
       (result) => {
         log.info("prompt_response", {
           connectionId,

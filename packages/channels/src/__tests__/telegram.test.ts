@@ -166,6 +166,70 @@ describe("createTelegramAdapter", () => {
     await adapter.stop();
   });
 
+  it("forwards photo messages as image inputs", async () => {
+    const onMessage = vi.fn().mockResolvedValue(undefined);
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const method = String(url).split("/").at(-1);
+      const requestBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+      const payloadOffset = requestBody.offset as number | undefined;
+
+      if (method === "getUpdates") {
+        if ((payloadOffset ?? 0) >= 2) return jsonResponse([]);
+        return jsonResponse([
+          {
+            update_id: 1,
+            message: {
+              message_id: 3,
+              from: { id: 11, is_bot: false, first_name: "Leo" },
+              chat: { id: 456, type: "private" },
+              caption: "what is shown here?",
+              photo: [
+                { file_id: "small", file_unique_id: "s1", width: 320, height: 240, file_size: 1000 },
+                { file_id: "big", file_unique_id: "s2", width: 1280, height: 960, file_size: 9999 },
+              ],
+            },
+          },
+        ]);
+      }
+      if (method === "getFile") {
+        const fileId = String(requestBody.file_id ?? "");
+        if (fileId === "big") return jsonResponse({ file_path: "photos/big.jpg" });
+        return jsonResponse({});
+      }
+      return jsonResponse(true);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const adapter = createTelegramAdapter({
+      botToken: "token",
+      pollTimeoutSeconds: 1,
+      pollIntervalMs: 10,
+    });
+
+    await adapter.start({
+      onMessage,
+      log: {
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+      },
+    });
+
+    await vi.waitFor(() => {
+      expect(onMessage).toHaveBeenCalledWith({
+        adapterId: "telegram",
+        conversationId: "456",
+        senderId: "11",
+        senderDisplayName: "Leo",
+        text: "what is shown here?",
+        images: [{ url: "https://api.telegram.org/file/bottoken/photos/big.jpg" }],
+      });
+    });
+
+    await adapter.stop();
+  });
+
   it("serializes concurrent stream updates to avoid duplicate sendMessage calls", async () => {
     let firstSendResolved = false;
     let releaseFirstSend: () => void = () => undefined;

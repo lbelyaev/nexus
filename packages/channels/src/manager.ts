@@ -414,6 +414,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         type: "prompt",
         sessionId,
         text: message.text,
+        images: message.images,
       });
       runningTurns.add(sessionId);
       cancelRequested.delete(sessionId);

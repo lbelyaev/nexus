@@ -282,7 +282,7 @@ describe("createRouter", () => {
       emit,
     );
 
-    expect(acpSession.prompt).toHaveBeenCalledWith("hello");
+    expect(acpSession.prompt).toHaveBeenCalledWith("hello", []);
 
     // Wait for the promise to resolve and turn_end to be emitted
     await vi.waitFor(() => {
@@ -294,6 +294,30 @@ describe("createRouter", () => {
     expect(turnEnd.executionId).toBeDefined();
     expect(turnEnd.turnId).toBeDefined();
     expect(turnEnd.policySnapshotId).toBeDefined();
+  });
+
+  it("prompt forwards image inputs to session.prompt", async () => {
+    const { emit, events } = collectEvents();
+    router.handleMessage({ type: "session_new" }, emit);
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === "session_created")).toBe(true);
+    });
+    const created = events.find((e) => e.type === "session_created");
+    if (!created || created.type !== "session_created") throw new Error("session_created missing");
+
+    events.length = 0;
+    router.handleMessage({
+      type: "prompt",
+      sessionId: created.sessionId,
+      text: "what is in this image?",
+      images: [{ url: "https://example.com/sample.png", mediaType: "image/png" }],
+    }, emit);
+
+    expect(acpSession.prompt).toHaveBeenCalledWith(
+      "what is in this image?",
+      [{ url: "https://example.com/sample.png", mediaType: "image/png" }],
+    );
   });
 
   it("prompt deduplicates by idempotencyKey", async () => {

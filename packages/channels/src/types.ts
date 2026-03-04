@@ -1,4 +1,4 @@
-import type { PrincipalType, PromptSource } from "@nexus/types";
+import type { PrincipalType, PromptImageInput, PromptSource } from "@nexus/types";
 
 export interface LoggerLike {
   debug: (message: string, fields?: Record<string, unknown>) => void;
@@ -13,6 +13,7 @@ export interface ChannelInboundMessage {
   senderId: string;
   senderDisplayName?: string;
   text: string;
+  images?: PromptImageInput[];
 }
 
 export interface ChannelOutboundMessage {

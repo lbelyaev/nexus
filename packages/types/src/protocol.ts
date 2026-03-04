@@ -41,8 +41,19 @@ export interface EventCorrelation {
   policySnapshotId?: string;
 }
 
+export interface PromptImageInput {
+  url: string;
+  mediaType?: string;
+}
+
 export type ClientMessage =
-  | { type: "prompt"; sessionId: string; text: string; idempotencyKey?: string }
+  | {
+      type: "prompt";
+      sessionId: string;
+      text: string;
+      images?: PromptImageInput[];
+      idempotencyKey?: string;
+    }
   | { type: "approval_response"; requestId: string; allow?: boolean; optionId?: string }
   | { type: "cancel"; sessionId: string }
   | { type: "session_close"; sessionId: string }
@@ -304,6 +315,16 @@ const hasValidCorrelation = (obj: Record<string, unknown>): boolean => (
   && (obj.policySnapshotId === undefined || typeof obj.policySnapshotId === "string")
 );
 
+const isPromptImageInput = (value: unknown): value is PromptImageInput => {
+  if (typeof value !== "object" || value === null) return false;
+  const obj = value as Record<string, unknown>;
+  return (
+    typeof obj.url === "string"
+    && obj.url.trim().length > 0
+    && (obj.mediaType === undefined || typeof obj.mediaType === "string")
+  );
+};
+
 export const isClientMessage = (value: unknown): value is ClientMessage => {
   if (typeof value !== "object" || value === null) return false;
   const obj = value as Record<string, unknown>;
@@ -314,6 +335,7 @@ export const isClientMessage = (value: unknown): value is ClientMessage => {
       return (
         typeof obj.sessionId === "string"
         && typeof obj.text === "string"
+        && (obj.images === undefined || (Array.isArray(obj.images) && obj.images.every((entry) => isPromptImageInput(entry))))
         && (obj.idempotencyKey === undefined || typeof obj.idempotencyKey === "string")
       );
     case "approval_response":

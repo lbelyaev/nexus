@@ -220,15 +220,27 @@ const toActionRows = (quickActions: ChannelQuickAction[] | undefined): Array<Act
   return [new ActionRowBuilder<ButtonBuilder>().addComponents(buttons)];
 };
 
-const normalizeInboundText = (message: Message, botUserId: string): string | null => {
+const isImageAttachment = (attachment: {
+  contentType: string | null;
+  name: string | null;
+}): boolean => {
+  if (attachment.contentType?.startsWith("image/")) return true;
+  if (!attachment.name) return false;
+  return /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(attachment.name);
+};
+
+const normalizeInboundText = (message: Message, botUserId: string, hasImages: boolean): string | null => {
   const trimmed = message.content.trim();
-  if (!trimmed) return null;
-  if (!message.guildId) return trimmed; // DMs: accept plain text.
+  if (!message.guildId) {
+    if (!trimmed && !hasImages) return null;
+    return trimmed;
+  }
 
   const mentionPrefix = new RegExp(`^<@!?${botUserId}>\\s*`);
   if (mentionPrefix.test(trimmed)) {
     const stripped = trimmed.replace(mentionPrefix, "").trim();
-    return stripped || null;
+    if (!stripped && !hasImages) return null;
+    return stripped;
   }
 
   // In guild text channels, require explicit slash-like command if not mentioned.
@@ -283,9 +295,18 @@ export const createDiscordAdapter = (options: DiscordAdapterOptions): ChannelAda
         }
         const botUserId = discordClient.user?.id;
         if (!botUserId) return;
+        const images = Array.from(message.attachments.values())
+          .filter((attachment) => isImageAttachment({
+            contentType: attachment.contentType,
+            name: attachment.name,
+          }))
+          .map((attachment) => ({
+            url: attachment.url,
+            ...(attachment.contentType ? { mediaType: attachment.contentType } : {}),
+          }));
 
-        const text = normalizeInboundText(message, botUserId);
-        if (!text) return;
+        const text = normalizeInboundText(message, botUserId, images.length > 0);
+        if (text === null) return;
 
         const conversationId = message.guildId
           ? `${message.channelId}:${message.author.id}`
@@ -297,6 +318,7 @@ export const createDiscordAdapter = (options: DiscordAdapterOptions): ChannelAda
           senderId: message.author.id,
           senderDisplayName: renderSenderDisplay(message),
           text,
+          images,
         }).catch((error) => {
           ctx?.log.warn("discord_inbound_message_failed", {
             adapterId: id,

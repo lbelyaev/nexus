@@ -1,5 +1,5 @@
 import { useState, useCallback, useRef, useEffect } from "react";
-import type { ClientMessage, GatewayEvent, TranscriptMessage } from "@nexus/types";
+import type { ClientMessage, GatewayEvent, PromptImageInput, TranscriptMessage } from "@nexus/types";
 
 export interface ActiveTool {
   tool: string;
@@ -74,7 +74,7 @@ export interface UseSessionResult {
   transcript: TranscriptMessage[];
   memoryResults: MemoryResultEvent[];
   error: string | null;
-  sendPrompt: (text: string) => void;
+  sendPrompt: (text: string, images?: PromptImageInput[]) => void;
   steer: (text: string) => void;
   cancel: () => void;
   closeSession: () => void;
@@ -154,7 +154,7 @@ export const useSession = (
   }, []);
 
   const sendPromptInternal = useCallback(
-    (text: string) => {
+    (text: string, images?: PromptImageInput[]) => {
       if (!sessionId) return;
       // Clear buffers and state
       textBufferRef.current = "";
@@ -169,7 +169,12 @@ export const useSession = (
       setToolCalls([]);
       setError(null);
       setIsStreaming(true);
-      sendMessage({ type: "prompt", sessionId, text });
+      sendMessage({
+        type: "prompt",
+        sessionId,
+        text,
+        ...(images && images.length > 0 ? { images } : {}),
+      });
     },
     [sessionId, sendMessage],
   );

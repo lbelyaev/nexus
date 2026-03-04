@@ -167,20 +167,20 @@ Multi-runtime profile (`config/nexus.multi.json`):
 {
   "defaultRuntimeId": "claude",
   "runtimes": {
-    "claude": { "command": ["npx", "@zed-industries/claude-agent-acp"], "defaultModel": "claude-sonnet-4-5-20250929" },
-    "codex": { "command": ["npx", "@zed-industries/codex-acp"], "defaultModel": "gpt-5.2-codex" }
+    "claude": { "command": ["npx", "@zed-industries/claude-agent-acp"], "defaultModel": "claude-sonnet-4-6" },
+    "codex": { "command": ["npx", "@zed-industries/codex-acp"], "defaultModel": "gpt-5.3-codex" }
   },
   "modelRouting": {
     "sonnet": "claude",
     "gpt-5": "codex"
   },
   "modelAliases": {
-    "codex-fast": "gpt-5.2-codex-mini",
-    "claude-latest": "claude-sonnet-4-5-20250929"
+    "codex-fast": "gpt-5.3-codex-mini",
+    "claude-latest": "claude-sonnet-4-6"
   },
   "modelCatalog": {
-    "codex": ["gpt-5.2-codex", "gpt-5.3-codex"],
-    "claude": ["claude-opus-4-1-20250805", "claude-sonnet-4-5-20250929"]
+    "codex": ["gpt-5.3-codex", "gpt-5.3-codex-mini"],
+    "claude": ["claude-opus-4-6", "claude-sonnet-4-6"]
   },
   "memory": {
     "enabled": true,
@@ -197,7 +197,7 @@ Codex-only profile (`config/nexus.codex.json`):
 
 ```json
 {
-  "runtime": { "command": ["npx", "@zed-industries/codex-acp"], "defaultModel": "gpt-5.2-codex" }
+  "runtime": { "command": ["npx", "@zed-industries/codex-acp"], "defaultModel": "gpt-5.3-codex" }
 }
 ```
 

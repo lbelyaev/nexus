@@ -1,4 +1,4 @@
-import type { GatewayEvent, JsonRpcNotification } from "@nexus/types";
+import type { GatewayEvent, JsonRpcNotification, PromptImageInput } from "@nexus/types";
 import type { RpcClient } from "./rpc.js";
 
 export type AcpEventHandler = (event: GatewayEvent) => void;
@@ -6,7 +6,7 @@ export type AcpEventHandler = (event: GatewayEvent) => void;
 export interface AcpSession {
   id: string;
   acpSessionId: string;
-  prompt: (text: string) => Promise<unknown>;
+  prompt: (text: string, images?: PromptImageInput[]) => Promise<unknown>;
   respondToPermission: (requestId: string, optionId: string) => boolean;
   cancel: () => void;
   onEvent: (handler: AcpEventHandler) => void;
@@ -29,6 +29,11 @@ export interface AcpSessionUpdate {
 export interface AcpContentBlock {
   type: string;
   text?: string;
+  source?: {
+    type: "url";
+    url: string;
+    mediaType?: string;
+  };
 }
 
 export interface AcpSessionNotificationParams {
@@ -228,11 +233,47 @@ export const createAcpSession = (
     throw new Error(`Unhandled method: ${method}`);
   });
 
-  const prompt = (text: string): Promise<unknown> =>
-    rpc.sendRequest("session/prompt", {
-      sessionId: acpSessionId,
-      prompt: [{ type: "text", text }],
-    });
+  const buildPromptBlocks = (text: string, images?: PromptImageInput[]): AcpContentBlock[] => {
+    const imageBlocks: AcpContentBlock[] = (images ?? [])
+      .filter((image) => typeof image.url === "string" && image.url.trim().length > 0)
+      .map((image) => ({
+        type: "image",
+        source: {
+          type: "url",
+          url: image.url,
+          ...(image.mediaType ? { mediaType: image.mediaType } : {}),
+        },
+      }));
+    const needsDefaultText = text.trim().length === 0 && imageBlocks.length > 0;
+    const textBlock: AcpContentBlock = {
+      type: "text",
+      text: needsDefaultText ? "Please analyze the provided image(s)." : text,
+    };
+    return [textBlock, ...imageBlocks];
+  };
+
+  const prompt = async (text: string, images?: PromptImageInput[]): Promise<unknown> => {
+    const hasImages = Array.isArray(images) && images.length > 0;
+    try {
+      return await rpc.sendRequest("session/prompt", {
+        sessionId: acpSessionId,
+        prompt: buildPromptBlocks(text, images),
+      });
+    } catch (error) {
+      if (!hasImages) throw error;
+      // Compatibility fallback for runtimes that reject image content blocks.
+      const fallbackText = [
+        text.trim(),
+        "",
+        "Attached image URLs:",
+        ...(images ?? []).map((image, index) => `${index + 1}. ${image.url}`),
+      ].join("\n").trim();
+      return rpc.sendRequest("session/prompt", {
+        sessionId: acpSessionId,
+        prompt: [{ type: "text", text: fallbackText }],
+      });
+    }
+  };
 
   const respondToPermission = (requestId: string, optionId: string): boolean => {
     const pending = pendingPermissions.get(requestId);

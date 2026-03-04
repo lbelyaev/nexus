@@ -36,6 +36,21 @@ interface TelegramUpdate {
       last_name?: string;
     };
     text?: string;
+    caption?: string;
+    photo?: Array<{
+      file_id: string;
+      file_unique_id: string;
+      width: number;
+      height: number;
+      file_size?: number;
+    }>;
+    document?: {
+      file_id: string;
+      file_unique_id: string;
+      mime_type?: string;
+      file_name?: string;
+      file_size?: number;
+    };
   };
   callback_query?: {
     id: string;
@@ -68,6 +83,10 @@ interface TelegramResponse<T> {
 
 interface TelegramMessageResponse {
   message_id: number;
+}
+
+interface TelegramFileResponse {
+  file_path?: string;
 }
 
 const TELEGRAM_CALLBACK_PREFIX = "nx:";
@@ -197,6 +216,7 @@ export const createTelegramAdapter = (options: TelegramAdapterOptions): ChannelA
   let pollAbort: AbortController | null = null;
   const streamingMessageIds = new Map<string, number>();
   const streamWritesInFlight = new Map<string, Promise<void>>();
+  const fileUrlCache = new Map<string, string>();
 
   const allowed = allowedChatIds && allowedChatIds.length > 0
     ? new Set(allowedChatIds.map((v) => v.trim()).filter(Boolean))
@@ -269,7 +289,7 @@ export const createTelegramAdapter = (options: TelegramAdapterOptions): ChannelA
       }
 
       const message = update.message;
-      if (!message?.text) continue;
+      if (!message) continue;
 
       const chatId = String(message.chat.id);
       if (allowed && !allowed.has(chatId)) {
@@ -280,13 +300,50 @@ export const createTelegramAdapter = (options: TelegramAdapterOptions): ChannelA
         continue;
       }
 
+      const imageUrls: Array<{ url: string; mediaType?: string }> = [];
+      const imageFileIds: string[] = [];
+      const largestPhoto = message.photo && message.photo.length > 0
+        ? [...message.photo].sort((a, b) => (b.file_size ?? 0) - (a.file_size ?? 0))[0]
+        : undefined;
+      if (largestPhoto?.file_id) {
+        imageFileIds.push(largestPhoto.file_id);
+      } else if (message.document?.mime_type?.startsWith("image/") && message.document.file_id) {
+        imageFileIds.push(message.document.file_id);
+      }
+
+      for (const fileId of imageFileIds) {
+        try {
+          const cachedUrl = fileUrlCache.get(fileId);
+          if (cachedUrl) {
+            imageUrls.push({ url: cachedUrl });
+            continue;
+          }
+          const file = await apiCall<TelegramFileResponse>("getFile", { file_id: fileId });
+          if (!file.file_path) continue;
+          const fileUrl = `${apiBaseUrl}/file/bot${botToken}/${file.file_path}`;
+          fileUrlCache.set(fileId, fileUrl);
+          imageUrls.push({ url: fileUrl });
+        } catch (error) {
+          ctx.log.warn("telegram_image_resolve_failed", {
+            adapterId: id,
+            chatId,
+            fileId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+
+      const inboundText = message.text ?? message.caption ?? "";
+      if (!inboundText.trim() && imageUrls.length === 0) continue;
+
       const senderId = String(message.from?.id ?? message.chat.id);
       await ctx.onMessage({
         adapterId: id,
         conversationId: chatId,
         senderId,
         senderDisplayName: renderSender(update),
-        text: message.text,
+        text: inboundText,
+        images: imageUrls,
       });
     }
   };

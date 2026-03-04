@@ -4,8 +4,8 @@ This milestone adds a pluggable channels layer in `@nexus/channels` and startup 
 
 ## Current status
 
-- Telegram: implemented (Bot API long-poll + send messages).
-- Discord: implemented via `discord.js` (message intake, send, typing indicator, streaming-edit mode).
+- Telegram: implemented (Bot API long-poll + send messages, including photo inputs).
+- Discord: implemented via `discord.js` (message intake, send, typing indicator, streaming-edit mode, image attachments).
 
 ## Config shape
 
@@ -20,7 +20,7 @@ Add a `channels` object to your gateway config (`NEXUS_CONFIG` file):
       "botToken": "<telegram-bot-token>",
       "allowedChatIds": ["123456789"],
       "runtimeId": "claude",
-      "model": "claude-sonnet-4-5-20250929",
+      "model": "claude-sonnet-4-6",
       "workspaceId": "default",
       "typingIndicator": true,
       "streamingMode": "off",
@@ -93,6 +93,9 @@ Inside Telegram chats connected to the bot:
 - Guild channels:
   - mention the bot (`@TeleNexus ...`) for plain prompts, or
   - use slash-like text commands (`/status`, `/help`, etc.).
+- Images:
+  - Telegram photo/document(image/*) inputs are forwarded as image prompts.
+  - Discord image attachments are forwarded as image prompts.
 - In guild channels, sessions are isolated per `(channel, user)` pair.
 
 ## Session mapping model
@@ -101,5 +104,7 @@ Inside Telegram chats connected to the bot:
 - Principal is mapped as `user:<adapterId>:<senderId>`.
 - Text deltas are buffered and sent as one message on `turn_end`.
 - Tool approvals are surfaced into chat as commands.
+- Incoming image inputs are forwarded to ACP as image content blocks when supported by runtime.
+- If a runtime rejects image blocks, Nexus falls back to a text prompt with image URLs.
 
 This principal format is now usable in policy rules via `principalIdPattern`, which lets you scope allow/deny behavior to a channel or user without changing global policy for everyone.

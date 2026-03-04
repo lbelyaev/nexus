@@ -34,6 +34,57 @@ describe("createAcpSession", () => {
     });
   });
 
+  it("prompt forwards image blocks when provided", async () => {
+    const rpc = makeMockRpc();
+    const session = createAcpSession(rpc, "acp-123", "gw-456");
+
+    await session.prompt("Describe this", [{ url: "https://example.com/cat.png", mediaType: "image/png" }]);
+
+    expect(rpc.sendRequest).toHaveBeenCalledWith("session/prompt", {
+      sessionId: "acp-123",
+      prompt: [
+        { type: "text", text: "Describe this" },
+        {
+          type: "image",
+          source: {
+            type: "url",
+            url: "https://example.com/cat.png",
+            mediaType: "image/png",
+          },
+        },
+      ],
+    });
+  });
+
+  it("falls back to text-only prompt when runtime rejects image blocks", async () => {
+    const rpc = makeMockRpc();
+    rpc.sendRequest = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("unsupported image block"))
+      .mockResolvedValueOnce({ ok: true });
+    const session = createAcpSession(rpc, "acp-123", "gw-456");
+
+    await session.prompt("", [{ url: "https://example.com/cat.png" }]);
+
+    expect(rpc.sendRequest).toHaveBeenNthCalledWith(1, "session/prompt", {
+      sessionId: "acp-123",
+      prompt: [
+        { type: "text", text: "Please analyze the provided image(s)." },
+        {
+          type: "image",
+          source: {
+            type: "url",
+            url: "https://example.com/cat.png",
+          },
+        },
+      ],
+    });
+    expect(rpc.sendRequest).toHaveBeenNthCalledWith(2, "session/prompt", {
+      sessionId: "acp-123",
+      prompt: [{ type: "text", text: "Attached image URLs:\n1. https://example.com/cat.png" }],
+    });
+  });
+
   it("cancel sends session/cancel notification", () => {
     const rpc = makeMockRpc();
     const session = createAcpSession(rpc, "acp-123", "gw-456");
