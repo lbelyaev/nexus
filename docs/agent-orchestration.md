@@ -45,6 +45,8 @@ echo '{"type":"prompt","text":"hello"}' | bun run cli:dev -- --token $TOKEN
 tail -f /tmp/gateway.log
 ```
 
+Note: this token-extraction flow is for local/dev only. Production should use authenticated identity + short-lived WS tickets, not static tokens scraped from startup logs.
+
 ### Pros
 - Zero protocol changes, zero gateway changes
 - Works immediately once the CLI exists
@@ -277,3 +279,5 @@ grep -i error /tmp/gw.log
 # 6. Clean up
 kill $GW_PID
 ```
+
+Dev-only note: steps 2-3 use a static startup token for convenience. Production bootstrap/auth should issue scoped, expiring connection credentials.

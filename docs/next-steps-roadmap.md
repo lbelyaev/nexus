@@ -253,13 +253,20 @@ Bridge interactive sessions to future scheduler/hooks/orchestration without rede
 2. Auth evolution:
    - scoped credentials (user/session/runtime)
    - expiration/renewal
-3. Policy engine evolution:
+   - short-lived WS connection tickets (issued from authenticated identity)
+   - explicit token classes (bootstrap/admin/user/session/service)
+3. Bootstrap + install hardening:
+   - first-run bootstrap mode with one-time setup secret
+   - server signing key generation and secret-manager persistence
+   - disable bootstrap mode after first admin is provisioned
+   - no committed real secrets/tokens in tracked config
+4. Policy engine evolution:
    - regex/structured conditions
    - per-user/per-channel policy overlays
-4. Runtime sandbox posture:
+5. Runtime sandbox posture:
    - runtime profile restrictions (FS/network/tool categories)
    - hardened defaults for untrusted channels
-5. Security audit trail completeness:
+6. Security audit trail completeness:
    - all approval decisions
    - policy match reason
    - runtime tool execution metadata
@@ -276,6 +283,9 @@ Bridge interactive sessions to future scheduler/hooks/orchestration without rede
 3. Every tool action has attributable policy decision records.
 4. Security profiles can be applied per runtime/channel combination.
 5. Threat-model walkthrough is documented and test-backed for top abuse paths.
+6. Bootstrap setup secret is one-time use and rejected after initial admin provisioning.
+7. WS connection tickets are short-lived, auditable, and bound to authenticated principal identity.
+8. Checked-in config files contain no live credentials; local overrides are gitignored.
 
 ### Non-goals
 
@@ -358,7 +368,10 @@ Parallel during entire window:
 3. Auth model target:
    - single-tenant hardened
    - multi-user first-class
-4. Scheduler execution model:
+4. Bootstrap secret and identity provider posture:
+   - local bootstrap + built-in auth first
+   - external IdP (OIDC/SAML) first
+5. Scheduler execution model:
    - embedded worker
    - external worker process pool
 

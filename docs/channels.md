@@ -38,6 +38,8 @@ Add a `channels` object to your gateway config (`NEXUS_CONFIG` file):
 }
 ```
 
+Security note: keep real channel tokens in env or gitignored local config files (for example `config/*.local.json`). Do not commit live bot tokens.
+
 Field notes:
 
 - `runtimeId`, `model`, and `workspaceId` are optional; defaults come from normal session routing.

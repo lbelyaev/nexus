@@ -112,6 +112,23 @@ Key remaining substrate gap:
 - **JWT tokens**: Replace simple hex tokens with JWTs that carry claims (user, session scope, expiry).
 - **Token rotation**: Support token refresh without reconnecting.
 - **Per-user auth**: Multiple users with different permissions, not just a single shared token.
+- **Token classes + TTL policy**:
+  - bootstrap setup token (single-use, short TTL)
+  - admin token (elevated scope, separate from chat scope)
+  - user access token + refresh token
+  - short-lived WS connection ticket minted from user identity
+  - optional session capability token for scoped actions
+- **Bootstrap ceremony**:
+  - first-run bootstrap mode creates server signing key + setup secret
+  - setup secret provisions first admin and is then permanently disabled
+  - bootstrap events are written to audit trail
+- **Secret source policy**:
+  - tracked config files must not contain live tokens
+  - use env/secret manager/local gitignored config for real credentials
+  - rotate bot/runtime/service secrets without code changes
+- **Client token storage policy**:
+  - web: access token in memory, refresh token in secure HttpOnly cookie, device keypair in WebCrypto/IndexedDB
+  - TUI/desktop: OS keychain-backed credential storage (fallback: restricted local file perms)
 
 ### 6.2 Sandbox
 - **Agent sandboxing**: Run the ACP agent in a sandboxed environment (container, nsjail, etc.).
