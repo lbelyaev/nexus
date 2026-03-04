@@ -5,6 +5,15 @@ export default defineConfig({
   test: {
     root: path.dirname(new URL(import.meta.url).pathname),
     include: ["src/**/*.test.ts", "src/**/*.test.tsx"],
-    passWithNoTests: true,
+    coverage: {
+      provider: "v8",
+      reporter: ["text", "json-summary"],
+      thresholds: {
+        lines: 64,
+        statements: 64,
+        branches: 72,
+        functions: 60,
+      },
+    },
   },
 });

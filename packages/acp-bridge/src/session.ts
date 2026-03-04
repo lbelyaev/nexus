@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import type { GatewayEvent, JsonRpcNotification, PromptImageInput } from "@nexus/types";
 import type { RpcClient } from "./rpc.js";
 
@@ -26,15 +27,21 @@ export interface AcpSessionUpdate {
   _meta?: { claudeCode?: { toolName?: string } };
 }
 
-export interface AcpContentBlock {
-  type: string;
-  text?: string;
-  source?: {
-    type: "url";
-    url: string;
-    mediaType?: string;
-  };
-}
+export type AcpContentBlock =
+  | {
+      type: "text";
+      text: string;
+    }
+  | {
+      type: "image";
+      data: string;
+      mimeType: string;
+      uri?: string;
+    }
+  | {
+      type: string;
+      [key: string]: unknown;
+    };
 
 export interface AcpSessionNotificationParams {
   sessionId: string;
@@ -58,11 +65,11 @@ const extractText = (content?: AcpContentBlock | AcpContentBlock[]): string => {
   if (!content) return "";
   if (Array.isArray(content)) {
     return content
-      .filter((b) => b.type === "text" && b.text)
-      .map((b) => b.text!)
+      .filter((b): b is Extract<AcpContentBlock, { type: "text" }> => b.type === "text" && typeof (b as { text?: unknown }).text === "string")
+      .map((b) => b.text)
       .join("");
   }
-  return content.type === "text" && content.text ? content.text : "";
+  return content.type === "text" && typeof content.text === "string" ? content.text : "";
 };
 
 const extractToolName = (update: AcpSessionUpdate): string => {
@@ -138,8 +145,10 @@ export type PolicyEvaluator = (tool: string, params?: string) => "allow" | "deny
  *  rather than the actual tool name. We use `kind` and `rawInput` structure to detect. */
 const inferToolName = (toolCall: AcpRequestPermissionParams["toolCall"]): string | undefined => {
   // Use the `kind` field if it maps to a known tool type
-  if (toolCall.kind === "fetch") return "WebSearch";
-  if (toolCall.kind === "bash") return "Bash";
+  const kind = typeof toolCall.kind === "string" ? toolCall.kind.toLowerCase() : undefined;
+  if (kind === "fetch") return "WebFetch";
+  if (kind === "search" || kind === "web_search") return "WebSearch";
+  if (kind === "bash") return "Bash";
 
   const input = toolCall.rawInput as Record<string, unknown> | undefined;
   if (!input) return undefined;
@@ -233,17 +242,58 @@ export const createAcpSession = (
     throw new Error(`Unhandled method: ${method}`);
   });
 
-  const buildPromptBlocks = (text: string, images?: PromptImageInput[]): AcpContentBlock[] => {
-    const imageBlocks: AcpContentBlock[] = (images ?? [])
-      .filter((image) => typeof image.url === "string" && image.url.trim().length > 0)
-      .map((image) => ({
+  const resolveImageBlock = async (image: PromptImageInput): Promise<AcpContentBlock | null> => {
+    const url = image.url.trim();
+    if (!url) return null;
+
+    // ACP image blocks use binary data (base64), not URL references.
+    if (url.startsWith("data:")) {
+      const commaIndex = url.indexOf(",");
+      if (commaIndex < 0) return null;
+      const meta = url.slice(5, commaIndex);
+      const payload = url.slice(commaIndex + 1);
+      const isBase64 = meta.includes(";base64");
+      const mimeTypeFromDataUrl = meta.split(";")[0]?.trim();
+      const mimeType = image.mediaType ?? mimeTypeFromDataUrl ?? "image/*";
+      const data = isBase64
+        ? payload
+        : Buffer.from(decodeURIComponent(payload), "utf8").toString("base64");
+      return {
         type: "image",
-        source: {
-          type: "url",
-          url: image.url,
-          ...(image.mediaType ? { mediaType: image.mediaType } : {}),
-        },
-      }));
+        data,
+        mimeType,
+      };
+    }
+
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch image URL (${response.status}): ${url}`);
+    }
+    const mimeType = image.mediaType
+      ?? response.headers.get("content-type")?.split(";")[0]?.trim()
+      ?? "image/*";
+    const arrayBuffer = await response.arrayBuffer();
+    const data = Buffer.from(arrayBuffer).toString("base64");
+    return {
+      type: "image",
+      data,
+      mimeType,
+      uri: url,
+    };
+  };
+
+  const buildPromptBlocks = async (text: string, images?: PromptImageInput[]): Promise<AcpContentBlock[]> => {
+    const imageEntries = (images ?? [])
+      .filter((image) => typeof image.url === "string" && image.url.trim().length > 0);
+    const imageBlocks: AcpContentBlock[] = [];
+    for (const image of imageEntries) {
+      try {
+        const block = await resolveImageBlock(image);
+        if (block) imageBlocks.push(block);
+      } catch (error) {
+        console.warn(`[acp-session] Failed to resolve image block for ${image.url}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     const needsDefaultText = text.trim().length === 0 && imageBlocks.length > 0;
     const textBlock: AcpContentBlock = {
       type: "text",
@@ -255,12 +305,14 @@ export const createAcpSession = (
   const prompt = async (text: string, images?: PromptImageInput[]): Promise<unknown> => {
     const hasImages = Array.isArray(images) && images.length > 0;
     try {
+      const promptBlocks = await buildPromptBlocks(text, images);
       return await rpc.sendRequest("session/prompt", {
         sessionId: acpSessionId,
-        prompt: buildPromptBlocks(text, images),
+        prompt: promptBlocks,
       });
     } catch (error) {
       if (!hasImages) throw error;
+      console.warn(`[acp-session] Image blocks rejected by runtime; falling back to URL text prompt: ${error instanceof Error ? error.message : String(error)}`);
       // Compatibility fallback for runtimes that reject image content blocks.
       const fallbackText = [
         text.trim(),

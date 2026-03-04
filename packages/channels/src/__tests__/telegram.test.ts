@@ -223,7 +223,7 @@ describe("createTelegramAdapter", () => {
         senderId: "11",
         senderDisplayName: "Leo",
         text: "what is shown here?",
-        images: [{ url: "https://api.telegram.org/file/bottoken/photos/big.jpg" }],
+        images: [{ url: "https://api.telegram.org/file/bottoken/photos/big.jpg", mediaType: "image/jpeg" }],
       });
     });
 

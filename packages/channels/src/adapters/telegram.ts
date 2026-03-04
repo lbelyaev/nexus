@@ -301,28 +301,29 @@ export const createTelegramAdapter = (options: TelegramAdapterOptions): ChannelA
       }
 
       const imageUrls: Array<{ url: string; mediaType?: string }> = [];
-      const imageFileIds: string[] = [];
+      const imageFileRefs: Array<{ fileId: string; mediaType?: string }> = [];
       const largestPhoto = message.photo && message.photo.length > 0
         ? [...message.photo].sort((a, b) => (b.file_size ?? 0) - (a.file_size ?? 0))[0]
         : undefined;
       if (largestPhoto?.file_id) {
-        imageFileIds.push(largestPhoto.file_id);
+        imageFileRefs.push({ fileId: largestPhoto.file_id, mediaType: "image/jpeg" });
       } else if (message.document?.mime_type?.startsWith("image/") && message.document.file_id) {
-        imageFileIds.push(message.document.file_id);
+        imageFileRefs.push({ fileId: message.document.file_id, mediaType: message.document.mime_type });
       }
 
-      for (const fileId of imageFileIds) {
+      for (const imageFileRef of imageFileRefs) {
+        const { fileId, mediaType } = imageFileRef;
         try {
           const cachedUrl = fileUrlCache.get(fileId);
           if (cachedUrl) {
-            imageUrls.push({ url: cachedUrl });
+            imageUrls.push({ url: cachedUrl, ...(mediaType ? { mediaType } : {}) });
             continue;
           }
           const file = await apiCall<TelegramFileResponse>("getFile", { file_id: fileId });
           if (!file.file_path) continue;
           const fileUrl = `${apiBaseUrl}/file/bot${botToken}/${file.file_path}`;
           fileUrlCache.set(fileId, fileUrl);
-          imageUrls.push({ url: fileUrl });
+          imageUrls.push({ url: fileUrl, ...(mediaType ? { mediaType } : {}) });
         } catch (error) {
           ctx.log.warn("telegram_image_resolve_failed", {
             adapterId: id,

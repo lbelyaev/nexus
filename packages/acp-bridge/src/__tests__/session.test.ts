@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { describe, it, expect, vi } from "vitest";
 import { createAcpSession, translateNotification } from "../session.js";
 import type { RpcClient, RequestHandler } from "../rpc.js";
@@ -37,8 +38,9 @@ describe("createAcpSession", () => {
   it("prompt forwards image blocks when provided", async () => {
     const rpc = makeMockRpc();
     const session = createAcpSession(rpc, "acp-123", "gw-456");
+    const dataUrl = "data:image/png;base64,Y2F0";
 
-    await session.prompt("Describe this", [{ url: "https://example.com/cat.png", mediaType: "image/png" }]);
+    await session.prompt("Describe this", [{ url: dataUrl, mediaType: "image/png" }]);
 
     expect(rpc.sendRequest).toHaveBeenCalledWith("session/prompt", {
       sessionId: "acp-123",
@@ -46,14 +48,39 @@ describe("createAcpSession", () => {
         { type: "text", text: "Describe this" },
         {
           type: "image",
-          source: {
-            type: "url",
-            url: "https://example.com/cat.png",
-            mediaType: "image/png",
-          },
+          data: "Y2F0",
+          mimeType: "image/png",
         },
       ],
     });
+  });
+
+  it("prompt fetches image URLs and sends ACP image data blocks", async () => {
+    const rpc = makeMockRpc();
+    const session = createAcpSession(rpc, "acp-123", "gw-456");
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: (name: string) => (name.toLowerCase() === "content-type" ? "image/jpeg" : null) } as unknown as Headers,
+      arrayBuffer: async () => new TextEncoder().encode("jpeg-bytes").buffer,
+    } as Response);
+    vi.stubGlobal("fetch", fetchMock);
+
+    await session.prompt("Describe", [{ url: "https://example.com/cat.jpg" }]);
+
+    expect(fetchMock).toHaveBeenCalledWith("https://example.com/cat.jpg");
+    expect(rpc.sendRequest).toHaveBeenCalledWith("session/prompt", {
+      sessionId: "acp-123",
+      prompt: [
+        { type: "text", text: "Describe" },
+        {
+          type: "image",
+          data: Buffer.from("jpeg-bytes", "utf8").toString("base64"),
+          mimeType: "image/jpeg",
+          uri: "https://example.com/cat.jpg",
+        },
+      ],
+    });
+    vi.unstubAllGlobals();
   });
 
   it("falls back to text-only prompt when runtime rejects image blocks", async () => {
@@ -64,7 +91,7 @@ describe("createAcpSession", () => {
       .mockResolvedValueOnce({ ok: true });
     const session = createAcpSession(rpc, "acp-123", "gw-456");
 
-    await session.prompt("", [{ url: "https://example.com/cat.png" }]);
+    await session.prompt("", [{ url: "data:image/png;base64,Y2F0" }]);
 
     expect(rpc.sendRequest).toHaveBeenNthCalledWith(1, "session/prompt", {
       sessionId: "acp-123",
@@ -72,16 +99,14 @@ describe("createAcpSession", () => {
         { type: "text", text: "Please analyze the provided image(s)." },
         {
           type: "image",
-          source: {
-            type: "url",
-            url: "https://example.com/cat.png",
-          },
+          data: "Y2F0",
+          mimeType: "image/png",
         },
       ],
     });
     expect(rpc.sendRequest).toHaveBeenNthCalledWith(2, "session/prompt", {
       sessionId: "acp-123",
-      prompt: [{ type: "text", text: "Attached image URLs:\n1. https://example.com/cat.png" }],
+      prompt: [{ type: "text", text: "Attached image URLs:\n1. data:image/png;base64,Y2F0" }],
     });
   });
 
@@ -274,6 +299,45 @@ describe("createAcpSession", () => {
     expect((events[0] as { type: string }).type).toBe("approval_request");
 
     session.respondToPermission("tc-1", "allow_once");
+    const result = await permissionPromise;
+    expect(result).toEqual({ outcome: { outcome: "selected", optionId: "allow_once" } });
+  });
+
+  it("maps fetch permission kind to WebFetch", async () => {
+    const rpc = makeMockRpc();
+    let capturedRequestHandler: RequestHandler | undefined;
+    rpc.onRequest = vi.fn((handler) => { capturedRequestHandler = handler; return () => {}; });
+
+    const session = createAcpSession(rpc, "acp-123", "gw-456");
+    const events: unknown[] = [];
+    session.onEvent((event) => events.push(event));
+
+    const permissionPromise = capturedRequestHandler!("session/request_permission", {
+      sessionId: "acp-123",
+      toolCall: {
+        toolCallId: "tc-fetch-1",
+        title: "https://example.com/image.png",
+        kind: "fetch",
+        rawInput: { url: "https://example.com/image.png", prompt: "describe the image" },
+      },
+      options: [
+        { optionId: "allow_once", name: "Allow", kind: "allow_once" },
+      ],
+    });
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toEqual({
+      type: "approval_request",
+      sessionId: "gw-456",
+      requestId: "tc-fetch-1",
+      tool: "WebFetch",
+      description: JSON.stringify({ url: "https://example.com/image.png", prompt: "describe the image" }),
+      options: [
+        { optionId: "allow_once", name: "Allow", kind: "allow_once" },
+      ],
+    });
+
+    session.respondToPermission("tc-fetch-1", "allow_once");
     const result = await permissionPromise;
     expect(result).toEqual({ outcome: { outcome: "selected", optionId: "allow_once" } });
   });

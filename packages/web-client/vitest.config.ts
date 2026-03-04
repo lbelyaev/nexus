@@ -7,6 +7,15 @@ export default defineConfig({
     root: dirname(fileURLToPath(import.meta.url)),
     include: ["src/**/*.test.ts", "src/**/*.test.tsx"],
     environment: "jsdom",
-    passWithNoTests: true,
+    coverage: {
+      provider: "v8",
+      reporter: ["text", "json-summary"],
+      thresholds: {
+        lines: 4,
+        statements: 4,
+        branches: 80,
+        functions: 78,
+      },
+    },
   },
 });

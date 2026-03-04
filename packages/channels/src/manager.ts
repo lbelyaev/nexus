@@ -116,6 +116,14 @@ const formatChannelError = (error: unknown): string => {
 
 const isSessionNotFoundMessage = (message: string): boolean =>
   message.startsWith("Session not found:");
+const isPromptTimeoutMessage = (message: string): boolean =>
+  message.includes('RPC request "session/prompt"') && message.includes("timed out");
+const formatUserFacingError = (message: string): string => {
+  if (isPromptTimeoutMessage(message)) {
+    return "Response timed out. You can retry, use /cancel, or send a new message to steer.";
+  }
+  return `Error: ${message}`;
+};
 
 const DEFAULT_TYPING_INDICATOR = true;
 const DEFAULT_STREAMING_MODE: ChannelStreamingMode = "off";
@@ -821,7 +829,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         stopTyping(event.sessionId);
         runningTurns.delete(event.sessionId);
         cancelRequested.delete(event.sessionId);
-        await sendToConversation(binding.adapterId, binding.conversationId, `Error: ${event.message}`);
+        await sendToConversation(binding.adapterId, binding.conversationId, formatUserFacingError(event.message));
         break;
       }
       case "session_closed": {
