@@ -700,6 +700,70 @@ describe("useSession", () => {
     });
   });
 
+  it("ignores transfer requests for a different authenticated principal", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "auth_result",
+        ok: true,
+        principalType: "user",
+        principalId: "user:tui:abc",
+      });
+      result.current.handleEvent({
+        type: "session_transfer_requested",
+        sessionId: "sess-other",
+        fromPrincipalType: "user",
+        fromPrincipalId: "user:web:xyz",
+        targetPrincipalType: "user",
+        targetPrincipalId: "user:tui:def",
+        expiresAt: "2026-01-01T00:00:00Z",
+      });
+    });
+
+    expect(result.current.pendingSessionTransfers).toHaveLength(0);
+  });
+
+  it("auth_result success prunes pending transfers that target a different principal", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_transfer_requested",
+        sessionId: "sess-a",
+        fromPrincipalType: "user",
+        fromPrincipalId: "user:web:one",
+        targetPrincipalType: "user",
+        targetPrincipalId: "user:tui:one",
+        expiresAt: "2026-01-01T00:00:00Z",
+      });
+      result.current.handleEvent({
+        type: "session_transfer_requested",
+        sessionId: "sess-b",
+        fromPrincipalType: "user",
+        fromPrincipalId: "user:web:two",
+        targetPrincipalType: "user",
+        targetPrincipalId: "user:tui:two",
+        expiresAt: "2026-01-01T00:00:00Z",
+      });
+    });
+    expect(result.current.pendingSessionTransfers).toHaveLength(2);
+
+    act(() => {
+      result.current.handleEvent({
+        type: "auth_result",
+        ok: true,
+        principalType: "user",
+        principalId: "user:tui:two",
+      });
+    });
+
+    expect(result.current.pendingSessionTransfers).toHaveLength(1);
+    expect(result.current.pendingSessionTransfers[0].sessionId).toBe("sess-b");
+  });
+
   it("session_transferred to authenticated principal switches active session and requests replay", () => {
     const sendMessage = vi.fn();
     const { result } = renderHook(() => useSession(sendMessage));

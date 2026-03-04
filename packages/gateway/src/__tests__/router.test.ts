@@ -33,6 +33,7 @@ const collectEvents = (): { emit: EventEmitter; events: GatewayEvent[] } => {
 };
 
 const createAuthProof = (params: {
+  challengeId: string;
   nonce: string;
   principalType?: "user" | "service_account";
   principalId: string;
@@ -40,7 +41,7 @@ const createAuthProof = (params: {
   const principalType = params.principalType ?? "user";
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
   const payload = Buffer.from(
-    `${params.nonce}:${principalType}:${params.principalId}`,
+    `${params.challengeId}:${params.nonce}:${principalType}:${params.principalId}`,
     "utf8",
   );
   const signature = sign(null, payload, privateKey).toString("base64");
@@ -50,6 +51,7 @@ const createAuthProof = (params: {
     principalType,
     principalId: params.principalId,
     publicKey: publicKeyPem,
+    challengeId: params.challengeId,
     nonce: params.nonce,
     signature,
     algorithm: "ed25519",
@@ -204,6 +206,7 @@ describe("createRouter", () => {
 
     events.length = 0;
     const proof = createAuthProof({
+      challengeId: challenge.challengeId,
       nonce: challenge.nonce,
       principalId: "user:alice",
     });
@@ -233,6 +236,7 @@ describe("createRouter", () => {
       throw new Error("auth_challenge missing");
     }
     const proof = createAuthProof({
+      challengeId: challenge.challengeId,
       nonce: challenge.nonce,
       principalId: "user:alice",
     });
@@ -249,6 +253,27 @@ describe("createRouter", () => {
     if (!second || second.type !== "auth_result") throw new Error("expected auth_result");
     expect(second.ok).toBe(false);
     expect(second.message).toMatch(/already used/i);
+  });
+
+  it("auth_proof rejects mismatched challengeId", () => {
+    const { emit, events } = collectEvents();
+    router.registerConnection("conn-1", emit);
+    const challenge = events.find((event) => event.type === "auth_challenge");
+    if (!challenge || challenge.type !== "auth_challenge") {
+      throw new Error("auth_challenge missing");
+    }
+
+    events.length = 0;
+    router.handleMessage(createAuthProof({
+      challengeId: "challenge-wrong",
+      nonce: challenge.nonce,
+      principalId: "user:alice",
+    }), emit, { connectionId: "conn-1" });
+
+    const result = events.find((event) => event.type === "auth_result");
+    if (!result || result.type !== "auth_result") throw new Error("expected auth_result");
+    expect(result.ok).toBe(false);
+    expect(result.message).toMatch(/challenge ID does not match/i);
   });
 
   it("prompt emits error event if sessionId not found", () => {
@@ -294,6 +319,9 @@ describe("createRouter", () => {
     expect(turnEnd.executionId).toBeDefined();
     expect(turnEnd.turnId).toBeDefined();
     expect(turnEnd.policySnapshotId).toBeDefined();
+    const execution = turnEnd.executionId ? stateStore.getExecution(turnEnd.executionId) : null;
+    expect(execution?.state).toBe("succeeded");
+    expect(execution?.completedAt).toBeTruthy();
   });
 
   it("prompt forwards image inputs to session.prompt", async () => {
@@ -354,6 +382,77 @@ describe("createRouter", () => {
     const duplicateTurnEnd = events.find((e) => e.type === "turn_end");
     if (!duplicateTurnEnd || duplicateTurnEnd.type !== "turn_end") throw new Error("turn_end missing");
     expect(duplicateTurnEnd.stopReason).toBe("idempotent_duplicate");
+  });
+
+  it("prompt propagates parentExecutionId correlation and persists execution parent link", async () => {
+    const { emit, events } = collectEvents();
+    router.handleMessage({ type: "session_new" }, emit);
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === "session_created")).toBe(true);
+    });
+    const created = events.find((e) => e.type === "session_created");
+    if (!created || created.type !== "session_created") throw new Error("session_created missing");
+
+    stateStore.createExecution({
+      id: "exec-parent-1",
+      sessionId: created.sessionId,
+      turnId: "turn-parent-1",
+      workspaceId: "default",
+      principalType: "user",
+      principalId: "user:local",
+      source: "interactive",
+      runtimeId: "default",
+      model: "claude",
+      policySnapshotId: "policy-parent",
+      state: "running",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      startedAt: "2026-01-01T00:00:00Z",
+    });
+
+    events.length = 0;
+    router.handleMessage({
+      type: "prompt",
+      sessionId: created.sessionId,
+      text: "child execution",
+      parentExecutionId: "exec-parent-1",
+    }, emit);
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === "turn_end")).toBe(true);
+    });
+    const turnEnd = events.find((e) => e.type === "turn_end");
+    if (!turnEnd || turnEnd.type !== "turn_end") throw new Error("turn_end missing");
+    expect(turnEnd.parentExecutionId).toBe("exec-parent-1");
+    const execution = turnEnd.executionId ? stateStore.getExecution(turnEnd.executionId) : null;
+    expect(execution?.parentExecutionId).toBe("exec-parent-1");
+  });
+
+  it("prompt rejects unknown parentExecutionId", async () => {
+    const { emit, events } = collectEvents();
+    router.handleMessage({ type: "session_new" }, emit);
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === "session_created")).toBe(true);
+    });
+    const created = events.find((e) => e.type === "session_created");
+    if (!created || created.type !== "session_created") throw new Error("session_created missing");
+
+    events.length = 0;
+    router.handleMessage({
+      type: "prompt",
+      sessionId: created.sessionId,
+      text: "child execution",
+      parentExecutionId: "exec-missing",
+    }, emit);
+
+    expect(events).toHaveLength(1);
+    expect(events[0].type).toBe("error");
+    if (events[0].type === "error") {
+      expect(events[0].message).toMatch(/parentExecutionId/i);
+    }
+    expect(acpSession.prompt).not.toHaveBeenCalled();
   });
 
   it("prompt emits text_delta when prompt result has a single content block object", async () => {
@@ -514,6 +613,68 @@ describe("createRouter", () => {
     expect(other.events[0].type).toBe("transcript");
   });
 
+  it("session_transfer_request requires authenticated requester principal", async () => {
+    const owner = collectEvents();
+    router.registerConnection("conn-owner", owner.emit);
+    router.handleMessage({ type: "session_new" }, owner.emit, { connectionId: "conn-owner" });
+
+    await vi.waitFor(() => {
+      expect(owner.events.some((e) => e.type === "session_created")).toBe(true);
+    });
+    const created = owner.events.find((e) => e.type === "session_created");
+    if (!created || created.type !== "session_created") throw new Error("expected session_created");
+
+    owner.events.length = 0;
+    router.handleMessage({
+      type: "session_transfer_request",
+      sessionId: created.sessionId,
+      targetPrincipalId: "user:bob",
+      targetPrincipalType: "user",
+    }, owner.emit, { connectionId: "conn-owner" });
+
+    expect(owner.events).toHaveLength(1);
+    expect(owner.events[0].type).toBe("error");
+    if (owner.events[0].type === "error") {
+      expect(owner.events[0].message).toMatch(/requires authenticated/i);
+    }
+  });
+
+  it("session_transfer_request rejects requester principal that does not own session", async () => {
+    const owner = collectEvents();
+    router.registerConnection("conn-owner", owner.emit);
+    const challenge = owner.events.find((event) => event.type === "auth_challenge");
+    if (!challenge || challenge.type !== "auth_challenge") throw new Error("auth_challenge missing");
+
+    router.handleMessage({ type: "session_new" }, owner.emit, { connectionId: "conn-owner" });
+    await vi.waitFor(() => {
+      expect(owner.events.some((e) => e.type === "session_created")).toBe(true);
+    });
+    const created = owner.events.find((e) => e.type === "session_created");
+    if (!created || created.type !== "session_created") throw new Error("expected session_created");
+
+    owner.events.length = 0;
+    router.handleMessage(createAuthProof({
+      challengeId: challenge.challengeId,
+      nonce: challenge.nonce,
+      principalId: "user:alice",
+    }), owner.emit, { connectionId: "conn-owner" });
+    expect(owner.events.some((event) => event.type === "auth_result")).toBe(true);
+
+    owner.events.length = 0;
+    router.handleMessage({
+      type: "session_transfer_request",
+      sessionId: created.sessionId,
+      targetPrincipalId: "user:bob",
+      targetPrincipalType: "user",
+    }, owner.emit, { connectionId: "conn-owner" });
+
+    expect(owner.events).toHaveLength(1);
+    expect(owner.events[0].type).toBe("error");
+    if (owner.events[0].type === "error") {
+      expect(owner.events[0].message).toMatch(/does not own this session/i);
+    }
+  });
+
   it("supports explicit session transfer between authenticated principals", async () => {
     const owner = collectEvents();
     const target = collectEvents();
@@ -528,10 +689,12 @@ describe("createRouter", () => {
     owner.events.length = 0;
     target.events.length = 0;
     router.handleMessage(createAuthProof({
+      challengeId: ownerChallenge.challengeId,
       nonce: ownerChallenge.nonce,
       principalId: "user:alice",
     }), owner.emit, { connectionId: "conn-owner" });
     router.handleMessage(createAuthProof({
+      challengeId: targetChallenge.challengeId,
       nonce: targetChallenge.nonce,
       principalId: "user:bob",
     }), target.emit, { connectionId: "conn-target" });

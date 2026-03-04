@@ -25,6 +25,10 @@ describe("createStateStore", () => {
     expect(typeof store.appendMemoryItem).toBe("function");
     expect(typeof store.getMemoryItems).toBe("function");
     expect(typeof store.searchMemory).toBe("function");
+    expect(typeof store.createExecution).toBe("function");
+    expect(typeof store.getExecution).toBe("function");
+    expect(typeof store.listExecutions).toBe("function");
+    expect(typeof store.transitionExecutionState).toBe("function");
     expect(typeof store.close).toBe("function");
 
     store.close();

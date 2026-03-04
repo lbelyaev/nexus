@@ -5,6 +5,7 @@ describe("isClientMessage", () => {
   it("validates a prompt message", () => {
     expect(isClientMessage({ type: "prompt", sessionId: "s1", text: "hello" })).toBe(true);
     expect(isClientMessage({ type: "prompt", sessionId: "s1", text: "hello", idempotencyKey: "req-123" })).toBe(true);
+    expect(isClientMessage({ type: "prompt", sessionId: "s1", text: "hello", parentExecutionId: "exec-parent-1" })).toBe(true);
     expect(isClientMessage({
       type: "prompt",
       sessionId: "s1",
@@ -57,6 +58,7 @@ describe("isClientMessage", () => {
       principalId: "user:alice",
       principalType: "user",
       publicKey: "-----BEGIN PUBLIC KEY-----\nabc\n-----END PUBLIC KEY-----",
+      challengeId: "challenge-1",
       nonce: "nonce-1",
       signature: "sig-1",
       algorithm: "ed25519",
@@ -136,6 +138,7 @@ describe("isClientMessage", () => {
     expect(isClientMessage({
       type: "auth_proof",
       principalId: "user:alice",
+      challengeId: "challenge-1",
       nonce: "nonce",
       signature: "sig",
     })).toBe(false);
@@ -153,6 +156,15 @@ describe("isGatewayEvent", () => {
   it("validates text_delta", () => {
     expect(isGatewayEvent({ type: "text_delta", sessionId: "s1", delta: "hi" })).toBe(true);
     expect(isGatewayEvent({ type: "text_delta", sessionId: "s1", delta: "hi", executionId: "exec-1", turnId: "turn-1" })).toBe(true);
+    expect(isGatewayEvent({
+      type: "text_delta",
+      sessionId: "s1",
+      delta: "hi",
+      executionId: "exec-1",
+      parentExecutionId: "exec-root",
+      turnId: "turn-1",
+      policySnapshotId: "policy-1",
+    })).toBe(true);
   });
 
   it("validates tool_start", () => {
@@ -217,6 +229,7 @@ describe("isGatewayEvent", () => {
     expect(isGatewayEvent({
       type: "auth_challenge",
       algorithm: "ed25519",
+      challengeId: "challenge-1",
       nonce: "nonce-1",
       issuedAt: "2026-01-01T00:00:00Z",
       expiresAt: "2026-01-01T00:01:00Z",

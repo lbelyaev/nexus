@@ -37,6 +37,7 @@ export interface RuntimeHealthInfo {
 
 export interface EventCorrelation {
   executionId?: string;
+  parentExecutionId?: string;
   turnId?: string;
   policySnapshotId?: string;
 }
@@ -53,6 +54,7 @@ export type ClientMessage =
       text: string;
       images?: PromptImageInput[];
       idempotencyKey?: string;
+      parentExecutionId?: string;
     }
   | { type: "approval_response"; requestId: string; allow?: boolean; optionId?: string }
   | { type: "cancel"; sessionId: string }
@@ -73,6 +75,7 @@ export type ClientMessage =
       principalType?: PrincipalType;
       principalId: string;
       publicKey: string;
+      challengeId: string;
       nonce: string;
       signature: string;
       algorithm?: AuthAlgorithm;
@@ -140,6 +143,7 @@ export type GatewayEvent =
   | {
       type: "auth_challenge";
       algorithm: AuthAlgorithm;
+      challengeId: string;
       nonce: string;
       issuedAt: string;
       expiresAt: string;
@@ -311,6 +315,7 @@ const isMemoryContextSnapshot = (value: unknown): value is MemoryContextSnapshot
 
 const hasValidCorrelation = (obj: Record<string, unknown>): boolean => (
   (obj.executionId === undefined || typeof obj.executionId === "string")
+  && (obj.parentExecutionId === undefined || typeof obj.parentExecutionId === "string")
   && (obj.turnId === undefined || typeof obj.turnId === "string")
   && (obj.policySnapshotId === undefined || typeof obj.policySnapshotId === "string")
 );
@@ -337,6 +342,7 @@ export const isClientMessage = (value: unknown): value is ClientMessage => {
         && typeof obj.text === "string"
         && (obj.images === undefined || (Array.isArray(obj.images) && obj.images.every((entry) => isPromptImageInput(entry))))
         && (obj.idempotencyKey === undefined || typeof obj.idempotencyKey === "string")
+        && (obj.parentExecutionId === undefined || typeof obj.parentExecutionId === "string")
       );
     case "approval_response":
       return (
@@ -364,6 +370,7 @@ export const isClientMessage = (value: unknown): value is ClientMessage => {
       return (
         typeof obj.principalId === "string"
         && typeof obj.publicKey === "string"
+        && typeof obj.challengeId === "string"
         && typeof obj.nonce === "string"
         && typeof obj.signature === "string"
         && (obj.principalType === undefined || (typeof obj.principalType === "string" && PRINCIPAL_TYPES.has(obj.principalType as PrincipalType)))
@@ -481,6 +488,7 @@ export const isGatewayEvent = (value: unknown): value is GatewayEvent => {
     case "auth_challenge":
       return (
         obj.algorithm === "ed25519"
+        && typeof obj.challengeId === "string"
         && typeof obj.nonce === "string"
         && typeof obj.issuedAt === "string"
         && typeof obj.expiresAt === "string"

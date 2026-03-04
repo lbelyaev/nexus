@@ -116,7 +116,7 @@ export const createTuiAuthProofProvider = (): AuthProofProvider => ({
   getAuthProof: async (challenge) => {
     const identity = getOrCreateIdentity();
     const payload = Buffer.from(
-      `${challenge.nonce}:${identity.principalType}:${identity.principalId}`,
+      `${challenge.challengeId}:${challenge.nonce}:${identity.principalType}:${identity.principalId}`,
       "utf8",
     );
     const signature = sign(null, payload, identity.privateKeyPem).toString("base64");
@@ -126,9 +126,9 @@ export const createTuiAuthProofProvider = (): AuthProofProvider => ({
       principalType: identity.principalType,
       principalId: identity.principalId,
       publicKey: identity.publicKeyPem,
+      challengeId: challenge.challengeId,
       nonce: challenge.nonce,
       signature,
     };
   },
 });
-

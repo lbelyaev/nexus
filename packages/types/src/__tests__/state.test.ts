@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { isSessionRecord, isAuditEvent } from "../state.js";
+import { isSessionRecord, isAuditEvent, isExecutionRecord } from "../state.js";
 
 describe("isSessionRecord", () => {
   const validSession = {
@@ -81,5 +81,50 @@ describe("isAuditEvent", () => {
   it("rejects missing required fields", () => {
     const { detail, ...noDetail } = validEvent;
     expect(isAuditEvent(noDetail)).toBe(false);
+  });
+});
+
+describe("isExecutionRecord", () => {
+  const validExecution = {
+    id: "exec-1",
+    sessionId: "sess-1",
+    turnId: "turn-1",
+    parentExecutionId: "exec-root",
+    idempotencyKey: "idem-1",
+    workspaceId: "default",
+    principalType: "user",
+    principalId: "user:local",
+    source: "interactive",
+    runtimeId: "claude-code",
+    model: "claude-4",
+    policySnapshotId: "abc123",
+    state: "running",
+    createdAt: "2026-01-01T00:00:00Z",
+    updatedAt: "2026-01-01T00:00:00Z",
+    startedAt: "2026-01-01T00:00:01Z",
+  };
+
+  it("validates well-formed execution records", () => {
+    expect(isExecutionRecord(validExecution)).toBe(true);
+    expect(isExecutionRecord({
+      ...validExecution,
+      state: "succeeded",
+      completedAt: "2026-01-01T00:00:10Z",
+      stopReason: "end_turn",
+    })).toBe(true);
+  });
+
+  it("validates all execution states", () => {
+    for (const state of ["queued", "running", "succeeded", "failed", "cancelled", "timed_out"]) {
+      expect(isExecutionRecord({ ...validExecution, state })).toBe(true);
+    }
+  });
+
+  it("rejects malformed execution records", () => {
+    expect(isExecutionRecord({ ...validExecution, state: "unknown" })).toBe(false);
+    expect(isExecutionRecord({ ...validExecution, policySnapshotId: 123 })).toBe(false);
+    expect(isExecutionRecord({ ...validExecution, principalType: "admin" })).toBe(false);
+    const { id, ...missingId } = validExecution;
+    expect(isExecutionRecord(missingId)).toBe(false);
   });
 });

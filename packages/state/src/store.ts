@@ -4,8 +4,9 @@ import { createSessionStore, type SessionStore } from "./sessions.js";
 import { createAuditStore, type AuditStore } from "./audit.js";
 import { createTranscriptStore, type TranscriptStore } from "./transcript.js";
 import { createMemoryStore, type MemoryStore } from "./memory.js";
+import { createExecutionStore, type ExecutionStore } from "./executions.js";
 
-export interface StateStore extends SessionStore, AuditStore, TranscriptStore, MemoryStore {
+export interface StateStore extends SessionStore, AuditStore, TranscriptStore, MemoryStore, ExecutionStore {
   close: () => void;
 }
 
@@ -17,6 +18,7 @@ export const createStateStore = (dbPath: string = ":memory:"): StateStore => {
     ...createAuditStore(db),
     ...createTranscriptStore(db),
     ...createMemoryStore(db),
+    ...createExecutionStore(db),
     close: () => db.close(),
   };
 };

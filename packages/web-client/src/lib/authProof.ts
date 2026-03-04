@@ -218,7 +218,7 @@ const getOrCreateIdentity = (() => {
 export const createWebAuthProofProvider = (): AuthProofProvider => ({
   getAuthProof: async (challenge) => {
     const identity = await getOrCreateIdentity();
-    const payload = `${challenge.nonce}:${identity.principalType}:${identity.principalId}`;
+    const payload = `${challenge.challengeId}:${challenge.nonce}:${identity.principalType}:${identity.principalId}`;
     const signature = await globalThis.crypto.subtle.sign(
       "Ed25519",
       identity.privateKey,
@@ -230,6 +230,7 @@ export const createWebAuthProofProvider = (): AuthProofProvider => ({
       principalType: identity.principalType,
       principalId: identity.principalId,
       publicKey: identity.publicKeyPem,
+      challengeId: challenge.challengeId,
       nonce: challenge.nonce,
       signature: toBase64(new Uint8Array(signature)),
     };

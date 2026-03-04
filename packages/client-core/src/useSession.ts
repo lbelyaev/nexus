@@ -109,6 +109,9 @@ export const useSession = (
   const [authStatus, setAuthStatus] = useState<"unverified" | "verifying" | "verified" | "failed">("unverified");
   const [authPrincipalType, setAuthPrincipalType] = useState<"user" | "service_account" | null>(null);
   const [authPrincipalId, setAuthPrincipalId] = useState<string | null>(null);
+  const authStatusRef = useRef(authStatus);
+  const authPrincipalTypeRef = useRef(authPrincipalType);
+  const authPrincipalIdRef = useRef(authPrincipalId);
   const [pendingSessionTransfers, setPendingSessionTransfers] = useState<SessionTransferRequestedEvent[]>([]);
   const [responseText, setResponseText] = useState("");
   const [thinkingText, setThinkingText] = useState("");
@@ -152,6 +155,12 @@ export const useSession = (
   useEffect(() => () => {
     if (flushTimerRef.current) clearTimeout(flushTimerRef.current);
   }, []);
+
+  useEffect(() => {
+    authStatusRef.current = authStatus;
+    authPrincipalTypeRef.current = authPrincipalType;
+    authPrincipalIdRef.current = authPrincipalId;
+  }, [authPrincipalId, authPrincipalType, authStatus]);
 
   const sendPromptInternal = useCallback(
     (text: string, images?: PromptImageInput[]) => {
@@ -247,17 +256,43 @@ export const useSession = (
         break;
       case "auth_challenge":
         setAuthStatus("verifying");
+        authStatusRef.current = "verifying";
         break;
       case "auth_result":
         if (event.ok) {
           setAuthStatus("verified");
-          setAuthPrincipalType(event.principalType ?? "user");
-          setAuthPrincipalId(event.principalId ?? null);
+          const nextType = event.principalType ?? "user";
+          const nextId = event.principalId ?? null;
+          authStatusRef.current = "verified";
+          authPrincipalTypeRef.current = nextType;
+          authPrincipalIdRef.current = nextId;
+          setAuthPrincipalType(nextType);
+          setAuthPrincipalId(nextId);
+          if (nextId) {
+            setPendingSessionTransfers((prev) => prev.filter((transfer) => (
+              transfer.targetPrincipalType === nextType
+              && transfer.targetPrincipalId === nextId
+            )));
+          } else {
+            setPendingSessionTransfers([]);
+          }
         } else {
           setAuthStatus("failed");
+          authStatusRef.current = "failed";
         }
         break;
       case "session_transfer_requested":
+        if (
+          authStatusRef.current === "verified"
+          && authPrincipalIdRef.current !== null
+          && authPrincipalTypeRef.current !== null
+          && (
+            event.targetPrincipalId !== authPrincipalIdRef.current
+            || event.targetPrincipalType !== authPrincipalTypeRef.current
+          )
+        ) {
+          break;
+        }
         setPendingSessionTransfers((prev) => {
           const existingIndex = prev.findIndex((transfer) => transfer.sessionId === event.sessionId);
           if (existingIndex >= 0) {
@@ -271,11 +306,11 @@ export const useSession = (
       case "session_transferred": {
         setPendingSessionTransfers((prev) => prev.filter((transfer) => transfer.sessionId !== event.sessionId));
         const isTarget =
-          authStatus === "verified"
-          && authPrincipalId !== null
-          && authPrincipalType !== null
-          && event.targetPrincipalId === authPrincipalId
-          && event.targetPrincipalType === authPrincipalType;
+          authStatusRef.current === "verified"
+          && authPrincipalIdRef.current !== null
+          && authPrincipalTypeRef.current !== null
+          && event.targetPrincipalId === authPrincipalIdRef.current
+          && event.targetPrincipalType === authPrincipalTypeRef.current;
 
         if (isTarget) {
           queuedSteerRef.current = null;
@@ -389,9 +424,6 @@ export const useSession = (
         break;
     }
   }, [
-    authPrincipalId,
-    authPrincipalType,
-    authStatus,
     flushBuffers,
     scheduleFlush,
     sendMessage,

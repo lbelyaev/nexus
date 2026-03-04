@@ -87,6 +87,35 @@ describe("initDatabase", () => {
     expect(columnNames).toContain("tokenEstimate");
   });
 
+  it("creates executions table with correct columns", () => {
+    initDatabase(db);
+
+    const columns = db
+      .prepare("PRAGMA table_info(executions)")
+      .all() as Array<{ name: string; type: string }>;
+    const columnNames = columns.map((c) => c.name);
+
+    expect(columnNames).toContain("id");
+    expect(columnNames).toContain("sessionId");
+    expect(columnNames).toContain("turnId");
+    expect(columnNames).toContain("parentExecutionId");
+    expect(columnNames).toContain("idempotencyKey");
+    expect(columnNames).toContain("workspaceId");
+    expect(columnNames).toContain("principalType");
+    expect(columnNames).toContain("principalId");
+    expect(columnNames).toContain("source");
+    expect(columnNames).toContain("runtimeId");
+    expect(columnNames).toContain("model");
+    expect(columnNames).toContain("policySnapshotId");
+    expect(columnNames).toContain("state");
+    expect(columnNames).toContain("stopReason");
+    expect(columnNames).toContain("errorMessage");
+    expect(columnNames).toContain("createdAt");
+    expect(columnNames).toContain("updatedAt");
+    expect(columnNames).toContain("startedAt");
+    expect(columnNames).toContain("completedAt");
+  });
+
   it("is idempotent (calling twice does not error)", () => {
     initDatabase(db);
     expect(() => initDatabase(db)).not.toThrow();
@@ -111,5 +140,9 @@ describe("initDatabase", () => {
     expect(indexNames).toContain("idx_memory_items_session_kind_createdAt");
     expect(indexNames).toContain("idx_memory_items_session_lastAccessedAt");
     expect(indexNames).toContain("idx_memory_items_workspace_kind_createdAt");
+    expect(indexNames).toContain("idx_executions_session_createdAt");
+    expect(indexNames).toContain("idx_executions_parentExecutionId");
+    expect(indexNames).toContain("idx_executions_state_updatedAt");
+    expect(indexNames).toContain("idx_executions_session_idempotencyKey");
   });
 });

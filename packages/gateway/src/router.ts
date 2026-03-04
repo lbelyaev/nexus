@@ -1,6 +1,7 @@
 import type {
   AuthAlgorithm,
   ClientMessage,
+  ExecutionState,
   EventCorrelation,
   GatewayEvent,
   PolicyConfig,
@@ -72,6 +73,7 @@ interface ConnectionPrincipal {
 }
 
 interface AuthChallenge {
+  id: string;
   nonce: string;
   issuedAtMs: number;
   expiresAtMs: number;
@@ -92,6 +94,7 @@ const AUTH_CHALLENGE_TTL_MS = 60_000;
 const TRANSFER_MIN_TTL_MS = 5_000;
 const TRANSFER_MAX_TTL_MS = 10 * 60 * 1000;
 const TRANSFER_DEFAULT_TTL_MS = 60_000;
+const CONSUMED_AUTH_CHALLENGE_TTL_MS = 15 * 60 * 1000;
 
 const normalizePublicKey = (publicKey: string): string => {
   const trimmed = publicKey.trim();
@@ -119,12 +122,14 @@ const decodeSignature = (signature: string): Buffer | null => {
 };
 
 const buildAuthPayload = (
+  challengeId: string,
   nonce: string,
   principalType: PrincipalType,
   principalId: string,
-): string => `${nonce}:${principalType}:${principalId}`;
+): string => `${challengeId}:${nonce}:${principalType}:${principalId}`;
 
 const verifyAuthProof = (
+  challengeId: string,
   nonce: string,
   principalType: PrincipalType,
   principalId: string,
@@ -133,13 +138,29 @@ const verifyAuthProof = (
 ): boolean => {
   try {
     const key = createPublicKey(normalizePublicKey(publicKey));
-    const payload = Buffer.from(buildAuthPayload(nonce, principalType, principalId), "utf8");
+    const payload = Buffer.from(buildAuthPayload(challengeId, nonce, principalType, principalId), "utf8");
     const signatureBytes = decodeSignature(signature);
     if (!signatureBytes) return false;
     return verify(null, payload, key, signatureBytes);
   } catch {
     return false;
   }
+};
+
+const mapStopReasonToExecutionState = (stopReason: string | undefined): ExecutionState => {
+  const normalized = (stopReason ?? "").toLowerCase();
+  if (normalized === "cancelled" || normalized === "canceled") {
+    return "cancelled";
+  }
+  if (
+    normalized === "timed_out"
+    || normalized === "timeout"
+    || normalized === "time_limit"
+    || normalized === "max_duration"
+  ) {
+    return "timed_out";
+  }
+  return "succeeded";
 };
 
 const safeStringify = (value: unknown): string => {
@@ -278,12 +299,14 @@ export const createRouter = (deps: RouterDeps): Router => {
     sessionId: string;
     turnId?: string;
     executionId?: string;
+    parentExecutionId?: string;
     policySnapshotId?: string;
   }>();
   const sessionIdempotency = new Map<string, Map<string, {
     state: "running" | "completed";
     turnId: string;
     executionId: string;
+    parentExecutionId?: string;
     completedAtMs?: number;
   }>>();
   const sessionToPendingRequests = new Map<string, Set<string>>();
@@ -291,7 +314,7 @@ export const createRouter = (deps: RouterDeps): Router => {
   const emitterConnectionIds = new WeakMap<EventEmitter, string>();
   const connectionPrincipals = new Map<string, ConnectionPrincipal>();
   const authChallenges = new Map<string, AuthChallenge>();
-  const consumedAuthChallenges = new Set<string>();
+  const consumedAuthChallenges = new Map<string, number>();
   const sessionTransfers = new Map<string, SessionTransferRequest>();
   const runtimeHealth = new Map<string, RuntimeHealthInfo>(Object.entries(initialRuntimeHealth));
   const log = createLogger("gateway.router");
@@ -316,9 +339,19 @@ export const createRouter = (deps: RouterDeps): Router => {
     connectionId ? connectionPrincipals.get(connectionId) : undefined
   );
 
+  const pruneConsumedAuthChallenges = (): void => {
+    const nowMs = Date.now();
+    for (const [key, expiresAtMs] of consumedAuthChallenges) {
+      if (nowMs >= expiresAtMs) {
+        consumedAuthChallenges.delete(key);
+      }
+    }
+  };
+
   const issueAuthChallenge = (connectionId: string, emit: EventEmitter): AuthChallenge => {
     const issuedAtMs = Date.now();
     const challenge: AuthChallenge = {
+      id: randomBytes(12).toString("base64url"),
       algorithm: "ed25519",
       nonce: randomBytes(24).toString("base64url"),
       issuedAtMs,
@@ -328,6 +361,7 @@ export const createRouter = (deps: RouterDeps): Router => {
     emit({
       type: "auth_challenge",
       algorithm: challenge.algorithm,
+      challengeId: challenge.id,
       nonce: challenge.nonce,
       issuedAt: new Date(challenge.issuedAtMs).toISOString(),
       expiresAt: new Date(challenge.expiresAtMs).toISOString(),
@@ -351,12 +385,14 @@ export const createRouter = (deps: RouterDeps): Router => {
     requestId: string,
     turnId?: string,
     executionId?: string,
+    parentExecutionId?: string,
     correlationPolicySnapshotId?: string,
   ): void => {
     requestToSession.set(requestId, {
       sessionId,
       turnId,
       executionId,
+      parentExecutionId,
       policySnapshotId: correlationPolicySnapshotId,
     });
     const pending = sessionToPendingRequests.get(sessionId) ?? new Set<string>();
@@ -417,6 +453,20 @@ export const createRouter = (deps: RouterDeps): Router => {
       // Best-effort cancel on close.
     }
 
+    try {
+      const executions = stateStore.listExecutions(sessionId, 500);
+      for (const execution of executions) {
+        if (execution.state !== "queued" && execution.state !== "running") continue;
+        stateStore.transitionExecutionState(execution.id, "cancelled", {
+          updatedAt: new Date().toISOString(),
+          completedAt: new Date().toISOString(),
+          stopReason: reason,
+        });
+      }
+    } catch {
+      // Best-effort execution transition on session close.
+    }
+
     const nowIso = new Date().toISOString();
     try {
       stateStore.updateSession(sessionId, {
@@ -463,15 +513,15 @@ export const createRouter = (deps: RouterDeps): Router => {
 
   const getOrCreateIdempotencyMap = (
     sessionId: string,
-  ): Map<string, { state: "running" | "completed"; turnId: string; executionId: string; completedAtMs?: number }> => {
+  ): Map<string, { state: "running" | "completed"; turnId: string; executionId: string; parentExecutionId?: string; completedAtMs?: number }> => {
     const existing = sessionIdempotency.get(sessionId);
     if (existing) return existing;
-    const created = new Map<string, { state: "running" | "completed"; turnId: string; executionId: string; completedAtMs?: number }>();
+    const created = new Map<string, { state: "running" | "completed"; turnId: string; executionId: string; parentExecutionId?: string; completedAtMs?: number }>();
     sessionIdempotency.set(sessionId, created);
     return created;
   };
 
-  const pruneIdempotencyMap = (entries: Map<string, { state: "running" | "completed"; turnId: string; executionId: string; completedAtMs?: number }>): void => {
+  const pruneIdempotencyMap = (entries: Map<string, { state: "running" | "completed"; turnId: string; executionId: string; parentExecutionId?: string; completedAtMs?: number }>): void => {
     const nowMs = Date.now();
     const ttlMs = 15 * 60 * 1000;
     for (const [key, value] of entries) {
@@ -611,14 +661,15 @@ export const createRouter = (deps: RouterDeps): Router => {
       return;
     }
 
-    const nonceKey = `${connectionId}:${msg.nonce}`;
-    if (consumedAuthChallenges.has(nonceKey)) {
+    pruneConsumedAuthChallenges();
+    const challengeReplayKey = `${connectionId}:${msg.challengeId}`;
+    if (consumedAuthChallenges.has(challengeReplayKey)) {
       emit({
         type: "auth_result",
         ok: false,
         principalType,
         principalId,
-        message: "Auth nonce was already used.",
+        message: "Auth challenge was already used.",
       });
       return;
     }
@@ -647,6 +698,16 @@ export const createRouter = (deps: RouterDeps): Router => {
       });
       return;
     }
+    if (msg.challengeId !== challenge.id) {
+      emit({
+        type: "auth_result",
+        ok: false,
+        principalType,
+        principalId,
+        message: "Auth challenge ID does not match active challenge.",
+      });
+      return;
+    }
     if (nowMs > challenge.expiresAtMs) {
       authChallenges.delete(connectionId);
       issueAuthChallenge(connectionId, emit);
@@ -661,6 +722,7 @@ export const createRouter = (deps: RouterDeps): Router => {
     }
 
     const verified = verifyAuthProof(
+      challenge.id,
       msg.nonce,
       principalType,
       principalId,
@@ -679,7 +741,7 @@ export const createRouter = (deps: RouterDeps): Router => {
       return;
     }
 
-    consumedAuthChallenges.add(nonceKey);
+    consumedAuthChallenges.set(challengeReplayKey, Date.now() + CONSUMED_AUTH_CHALLENGE_TTL_MS);
     authChallenges.delete(connectionId);
     connectionPrincipals.set(connectionId, {
       principalType,
@@ -731,6 +793,15 @@ export const createRouter = (deps: RouterDeps): Router => {
       });
       return;
     }
+    const requesterPrincipal = resolvePrincipal(connectionId);
+    if (!requesterPrincipal?.verified) {
+      emit({
+        type: "error",
+        sessionId: msg.sessionId,
+        message: "Session transfer request requires authenticated connection principal.",
+      });
+      return;
+    }
 
     const targetPrincipalId = msg.targetPrincipalId.trim();
     if (!targetPrincipalId) {
@@ -747,6 +818,17 @@ export const createRouter = (deps: RouterDeps): Router => {
       principalId: "user:local",
       source: "interactive" as const,
     };
+    if (
+      requesterPrincipal.principalType !== sessionPrincipal.principalType
+      || requesterPrincipal.principalId !== sessionPrincipal.principalId
+    ) {
+      emit({
+        type: "error",
+        sessionId: msg.sessionId,
+        message: "Authenticated principal does not own this session.",
+      });
+      return;
+    }
     const expiresInMs = Math.max(
       TRANSFER_MIN_TTL_MS,
       Math.min(TRANSFER_MAX_TTL_MS, Math.floor(msg.expiresInMs ?? TRANSFER_DEFAULT_TTL_MS)),
@@ -839,6 +921,31 @@ export const createRouter = (deps: RouterDeps): Router => {
       });
       return;
     }
+    const transferOwner = sessionOwners.get(msg.sessionId);
+    const transferOwnerConnectionId = transferOwner ? emitterConnectionIds.get(transferOwner) : undefined;
+    if (!transferOwnerConnectionId || transferOwnerConnectionId !== transfer.requesterConnectionId) {
+      sessionTransfers.delete(msg.sessionId);
+      emit({
+        type: "error",
+        sessionId: msg.sessionId,
+        message: "Pending transfer is no longer valid for current session owner.",
+      });
+      return;
+    }
+    const requesterPrincipal = resolvePrincipal(transfer.requesterConnectionId);
+    if (
+      !requesterPrincipal?.verified
+      || requesterPrincipal.principalType !== transfer.fromPrincipalType
+      || requesterPrincipal.principalId !== transfer.fromPrincipalId
+    ) {
+      sessionTransfers.delete(msg.sessionId);
+      emit({
+        type: "error",
+        sessionId: msg.sessionId,
+        message: "Pending transfer requester identity is no longer valid.",
+      });
+      return;
+    }
     if (
       principal.principalType !== transfer.targetPrincipalType
       || principal.principalId !== transfer.targetPrincipalId
@@ -924,12 +1031,26 @@ export const createRouter = (deps: RouterDeps): Router => {
     const connectionId = context?.connectionId ?? emitterConnectionIds.get(emit) ?? null;
     const executionId = `exec-${msg.sessionId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const turnId = `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const parentExecutionId = msg.parentExecutionId?.trim() || undefined;
     const imageInputs = msg.images ?? [];
     const promptBody = msg.text.trim().length > 0
       ? msg.text
       : (imageInputs.length > 0 ? "(image input)" : "");
+    const workspaceId = sessionWorkspaces.get(msg.sessionId) ?? defaultWorkspaceId;
+    if (parentExecutionId) {
+      const parentExecution = stateStore.getExecution(parentExecutionId);
+      if (!parentExecution || parentExecution.sessionId !== msg.sessionId) {
+        emit({
+          type: "error",
+          sessionId: msg.sessionId,
+          message: "parentExecutionId must reference an execution in the same session.",
+        });
+        return;
+      }
+    }
     const correlation: EventCorrelation = {
       executionId,
+      parentExecutionId,
       turnId,
       policySnapshotId,
     };
@@ -939,10 +1060,10 @@ export const createRouter = (deps: RouterDeps): Router => {
       source: "interactive" as const,
     };
     const idempotencyKey = msg.idempotencyKey?.trim() || undefined;
+    const dedup = idempotencyKey ? getOrCreateIdempotencyMap(msg.sessionId) : undefined;
     if (idempotencyKey) {
-      const dedup = getOrCreateIdempotencyMap(msg.sessionId);
-      pruneIdempotencyMap(dedup);
-      const existing = dedup.get(idempotencyKey);
+      pruneIdempotencyMap(dedup!);
+      const existing = dedup!.get(idempotencyKey);
       if (existing) {
         log.info("prompt_deduplicated", {
           connectionId,
@@ -958,22 +1079,60 @@ export const createRouter = (deps: RouterDeps): Router => {
           stopReason: "idempotent_duplicate",
         }, {
           executionId: existing.executionId,
+          parentExecutionId: existing.parentExecutionId,
           turnId: existing.turnId,
           policySnapshotId,
         }));
         return;
       }
-      dedup.set(idempotencyKey, {
+      dedup!.set(idempotencyKey, {
         state: "running",
         turnId,
         executionId,
+        parentExecutionId,
       });
+    }
+
+    const executionCreatedAt = new Date().toISOString();
+    try {
+      stateStore.createExecution({
+        id: executionId,
+        sessionId: msg.sessionId,
+        turnId,
+        ...(parentExecutionId ? { parentExecutionId } : {}),
+        ...(idempotencyKey ? { idempotencyKey } : {}),
+        workspaceId,
+        principalType: principal.principalType,
+        principalId: principal.principalId,
+        source: principal.source,
+        runtimeId: session.runtimeId,
+        model: session.model,
+        policySnapshotId,
+        state: "queued",
+        createdAt: executionCreatedAt,
+        updatedAt: executionCreatedAt,
+      });
+      stateStore.transitionExecutionState(executionId, "running", {
+        updatedAt: executionCreatedAt,
+        startedAt: executionCreatedAt,
+      });
+    } catch (error) {
+      if (idempotencyKey) {
+        dedup?.delete(idempotencyKey);
+      }
+      emit({
+        type: "error",
+        sessionId: msg.sessionId,
+        message: error instanceof Error ? error.message : "Failed to create execution record.",
+      });
+      return;
     }
 
     log.info("prompt_received", {
       connectionId,
       sessionId: msg.sessionId,
       executionId,
+      parentExecutionId: parentExecutionId ?? null,
       turnId,
       policySnapshotId,
       principalType: principal.principalType,
@@ -989,7 +1148,6 @@ export const createRouter = (deps: RouterDeps): Router => {
     };
 
     // Record user prompt to transcript
-    const workspaceId = sessionWorkspaces.get(msg.sessionId) ?? defaultWorkspaceId;
     const promptRecordContent = imageInputs.length > 0
       ? `${msg.text}${msg.text ? "\n\n" : ""}${imageInputs.map((image) => `[image] ${image.url}`).join("\n")}`
       : msg.text;
@@ -1006,6 +1164,36 @@ export const createRouter = (deps: RouterDeps): Router => {
     let sawStreamedText = false;
     let assistantMessageForTurn = "";
     let turnCompleted = false;
+    let executionFinalized = false;
+    const finalizeExecution = (
+      state: ExecutionState,
+      options: {
+        stopReason?: string;
+        errorMessage?: string;
+      } = {},
+    ): void => {
+      if (executionFinalized) return;
+      executionFinalized = true;
+      try {
+        stateStore.transitionExecutionState(executionId, state, {
+          updatedAt: new Date().toISOString(),
+          completedAt: new Date().toISOString(),
+          ...(options.stopReason !== undefined ? { stopReason: options.stopReason } : {}),
+          ...(options.errorMessage !== undefined ? { errorMessage: options.errorMessage } : {}),
+        });
+      } catch (error) {
+        log.warn("execution_finalize_failed", {
+          connectionId,
+          sessionId: msg.sessionId,
+          executionId,
+          parentExecutionId: parentExecutionId ?? null,
+          turnId,
+          policySnapshotId,
+          state,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    };
     bumpInFlightTurns(msg.sessionId, 1);
     const recordingEmitWithHooks = createRecordingEmitter(workspaceId, msg.sessionId, stateStore, emitWithCorrelation, {
       onAnyEvent: (event) => {
@@ -1018,6 +1206,7 @@ export const createRouter = (deps: RouterDeps): Router => {
             tool: event.tool,
             detail: safeStringify({
               executionId,
+              parentExecutionId,
               turnId,
               policySnapshotId,
               principalType: principal.principalType,
@@ -1030,13 +1219,24 @@ export const createRouter = (deps: RouterDeps): Router => {
         if (event.type === "turn_end" && !turnCompleted) {
           turnCompleted = true;
           bumpInFlightTurns(msg.sessionId, -1);
+          finalizeExecution(
+            mapStopReasonToExecutionState(event.stopReason),
+            { stopReason: event.stopReason },
+          );
         }
       },
       onTextDelta: () => {
         sawStreamedText = true;
       },
       onApprovalRequest: (requestId) => {
-        trackPendingApproval(msg.sessionId, requestId, turnId, executionId, policySnapshotId);
+        trackPendingApproval(
+          msg.sessionId,
+          requestId,
+          turnId,
+          executionId,
+          parentExecutionId,
+          policySnapshotId,
+        );
       },
       onAssistantMessage: (assistantText) => {
         assistantMessageForTurn = assistantText;
@@ -1095,6 +1295,7 @@ export const createRouter = (deps: RouterDeps): Router => {
           sessionId: msg.sessionId,
           runtimeId: session.runtimeId,
           executionId,
+          parentExecutionId: parentExecutionId ?? null,
           turnId,
           policySnapshotId,
           payloadPreview: safeStringify(result ?? null).slice(0, 500),
@@ -1145,6 +1346,7 @@ export const createRouter = (deps: RouterDeps): Router => {
             state: "completed",
             turnId,
             executionId,
+            parentExecutionId,
             completedAtMs: Date.now(),
           });
         }
@@ -1173,6 +1375,9 @@ export const createRouter = (deps: RouterDeps): Router => {
         if (idempotencyKey) {
           sessionIdempotency.get(msg.sessionId)?.delete(idempotencyKey);
         }
+        finalizeExecution("failed", {
+          errorMessage: err instanceof Error ? err.message : "Unknown error",
+        });
         if (!turnCompleted) {
           turnCompleted = true;
           bumpInFlightTurns(msg.sessionId, -1);
@@ -1183,6 +1388,7 @@ export const createRouter = (deps: RouterDeps): Router => {
           sessionId: msg.sessionId,
           runtimeId: session.runtimeId,
           executionId,
+          parentExecutionId: parentExecutionId ?? null,
           turnId,
           policySnapshotId,
           error: err instanceof Error ? err.message : "Unknown error",
@@ -1193,6 +1399,7 @@ export const createRouter = (deps: RouterDeps): Router => {
           type: "error",
           detail: safeStringify({
             executionId,
+            parentExecutionId,
             turnId,
             policySnapshotId,
             principalType: principal.principalType,
@@ -1331,6 +1538,7 @@ export const createRouter = (deps: RouterDeps): Router => {
       runtimeId: session.runtimeId,
       turnId: requestMeta.turnId ?? null,
       executionId: requestMeta.executionId ?? null,
+      parentExecutionId: requestMeta.parentExecutionId ?? null,
       policySnapshotId: requestMeta.policySnapshotId ?? policySnapshotId,
       requestId: msg.requestId,
       optionId,
@@ -1344,6 +1552,7 @@ export const createRouter = (deps: RouterDeps): Router => {
         optionId,
         allow,
         executionId: requestMeta.executionId ?? null,
+        parentExecutionId: requestMeta.parentExecutionId ?? null,
         turnId: requestMeta.turnId ?? null,
         policySnapshotId: requestMeta.policySnapshotId ?? policySnapshotId,
         principalType: principal.principalType,
@@ -1563,7 +1772,10 @@ export const createRouter = (deps: RouterDeps): Router => {
     connectionPrincipals.delete(connectionId);
     const challenge = authChallenges.get(connectionId);
     if (challenge) {
-      consumedAuthChallenges.add(`${connectionId}:${challenge.nonce}`);
+      consumedAuthChallenges.set(
+        `${connectionId}:${challenge.id}`,
+        Date.now() + CONSUMED_AUTH_CHALLENGE_TTL_MS,
+      );
       authChallenges.delete(connectionId);
     }
 
