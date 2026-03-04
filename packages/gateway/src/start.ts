@@ -10,6 +10,7 @@ import type { AgentProcess } from "@nexus/acp-bridge";
 import { evaluatePolicy } from "@nexus/policy";
 import { createSqliteMemoryProvider, type MemoryProvider } from "@nexus/memory";
 import type { NexusConfig, RuntimeHealthInfo, RuntimeHealthStatus, RuntimeProfile } from "@nexus/types";
+import { createChannelManager, createDiscordAdapter, createTelegramAdapter, type ChannelAdapterRegistration } from "@nexus/channels";
 import { createLogger } from "./logger.js";
 
 const inferRuntimeId = (command: string[]): string => {
@@ -120,6 +121,7 @@ export const startGateway = async (configPath?: string) => {
   const runtimeAgents = new Map<string, { profile: RuntimeProfile; agent: AgentProcess }>();
   const runtimeHealth = new Map<string, RuntimeHealthInfo>();
   let routerRef: Router | null = null;
+  let channelManager: ReturnType<typeof createChannelManager> | null = null;
 
   const setRuntimeHealth = (
     runtimeId: string,
@@ -214,6 +216,63 @@ export const startGateway = async (configPath?: string) => {
       }
     }
     runtimeAgents.clear();
+  };
+
+  const createChannelRegistrations = (): ChannelAdapterRegistration[] => {
+    const channels = config.channels ?? {};
+    const registrations: ChannelAdapterRegistration[] = [];
+
+    for (const [channelId, channel] of Object.entries(channels)) {
+      if (channel.enabled === false) {
+        log.info("channel_adapter_disabled", { channelId, kind: channel.kind });
+        continue;
+      }
+
+      if (channel.kind === "telegram") {
+        registrations.push({
+          adapter: createTelegramAdapter({
+            id: channelId,
+            botToken: channel.botToken,
+            apiBaseUrl: channel.apiBaseUrl,
+            pollTimeoutSeconds: channel.pollTimeoutSeconds,
+            pollIntervalMs: channel.pollIntervalMs,
+            allowedChatIds: channel.allowedChatIds,
+          }),
+          route: {
+            runtimeId: channel.runtimeId,
+            model: channel.model,
+            workspaceId: channel.workspaceId,
+            source: "api",
+            principalType: "user",
+            typingIndicator: channel.typingIndicator,
+            streamingMode: channel.streamingMode,
+          },
+        });
+        continue;
+      }
+
+      if (channel.kind === "discord") {
+        registrations.push({
+          adapter: createDiscordAdapter({
+            id: channelId,
+            botToken: channel.botToken,
+            applicationId: channel.applicationId,
+            guildId: channel.guildId,
+          }),
+          route: {
+            runtimeId: channel.runtimeId,
+            model: channel.model,
+            workspaceId: channel.workspaceId,
+            source: "api",
+            principalType: "user",
+            typingIndicator: channel.typingIndicator,
+            streamingMode: channel.streamingMode,
+          },
+        });
+      }
+    }
+
+    return registrations;
   };
 
   // Spawn and initialize one ACP process per runtime profile.
@@ -457,10 +516,35 @@ export const startGateway = async (configPath?: string) => {
   // Keep a human-friendly line for terminal workflows and docs that parse this exact prefix.
   console.log(`[nexus] Connect via: ${connectUrl}`);
 
+  const channelRegistrations = createChannelRegistrations();
+  if (channelRegistrations.length > 0) {
+    const gatewayWsUrl = `ws://${config.host}:${port}/ws`;
+    channelManager = createChannelManager({
+      gatewayUrl: gatewayWsUrl,
+      token: config.auth.token,
+      adapters: channelRegistrations,
+      logger: {
+        debug: (message, fields) => log.debug(message, fields),
+        info: (message, fields) => log.info(message, fields),
+        warn: (message, fields) => log.warn(message, fields),
+        error: (message, fields) => log.error(message, fields),
+      },
+    });
+    await channelManager.start();
+    log.info("channel_manager_started", {
+      adapterCount: channelRegistrations.length,
+      adapterIds: channelRegistrations.map((registration) => registration.adapter.id),
+    });
+  }
+
   // Graceful shutdown
   const shutdown = async () => {
     log.info("gateway_shutdown_start");
     clearInterval(sweepTimer);
+    if (channelManager) {
+      await channelManager.stop();
+      channelManager = null;
+    }
     await server.stop();
     for (const runtimeProfileId of runtimeAgents.keys()) {
       log.info("runtime_stopping", { runtimeProfileId });

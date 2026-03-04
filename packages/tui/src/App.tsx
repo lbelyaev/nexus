@@ -7,6 +7,7 @@ import { Chat, type ChatMessage } from "./components/Chat.js";
 import { Input } from "./components/Input.js";
 import { ToolStatus } from "./components/ToolStatus.js";
 import { ApprovalPrompt } from "./components/ApprovalPrompt.js";
+import { TransferPrompt } from "./components/TransferPrompt.js";
 import { createTuiAuthProofProvider } from "./auth/provider.js";
 
 export interface AppProps {
@@ -45,6 +46,17 @@ const compact = (text: string, max: number = 110): string => {
   const cleaned = text.replace(/\s+/g, " ").trim();
   if (cleaned.length <= max) return cleaned;
   return `${cleaned.slice(0, max - 3)}...`;
+};
+
+const normalizePrincipalIdInput = (
+  principalId: string,
+  principalType: "user" | "service_account",
+): string => {
+  const duplicatedPrefix = `${principalType}:${principalType}:`;
+  if (principalId.startsWith(duplicatedPrefix)) {
+    return `${principalType}:${principalId.slice(duplicatedPrefix.length)}`;
+  }
+  return principalId;
 };
 
 const formatMemoryResult = (
@@ -335,6 +347,8 @@ export const App = ({ url, token }: AppProps) => {
     const activePrincipalType = session.sessionPrincipalType ?? "user";
     const activePrincipalId = session.sessionPrincipalId ?? "user:local";
     const activeSource = session.sessionSource ?? "interactive";
+    const authPrincipalType = session.authPrincipalType ?? "user";
+    const authPrincipalId = session.authPrincipalId ?? "(unverified)";
     const catalogRuntimes = Object.keys(session.modelCatalog).length;
     const catalogModels = Object.values(session.modelCatalog).reduce((acc, models) => acc + models.length, 0);
     const aliasCount = Object.keys(session.modelAliases).length + Object.keys(localAliases).length;
@@ -346,7 +360,8 @@ export const App = ({ url, token }: AppProps) => {
       { role: "system", text: `    connection=${status}` },
       { role: "system", text: `    session=${session.sessionId ?? "(none)"}` },
       { role: "system", text: `    workspace=${activeWorkspace}` },
-      { role: "system", text: `    principal=${activePrincipalType}:${activePrincipalId}` },
+      { role: "system", text: `    principal=${activePrincipalId} (type=${activePrincipalType})` },
+      { role: "system", text: `    auth_principal=${authPrincipalId} (type=${authPrincipalType})` },
       { role: "system", text: `    source=${activeSource}` },
       { role: "system", text: `    runtime=${activeRuntime}` },
       { role: "system", text: `    model=${activeModel}` },
@@ -384,6 +399,94 @@ export const App = ({ url, token }: AppProps) => {
     session.sessionWorkspaceId,
     status,
   ]);
+
+  const handleTransferCommand = useCallback(
+    (transferArg: string) => {
+      const parts = transferArg.trim().split(/\s+/).filter(Boolean);
+      const sub = parts[0]?.toLowerCase();
+
+      const pendingTransfers = session.pendingSessionTransfers.filter((transfer) => {
+        if (!session.authPrincipalId) return true;
+        const authType = session.authPrincipalType ?? "user";
+        return transfer.targetPrincipalId === session.authPrincipalId
+          && transfer.targetPrincipalType === authType;
+      });
+      const currentTransfer = pendingTransfers[0];
+
+      if (!sub || sub === "pending") {
+        if (pendingTransfers.length === 0) {
+          setMessages((prev) => [...prev, { role: "system", text: "  No pending transfer requests." }]);
+          return;
+        }
+        setMessages((prev) => [
+          ...prev,
+          { role: "system", text: `  Pending transfers (${pendingTransfers.length}):` },
+          ...pendingTransfers.map((transfer) => ({
+            role: "system" as const,
+            text: `    - session=${transfer.sessionId} from=${transfer.fromPrincipalType}:${transfer.fromPrincipalId} expires=${transfer.expiresAt}`,
+          })),
+        ]);
+        return;
+      }
+
+      if (sub === "request") {
+        const targetPrincipalRaw = parts[1];
+        const targetPrincipalTypeRaw = parts[2]?.toLowerCase();
+        const targetPrincipalType = targetPrincipalTypeRaw === "service_account" ? "service_account" : "user";
+        const expiresInMsRaw = parts[3];
+        let expiresInMs: number | undefined;
+
+        if (!targetPrincipalRaw) {
+          setMessages((prev) => [...prev, { role: "system", text: "  Usage: /transfer request <targetPrincipalId> [user|service_account] [expiresMs]" }]);
+          return;
+        }
+        if (expiresInMsRaw) {
+          const parsedExpiresInMs = Number.parseInt(expiresInMsRaw, 10);
+          if (!Number.isFinite(parsedExpiresInMs) || parsedExpiresInMs <= 0) {
+            setMessages((prev) => [...prev, { role: "system", text: "  Usage: /transfer request <targetPrincipalId> [user|service_account] [expiresMs]" }]);
+            return;
+          }
+          expiresInMs = parsedExpiresInMs;
+        }
+
+        const targetPrincipalId = normalizePrincipalIdInput(targetPrincipalRaw, targetPrincipalType);
+        session.requestSessionTransfer(targetPrincipalId, targetPrincipalType, expiresInMs);
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "system",
+            text: `  Transfer requested for current session -> ${targetPrincipalType}:${targetPrincipalId}${expiresInMs ? ` (ttl=${expiresInMs}ms)` : ""}`,
+          },
+        ]);
+        return;
+      }
+
+      if (sub === "accept") {
+        const explicitSessionId = parts[1] ?? currentTransfer?.sessionId;
+        if (!explicitSessionId) {
+          setMessages((prev) => [...prev, { role: "system", text: "  Usage: /transfer accept [sessionId]" }]);
+          return;
+        }
+        session.acceptSessionTransfer(explicitSessionId);
+        setMessages((prev) => [...prev, { role: "system", text: `  Accepting transfer for session ${explicitSessionId}...` }]);
+        return;
+      }
+
+      if (sub === "dismiss" || sub === "ignore") {
+        const explicitSessionId = parts[1] ?? currentTransfer?.sessionId;
+        if (!explicitSessionId) {
+          setMessages((prev) => [...prev, { role: "system", text: "  Usage: /transfer dismiss [sessionId]" }]);
+          return;
+        }
+        session.dismissPendingSessionTransfer(explicitSessionId);
+        setMessages((prev) => [...prev, { role: "system", text: `  Dismissed transfer prompt for session ${explicitSessionId}.` }]);
+        return;
+      }
+
+      setMessages((prev) => [...prev, { role: "system", text: "  Usage: /transfer pending | request <targetPrincipalId> [user|service_account] [expiresMs] | accept [sessionId] | dismiss [sessionId]" }]);
+    },
+    [session],
+  );
 
   const parseMemoryScope = (
     value: string | undefined,
@@ -591,6 +694,11 @@ export const App = ({ url, token }: AppProps) => {
         return;
       }
 
+      if (text.startsWith("/transfer")) {
+        handleTransferCommand(text.replace("/transfer", ""));
+        return;
+      }
+
       if (text.startsWith("/memory")) {
         handleMemoryCommand(text.replace("/memory", ""));
         return;
@@ -613,7 +721,7 @@ export const App = ({ url, token }: AppProps) => {
         session.sendPrompt(text);
       }
     },
-    [handleAliasCommand, handleMemoryCommand, handleModelCommand, handleModelsCommand, handleRuntimeCommand, handleStatusCommand, handleWorkspaceCommand, session],
+    [handleAliasCommand, handleMemoryCommand, handleModelCommand, handleModelsCommand, handleRuntimeCommand, handleStatusCommand, handleTransferCommand, handleWorkspaceCommand, session],
   );
 
   const handleCancelTurn = useCallback(() => {
@@ -624,6 +732,13 @@ export const App = ({ url, token }: AppProps) => {
   }, [session.cancel, session.isStreaming]);
 
   const currentApproval = approval.pendingApprovals[0] ?? null;
+  const pendingTransfers = session.pendingSessionTransfers.filter((transfer) => {
+    if (!session.authPrincipalId) return true;
+    const authType = session.authPrincipalType ?? "user";
+    return transfer.targetPrincipalId === session.authPrincipalId
+      && transfer.targetPrincipalType === authType;
+  });
+  const currentTransfer = pendingTransfers[0] ?? null;
 
   const handleApprove = useCallback(() => {
     if (currentApproval) {
@@ -677,10 +792,24 @@ export const App = ({ url, token }: AppProps) => {
         onCancel={handleCancelTurn}
         canCancel={session.isStreaming}
       />
+      <TransferPrompt
+        transfer={currentTransfer}
+        totalPending={pendingTransfers.length}
+        onAccept={() => {
+          if (!currentTransfer) return;
+          session.acceptSessionTransfer(currentTransfer.sessionId);
+          setMessages((prev) => [...prev, { role: "system", text: `  Accepting transfer for session ${currentTransfer.sessionId}...` }]);
+        }}
+        onDismiss={() => {
+          if (!currentTransfer) return;
+          session.dismissPendingSessionTransfer(currentTransfer.sessionId);
+          setMessages((prev) => [...prev, { role: "system", text: `  Dismissed transfer prompt for session ${currentTransfer.sessionId}.` }]);
+        }}
+      />
       <Input
         onSubmit={handleSubmit}
         isDisabled={!session.sessionId}
-        isFocused={!currentApproval}
+        isFocused={!currentApproval && !currentTransfer}
         onCancel={handleCancelTurn}
         canCancel={session.isStreaming && !currentApproval}
       />
@@ -688,7 +817,7 @@ export const App = ({ url, token }: AppProps) => {
         <Text color="gray">Enter = steer, Esc = cancel current turn</Text>
       ) : null}
       {!session.isStreaming ? (
-        <Text color="gray">Commands: /workspace &lt;id&gt;, /runtime &lt;id&gt;, /model &lt;name&gt;, /models, /alias &lt;nick&gt; &lt;model-id&gt;, /status, /memory ..., /close</Text>
+        <Text color="gray">Commands: /workspace &lt;id&gt;, /runtime &lt;id&gt;, /model &lt;name&gt;, /models, /alias &lt;nick&gt; &lt;model-id&gt;, /status, /transfer ..., /memory ..., /close</Text>
       ) : null}
     </Box>
   );

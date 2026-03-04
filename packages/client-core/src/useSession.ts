@@ -23,6 +23,7 @@ export interface MemoryQueryInput {
 }
 
 export type MemoryResultEvent = Extract<GatewayEvent, { type: "memory_result" }>;
+export type SessionTransferRequestedEvent = Extract<GatewayEvent, { type: "session_transfer_requested" }>;
 
 const createToolMatcher = (
   event: Extract<GatewayEvent, { type: "tool_end" }>,
@@ -64,6 +65,7 @@ export interface UseSessionResult {
   authStatus: "unverified" | "verifying" | "verified" | "failed";
   authPrincipalType: "user" | "service_account" | null;
   authPrincipalId: string | null;
+  pendingSessionTransfers: SessionTransferRequestedEvent[];
   responseText: string;
   thinkingText: string;
   isStreaming: boolean;
@@ -84,6 +86,7 @@ export interface UseSessionResult {
     sessionId?: string,
   ) => void;
   acceptSessionTransfer: (sessionId?: string) => void;
+  dismissPendingSessionTransfer: (sessionId?: string) => void;
   requestMemory: (query: MemoryQueryInput) => void;
   handleEvent: (event: GatewayEvent) => void;
 }
@@ -106,6 +109,7 @@ export const useSession = (
   const [authStatus, setAuthStatus] = useState<"unverified" | "verifying" | "verified" | "failed">("unverified");
   const [authPrincipalType, setAuthPrincipalType] = useState<"user" | "service_account" | null>(null);
   const [authPrincipalId, setAuthPrincipalId] = useState<string | null>(null);
+  const [pendingSessionTransfers, setPendingSessionTransfers] = useState<SessionTransferRequestedEvent[]>([]);
   const [responseText, setResponseText] = useState("");
   const [thinkingText, setThinkingText] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
@@ -198,6 +202,7 @@ export const useSession = (
         setModelAliases(event.modelAliases ?? {});
         setModelCatalog(event.modelCatalog ?? {});
         setRuntimeDefaults(event.runtimeDefaults ?? {});
+        setPendingSessionTransfers([]);
         break;
       case "session_closed":
         if (event.sessionId === sessionId) {
@@ -223,6 +228,7 @@ export const useSession = (
           setToolCalls([]);
           setError(null);
         }
+        setPendingSessionTransfers((prev) => prev.filter((transfer) => transfer.sessionId !== event.sessionId));
         break;
       case "runtime_health":
         setRuntimeHealth((prev) => ({
@@ -246,6 +252,49 @@ export const useSession = (
           setAuthStatus("failed");
         }
         break;
+      case "session_transfer_requested":
+        setPendingSessionTransfers((prev) => {
+          const existingIndex = prev.findIndex((transfer) => transfer.sessionId === event.sessionId);
+          if (existingIndex >= 0) {
+            const next = [...prev];
+            next[existingIndex] = event;
+            return next;
+          }
+          return [...prev, event];
+        });
+        break;
+      case "session_transferred": {
+        setPendingSessionTransfers((prev) => prev.filter((transfer) => transfer.sessionId !== event.sessionId));
+        const isTarget =
+          authStatus === "verified"
+          && authPrincipalId !== null
+          && authPrincipalType !== null
+          && event.targetPrincipalId === authPrincipalId
+          && event.targetPrincipalType === authPrincipalType;
+
+        if (isTarget) {
+          queuedSteerRef.current = null;
+          ignoreCancelledTurnEndRef.current = false;
+          textBufferRef.current = "";
+          thinkingBufferRef.current = "";
+          if (flushTimerRef.current) {
+            clearTimeout(flushTimerRef.current);
+            flushTimerRef.current = null;
+          }
+          setResponseText("");
+          setThinkingText("");
+          setIsStreaming(false);
+          setActiveTools([]);
+          setToolCalls([]);
+          setError(null);
+          setSessionId(event.sessionId);
+          setSessionPrincipalType(event.targetPrincipalType);
+          setSessionPrincipalId(event.targetPrincipalId);
+          setSessionSource("interactive");
+          sendMessage({ type: "session_replay", sessionId: event.sessionId });
+        }
+        break;
+      }
       case "text_delta":
         ignoreCancelledTurnEndRef.current = false;
         textBufferRef.current += event.delta;
@@ -334,7 +383,16 @@ export const useSession = (
         setError(event.message);
         break;
     }
-  }, [sessionId, sendPromptInternal]);
+  }, [
+    authPrincipalId,
+    authPrincipalType,
+    authStatus,
+    flushBuffers,
+    scheduleFlush,
+    sendMessage,
+    sendPromptInternal,
+    sessionId,
+  ]);
 
   const sendPrompt = useCallback(
     (text: string) => {
@@ -395,14 +453,23 @@ export const useSession = (
 
   const acceptSessionTransfer = useCallback(
     (explicitSessionId?: string) => {
-      const sid = explicitSessionId ?? sessionId;
+      const sid = explicitSessionId ?? pendingSessionTransfers[0]?.sessionId ?? sessionId;
       if (!sid) return;
       sendMessage({
         type: "session_transfer_accept",
         sessionId: sid,
       });
     },
-    [sendMessage, sessionId],
+    [pendingSessionTransfers, sendMessage, sessionId],
+  );
+
+  const dismissPendingSessionTransfer = useCallback(
+    (explicitSessionId?: string) => {
+      const sid = explicitSessionId ?? pendingSessionTransfers[0]?.sessionId;
+      if (!sid) return;
+      setPendingSessionTransfers((prev) => prev.filter((transfer) => transfer.sessionId !== sid));
+    },
+    [pendingSessionTransfers],
   );
 
   const requestMemory = useCallback(
@@ -445,6 +512,7 @@ export const useSession = (
     authStatus,
     authPrincipalType,
     authPrincipalId,
+    pendingSessionTransfers,
     responseText,
     thinkingText,
     isStreaming,
@@ -460,6 +528,7 @@ export const useSession = (
     requestReplay,
     requestSessionTransfer,
     acceptSessionTransfer,
+    dismissPendingSessionTransfer,
     requestMemory,
     handleEvent,
   };

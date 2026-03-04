@@ -21,6 +21,36 @@ export interface MemoryConfig {
   summaryWindowMessages?: number;
 }
 
+export interface ChannelBaseConfig {
+  kind: "telegram" | "discord";
+  enabled?: boolean;
+  runtimeId?: string;
+  model?: string;
+  workspaceId?: string;
+  typingIndicator?: boolean;
+  streamingMode?: "off" | "edit";
+}
+
+export interface TelegramChannelConfig extends ChannelBaseConfig {
+  kind: "telegram";
+  botToken: string;
+  apiBaseUrl?: string;
+  pollTimeoutSeconds?: number;
+  pollIntervalMs?: number;
+  allowedChatIds?: string[];
+}
+
+export interface DiscordChannelConfig extends ChannelBaseConfig {
+  kind: "discord";
+  botToken: string;
+  applicationId?: string;
+  guildId?: string;
+}
+
+export type ChannelConfig =
+  | TelegramChannelConfig
+  | DiscordChannelConfig;
+
 export interface NexusConfig {
   port: number;
   host: string;
@@ -37,5 +67,6 @@ export interface NexusConfig {
   wsPingIntervalMs?: number;
   wsPongGraceMs?: number;
   memory?: MemoryConfig;
+  channels?: Record<string, ChannelConfig>;
   dataDir: string;
 }

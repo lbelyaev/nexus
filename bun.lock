@@ -22,6 +22,19 @@
         "vitest": "^3",
       },
     },
+    "packages/channels": {
+      "name": "@nexus/channels",
+      "version": "0.0.1",
+      "dependencies": {
+        "@nexus/types": "workspace:*",
+        "ws": "^8",
+      },
+      "devDependencies": {
+        "@types/ws": "^8",
+        "typescript": "^5.7",
+        "vitest": "^3",
+      },
+    },
     "packages/cli": {
       "name": "@nexus/cli",
       "version": "0.0.1",
@@ -59,6 +72,7 @@
       "version": "0.0.1",
       "dependencies": {
         "@nexus/acp-bridge": "workspace:*",
+        "@nexus/channels": "workspace:*",
         "@nexus/memory": "workspace:*",
         "@nexus/policy": "workspace:*",
         "@nexus/state": "workspace:*",
@@ -317,6 +331,8 @@
     "@next/swc-win32-x64-msvc": ["@next/swc-win32-x64-msvc@14.2.33", "", { "os": "win32", "cpu": "x64" }, "sha512-nOjfZMy8B94MdisuzZo9/57xuFVLHJaDj5e/xrduJp9CV2/HrfxTRH2fbyLe+K9QT41WBLUd4iXX3R7jBp0EUg=="],
 
     "@nexus/acp-bridge": ["@nexus/acp-bridge@workspace:packages/acp-bridge"],
+
+    "@nexus/channels": ["@nexus/channels@workspace:packages/channels"],
 
     "@nexus/cli": ["@nexus/cli@workspace:packages/cli"],
 

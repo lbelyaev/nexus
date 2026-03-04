@@ -37,6 +37,7 @@ describe("useSession", () => {
     expect(result.current.activeTools).toEqual([]);
     expect(result.current.error).toBeNull();
     expect(result.current.memoryResults).toEqual([]);
+    expect(result.current.pendingSessionTransfers).toEqual([]);
   });
 
   it("sets sessionId on session_created event", () => {
@@ -640,6 +641,100 @@ describe("useSession", () => {
     expect(sendMessage).toHaveBeenCalledWith({
       type: "session_replay",
       sessionId: "sess-42",
+    });
+  });
+
+  it("requestSessionTransfer targets current session by default", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_created",
+        sessionId: "sess-42",
+        model: "claude-4",
+      });
+    });
+
+    act(() => {
+      result.current.requestSessionTransfer("user:tui:abc");
+    });
+
+    expect(sendMessage).toHaveBeenCalledWith({
+      type: "session_transfer_request",
+      sessionId: "sess-42",
+      targetPrincipalId: "user:tui:abc",
+      targetPrincipalType: "user",
+    });
+  });
+
+  it("acceptSessionTransfer uses first pending transfer when explicit session is not provided", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "auth_result",
+        ok: true,
+        principalType: "user",
+        principalId: "user:tui:abc",
+      });
+      result.current.handleEvent({
+        type: "session_transfer_requested",
+        sessionId: "sess-xfer",
+        fromPrincipalType: "user",
+        fromPrincipalId: "user:web:xyz",
+        targetPrincipalType: "user",
+        targetPrincipalId: "user:tui:abc",
+        expiresAt: "2026-01-01T00:00:00Z",
+      });
+    });
+
+    act(() => {
+      result.current.acceptSessionTransfer();
+    });
+
+    expect(sendMessage).toHaveBeenCalledWith({
+      type: "session_transfer_accept",
+      sessionId: "sess-xfer",
+    });
+  });
+
+  it("session_transferred to authenticated principal switches active session and requests replay", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "auth_result",
+        ok: true,
+        principalType: "user",
+        principalId: "user:tui:abc",
+      });
+      result.current.handleEvent({
+        type: "session_created",
+        sessionId: "sess-old",
+        model: "claude-4",
+      });
+    });
+    sendMessage.mockClear();
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_transferred",
+        sessionId: "sess-new",
+        fromPrincipalType: "user",
+        fromPrincipalId: "user:web:xyz",
+        targetPrincipalType: "user",
+        targetPrincipalId: "user:tui:abc",
+        transferredAt: "2026-01-01T00:00:01Z",
+      });
+    });
+
+    expect(result.current.sessionId).toBe("sess-new");
+    expect(sendMessage).toHaveBeenCalledWith({
+      type: "session_replay",
+      sessionId: "sess-new",
     });
   });
 

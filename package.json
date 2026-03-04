@@ -13,7 +13,7 @@
     "gateway:dev:multi": "NEXUS_CONFIG=../../config/nexus.multi.json bun run --filter=@nexus/gateway dev",
     "gateway:dev:codex": "NEXUS_CONFIG=../../config/nexus.codex.json bun run --filter=@nexus/gateway dev",
     "cli:dev": "bun run --filter=@nexus/cli dev",
-    "tui:dev": "bun run --filter=@nexus/tui dev",
+    "tui:dev": "cd packages/tui && bun run dev",
     "web:dev": "bun run --filter=@nexus/web-client dev",
     "web:build": "bun run --filter=@nexus/web-client build",
     "lint": "turbo run lint",

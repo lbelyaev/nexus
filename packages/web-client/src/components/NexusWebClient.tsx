@@ -41,6 +41,17 @@ const compact = (text: string, max: number = 120): string => {
   return `${cleaned.slice(0, max - 3)}...`;
 };
 
+const normalizePrincipalIdInput = (
+  principalId: string,
+  principalType: "user" | "service_account",
+): string => {
+  const duplicatedPrefix = `${principalType}:${principalType}:`;
+  if (principalId.startsWith(duplicatedPrefix)) {
+    return `${principalType}:${principalId.slice(duplicatedPrefix.length)}`;
+  }
+  return principalId;
+};
+
 const formatMemoryResult = (event: MemoryResultEvent): ChatMessage[] => {
   const scopeLabel = `scope=${event.scope}`;
 
@@ -408,7 +419,10 @@ const ConnectedClient = ({
           appendSystem(`workspace=${session.sessionWorkspaceId ?? preferredWorkspaceId}`);
           appendSystem(`runtime=${session.sessionRuntimeId ?? preferredRuntimeId ?? "default"}`);
           appendSystem(`model=${session.sessionModel ?? preferredModel ?? "default"}`);
+          appendSystem(`principal=${session.sessionPrincipalId ?? "(none)"} (type=${session.sessionPrincipalType ?? "user"})`);
+          appendSystem(`auth_principal=${session.authPrincipalId ?? "(unverified)"} (type=${session.authPrincipalType ?? "user"})`);
           appendSystem(`streaming=${session.isStreaming ? "yes" : "no"}, approvals=${approval.pendingApprovals.length}, activeTools=${session.activeTools.length}`);
+          appendSystem(`pending_transfers=${session.pendingSessionTransfers.length}`);
           setPromptInput("");
           return;
         }
@@ -512,7 +526,88 @@ const ConnectedClient = ({
           return;
         }
 
-        appendSystem("Unknown local command. Use /status, /models, /runtime, /model, /workspace, /cancel, /close.");
+        if (normalized === "transfer") {
+          const sub = restParts[0]?.toLowerCase();
+          const pendingTransfers = session.pendingSessionTransfers.filter((transfer) => {
+            if (!session.authPrincipalId) return true;
+            const authType = session.authPrincipalType ?? "user";
+            return transfer.targetPrincipalId === session.authPrincipalId
+              && transfer.targetPrincipalType === authType;
+          });
+          const currentTransfer = pendingTransfers[0];
+
+          if (!sub || sub === "pending") {
+            if (pendingTransfers.length === 0) {
+              appendSystem("No pending transfer requests.");
+            } else {
+              appendSystem(`Pending transfers (${pendingTransfers.length}):`);
+              for (const transfer of pendingTransfers) {
+                appendSystem(`- session=${transfer.sessionId} from=${transfer.fromPrincipalType}:${transfer.fromPrincipalId} expires=${transfer.expiresAt}`);
+              }
+            }
+            setPromptInput("");
+            return;
+          }
+
+          if (sub === "request") {
+            const targetPrincipalRaw = restParts[1];
+            const targetPrincipalTypeRaw = restParts[2]?.toLowerCase();
+            const targetPrincipalType = targetPrincipalTypeRaw === "service_account" ? "service_account" : "user";
+            const expiresInMsRaw = restParts[3];
+            let expiresInMs: number | undefined;
+            if (!targetPrincipalRaw) {
+              appendSystem("Usage: /transfer request <targetPrincipalId> [user|service_account] [expiresMs]");
+              setPromptInput("");
+              return;
+            }
+            if (expiresInMsRaw) {
+              const parsedExpiresInMs = Number.parseInt(expiresInMsRaw, 10);
+              if (!Number.isFinite(parsedExpiresInMs) || parsedExpiresInMs <= 0) {
+                appendSystem("Usage: /transfer request <targetPrincipalId> [user|service_account] [expiresMs]");
+                setPromptInput("");
+                return;
+              }
+              expiresInMs = parsedExpiresInMs;
+            }
+            const targetPrincipalId = normalizePrincipalIdInput(targetPrincipalRaw, targetPrincipalType);
+            session.requestSessionTransfer(targetPrincipalId, targetPrincipalType, expiresInMs);
+            appendSystem(`Transfer requested for current session -> ${targetPrincipalType}:${targetPrincipalId}${expiresInMs ? ` (ttl=${expiresInMs}ms)` : ""}`);
+            setPromptInput("");
+            return;
+          }
+
+          if (sub === "accept") {
+            const sid = restParts[1] ?? currentTransfer?.sessionId;
+            if (!sid) {
+              appendSystem("Usage: /transfer accept [sessionId]");
+              setPromptInput("");
+              return;
+            }
+            session.acceptSessionTransfer(sid);
+            appendSystem(`Accepting transfer for session ${sid}...`);
+            setPromptInput("");
+            return;
+          }
+
+          if (sub === "dismiss" || sub === "ignore") {
+            const sid = restParts[1] ?? currentTransfer?.sessionId;
+            if (!sid) {
+              appendSystem("Usage: /transfer dismiss [sessionId]");
+              setPromptInput("");
+              return;
+            }
+            session.dismissPendingSessionTransfer(sid);
+            appendSystem(`Dismissed transfer prompt for session ${sid}.`);
+            setPromptInput("");
+            return;
+          }
+
+          appendSystem("Usage: /transfer pending | request <targetPrincipalId> [user|service_account] [expiresMs] | accept [sessionId] | dismiss [sessionId]");
+          setPromptInput("");
+          return;
+        }
+
+        appendSystem("Unknown local command. Use /status, /models, /runtime, /model, /workspace, /transfer, /cancel, /close.");
         setPromptInput("");
         return;
       }
@@ -571,6 +666,13 @@ const ConnectedClient = ({
   }, [aliasName, aliasTarget, appendSystem]);
 
   const currentApproval = approval.pendingApprovals[0] ?? null;
+  const pendingTransfers = session.pendingSessionTransfers.filter((transfer) => {
+    if (!session.authPrincipalId) return true;
+    const authType = session.authPrincipalType ?? "user";
+    return transfer.targetPrincipalId === session.authPrincipalId
+      && transfer.targetPrincipalType === authType;
+  });
+  const currentTransfer = pendingTransfers[0] ?? null;
 
   const handleApprove = useCallback(() => {
     if (!currentApproval) return;
@@ -910,6 +1012,38 @@ const ConnectedClient = ({
               <button type="button" className="button-warning" onClick={handleApproveAll}>Approve All</button>
               <button type="button" className="button-danger" onClick={handleDeny}>Reject</button>
               <button type="button" className="button-secondary" onClick={handleCancel} disabled={!session.isStreaming}>Cancel Turn</button>
+            </div>
+          </div>
+        ) : null}
+        {currentTransfer ? (
+          <div className="mb-3 mt-3 rounded-lg border border-yellow-400/45 bg-yellow-500/10 p-3">
+            <div className="text-sm font-semibold text-yellow-300">Session Transfer Requested ({pendingTransfers.length} pending)</div>
+            <div className="mt-1 text-sm text-yellow-50">Session: {currentTransfer.sessionId}</div>
+            <div className="mt-1 text-xs text-yellow-100/90">
+              From: {currentTransfer.fromPrincipalType}:{currentTransfer.fromPrincipalId}
+            </div>
+            <div className="mt-1 text-xs text-yellow-100/80">Expires: {currentTransfer.expiresAt}</div>
+            <div className="mt-2 flex flex-wrap gap-2">
+              <button
+                type="button"
+                className="button-warning"
+                onClick={() => {
+                  session.acceptSessionTransfer(currentTransfer.sessionId);
+                  appendSystem(`Accepting transfer for session ${currentTransfer.sessionId}...`);
+                }}
+              >
+                Accept
+              </button>
+              <button
+                type="button"
+                className="button-secondary"
+                onClick={() => {
+                  session.dismissPendingSessionTransfer(currentTransfer.sessionId);
+                  appendSystem(`Dismissed transfer prompt for session ${currentTransfer.sessionId}.`);
+                }}
+              >
+                Dismiss
+              </button>
             </div>
           </div>
         ) : null}

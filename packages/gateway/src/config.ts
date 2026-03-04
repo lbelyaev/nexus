@@ -1,6 +1,13 @@
 import { readFileSync, existsSync } from "node:fs";
 import { resolve, dirname, join } from "node:path";
-import type { MemoryConfig, NexusConfig, RuntimeProfile } from "@nexus/types";
+import type {
+  ChannelConfig,
+  DiscordChannelConfig,
+  MemoryConfig,
+  NexusConfig,
+  RuntimeProfile,
+  TelegramChannelConfig,
+} from "@nexus/types";
 import { generateToken } from "./auth.js";
 
 const DEFAULTS: Omit<NexusConfig, "runtime" | "auth"> & {
@@ -74,6 +81,7 @@ export const loadConfig = (configPath?: string): NexusConfig => {
     wsPingIntervalMs: raw.wsPingIntervalMs as number | undefined,
     wsPongGraceMs: raw.wsPongGraceMs as number | undefined,
     memory: raw.memory as MemoryConfig | undefined,
+    channels: raw.channels as Record<string, ChannelConfig> | undefined,
     dataDir: (raw.dataDir as string) ?? DEFAULTS.dataDir,
   };
 
@@ -169,6 +177,75 @@ export const loadConfig = (configPath?: string): NexusConfig => {
     }
     if (config.memory.enabled !== undefined && typeof config.memory.enabled !== "boolean") {
       throw new Error("Invalid config: memory.enabled must be a boolean");
+    }
+  }
+
+  if (config.channels) {
+    const availableRuntimeIds = new Set<string>([
+      ...(config.runtimes ? Object.keys(config.runtimes) : []),
+      ...(config.runtime ? ["default"] : []),
+    ]);
+    for (const [channelId, channel] of Object.entries(config.channels)) {
+      if (typeof channel !== "object" || channel === null) {
+        throw new Error(`Invalid config: channels.${channelId} must be an object`);
+      }
+      if (channel.enabled !== undefined && typeof channel.enabled !== "boolean") {
+        throw new Error(`Invalid config: channels.${channelId}.enabled must be a boolean`);
+      }
+      if (channel.runtimeId !== undefined && (typeof channel.runtimeId !== "string" || !channel.runtimeId.trim())) {
+        throw new Error(`Invalid config: channels.${channelId}.runtimeId must be a non-empty string`);
+      }
+      if (channel.runtimeId !== undefined && !availableRuntimeIds.has(channel.runtimeId)) {
+        throw new Error(`Invalid config: channels.${channelId}.runtimeId points to unknown runtime \"${channel.runtimeId}\"`);
+      }
+      if (channel.model !== undefined && (typeof channel.model !== "string" || !channel.model.trim())) {
+        throw new Error(`Invalid config: channels.${channelId}.model must be a non-empty string`);
+      }
+      if (channel.workspaceId !== undefined && (typeof channel.workspaceId !== "string" || !channel.workspaceId.trim())) {
+        throw new Error(`Invalid config: channels.${channelId}.workspaceId must be a non-empty string`);
+      }
+      if (channel.typingIndicator !== undefined && typeof channel.typingIndicator !== "boolean") {
+        throw new Error(`Invalid config: channels.${channelId}.typingIndicator must be a boolean`);
+      }
+      if (
+        channel.streamingMode !== undefined
+        && channel.streamingMode !== "off"
+        && channel.streamingMode !== "edit"
+      ) {
+        throw new Error(`Invalid config: channels.${channelId}.streamingMode must be "off" or "edit"`);
+      }
+
+      if (channel.kind === "telegram") {
+        const telegram = channel as TelegramChannelConfig;
+        if (!telegram.botToken || typeof telegram.botToken !== "string") {
+          throw new Error(`Invalid config: channels.${channelId}.botToken is required for telegram`);
+        }
+        if (
+          telegram.allowedChatIds !== undefined
+          && (!Array.isArray(telegram.allowedChatIds) || telegram.allowedChatIds.some((id) => typeof id !== "string"))
+        ) {
+          throw new Error(`Invalid config: channels.${channelId}.allowedChatIds must be an array of strings`);
+        }
+        if (
+          telegram.pollTimeoutSeconds !== undefined
+          && (typeof telegram.pollTimeoutSeconds !== "number" || !Number.isFinite(telegram.pollTimeoutSeconds) || telegram.pollTimeoutSeconds <= 0)
+        ) {
+          throw new Error(`Invalid config: channels.${channelId}.pollTimeoutSeconds must be a positive number`);
+        }
+        if (
+          telegram.pollIntervalMs !== undefined
+          && (typeof telegram.pollIntervalMs !== "number" || !Number.isFinite(telegram.pollIntervalMs) || telegram.pollIntervalMs < 0)
+        ) {
+          throw new Error(`Invalid config: channels.${channelId}.pollIntervalMs must be a non-negative number`);
+        }
+      } else if (channel.kind === "discord") {
+        const discord = channel as DiscordChannelConfig;
+        if (!discord.botToken || typeof discord.botToken !== "string") {
+          throw new Error(`Invalid config: channels.${channelId}.botToken is required for discord`);
+        }
+      } else {
+        throw new Error(`Invalid config: channels.${channelId}.kind must be \"telegram\" or \"discord\"`);
+      }
     }
   }
 
