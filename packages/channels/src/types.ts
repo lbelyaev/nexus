@@ -18,9 +18,16 @@ export interface ChannelInboundMessage {
 export interface ChannelOutboundMessage {
   conversationId: string;
   text: string;
+  quickActions?: ChannelQuickAction[];
+}
+
+export interface ChannelQuickAction {
+  label: string;
+  command: string;
 }
 
 export type ChannelStreamingMode = "off" | "edit";
+export type ChannelSteeringMode = "off" | "on";
 
 export interface ChannelTypingState {
   conversationId: string;
@@ -41,6 +48,7 @@ export interface ChannelAdapterContext {
 
 export interface ChannelAdapter {
   id: string;
+  supportsQuickActions?: boolean;
   start: (context: ChannelAdapterContext) => Promise<void>;
   stop: () => Promise<void>;
   sendMessage: (message: ChannelOutboundMessage) => Promise<void>;
@@ -56,6 +64,7 @@ export interface ChannelRouteConfig {
   source?: PromptSource;
   typingIndicator?: boolean;
   streamingMode?: ChannelStreamingMode;
+  steeringMode?: ChannelSteeringMode;
 }
 
 export interface ChannelAdapterRegistration {

@@ -43,6 +43,20 @@ describe("validatePolicyConfig", () => {
     expect(errors).toEqual([]);
   });
 
+  it("returns empty array for valid principal/source scoped rule", () => {
+    const errors = validatePolicyConfig({
+      rules: [{
+        tool: "Write",
+        action: "deny",
+        principalType: "service_account",
+        principalIdPattern: "discord-main",
+        source: "api",
+        workspaceIdPattern: "sandbox",
+      }],
+    });
+    expect(errors).toEqual([]);
+  });
+
   it("returns errors for missing rules", () => {
     const errors = validatePolicyConfig({});
     expect(errors.length).toBeGreaterThan(0);
@@ -56,6 +70,20 @@ describe("validatePolicyConfig", () => {
   it("returns errors for invalid action values", () => {
     const errors = validatePolicyConfig({
       rules: [{ tool: "Read", action: "permit" }],
+    });
+    expect(errors.length).toBeGreaterThan(0);
+  });
+
+  it("returns errors for invalid principalType", () => {
+    const errors = validatePolicyConfig({
+      rules: [{ tool: "Read", action: "allow", principalType: "admin" }],
+    });
+    expect(errors.length).toBeGreaterThan(0);
+  });
+
+  it("returns errors for invalid source", () => {
+    const errors = validatePolicyConfig({
+      rules: [{ tool: "Read", action: "allow", source: "discord" }],
     });
     expect(errors.length).toBeGreaterThan(0);
   });

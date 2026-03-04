@@ -214,6 +214,13 @@ export const loadConfig = (configPath?: string): NexusConfig => {
       ) {
         throw new Error(`Invalid config: channels.${channelId}.streamingMode must be "off" or "edit"`);
       }
+      if (
+        channel.steeringMode !== undefined
+        && channel.steeringMode !== "off"
+        && channel.steeringMode !== "on"
+      ) {
+        throw new Error(`Invalid config: channels.${channelId}.steeringMode must be "off" or "on"`);
+      }
 
       if (channel.kind === "telegram") {
         const telegram = channel as TelegramChannelConfig;
@@ -242,6 +249,12 @@ export const loadConfig = (configPath?: string): NexusConfig => {
         const discord = channel as DiscordChannelConfig;
         if (!discord.botToken || typeof discord.botToken !== "string") {
           throw new Error(`Invalid config: channels.${channelId}.botToken is required for discord`);
+        }
+        if (
+          discord.allowedUserIds !== undefined
+          && (!Array.isArray(discord.allowedUserIds) || discord.allowedUserIds.some((id) => typeof id !== "string"))
+        ) {
+          throw new Error(`Invalid config: channels.${channelId}.allowedUserIds must be an array of strings`);
         }
       } else {
         throw new Error(`Invalid config: channels.${channelId}.kind must be \"telegram\" or \"discord\"`);

@@ -3,7 +3,13 @@ import { createStateStore, type StateStore } from "@nexus/state";
 import type { PolicyConfig, GatewayEvent, ClientMessage } from "@nexus/types";
 import type { MemoryProvider } from "@nexus/memory";
 import { generateKeyPairSync, sign } from "node:crypto";
-import { createRouter, type Router, type EventEmitter, type ManagedAcpSession } from "../router.js";
+import {
+  createRouter,
+  type Router,
+  type EventEmitter,
+  type ManagedAcpSession,
+  type SessionPolicyContext,
+} from "../router.js";
 
 const mockAcpSession = (): ManagedAcpSession => ({
   id: "gw-session-1",
@@ -87,7 +93,7 @@ describe("createRouter", () => {
       recordTurn: vi.fn(),
       clear: vi.fn(() => 0),
     };
-    createAcpSessionMock = vi.fn(async (_runtimeId, _model, _onEvent: EventEmitter) => acpSession);
+    createAcpSessionMock = vi.fn(async (_runtimeId, _model, _onEvent: EventEmitter, _policyContext) => acpSession);
     router = createRouter({
       createAcpSession: createAcpSessionMock,
       stateStore,
@@ -140,7 +146,12 @@ describe("createRouter", () => {
       expect(events).toHaveLength(1);
     });
 
-    expect(createAcpSessionMock).toHaveBeenCalledWith("codex", "gpt-5", emit);
+    expect(createAcpSessionMock).toHaveBeenCalledWith("codex", "gpt-5", emit, {
+      principalType: "user",
+      principalId: "user:local",
+      source: "interactive",
+      workspaceId: "default",
+    });
   });
 
   it("session_new uses provided workspaceId", async () => {
@@ -175,6 +186,12 @@ describe("createRouter", () => {
     expect(event.principalType).toBe("service_account");
     expect(event.principalId).toBe("svc:nightly");
     expect(event.source).toBe("schedule");
+    expect(createAcpSessionMock).toHaveBeenCalledWith(undefined, undefined, emit, {
+      principalType: "service_account",
+      principalId: "svc:nightly",
+      source: "schedule",
+      workspaceId: "default",
+    });
   });
 
   it("auth_proof binds a verified principal that session_new reuses", async () => {
@@ -501,6 +518,9 @@ describe("createRouter", () => {
     await vi.waitFor(() => {
       expect(owner.events.some((event) => event.type === "session_created")).toBe(true);
     });
+    const policyContext = createAcpSessionMock.mock.calls.at(-1)?.[3] as SessionPolicyContext | undefined;
+    expect(policyContext).toBeDefined();
+    expect(policyContext?.principalId).toBe("user:alice");
     const created = owner.events.find((event) => event.type === "session_created");
     if (!created || created.type !== "session_created") throw new Error("expected session_created");
 
@@ -525,6 +545,9 @@ describe("createRouter", () => {
 
     expect(target.events.some((event) => event.type === "session_transferred")).toBe(true);
     expect(owner.events.some((event) => event.type === "session_transferred")).toBe(true);
+    expect(policyContext?.principalId).toBe("user:bob");
+    expect(policyContext?.principalType).toBe("user");
+    expect(policyContext?.source).toBe("interactive");
 
     owner.events.length = 0;
     target.events.length = 0;

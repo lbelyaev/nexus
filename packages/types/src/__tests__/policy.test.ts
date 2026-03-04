@@ -7,6 +7,14 @@ describe("isPolicyConfig", () => {
       rules: [
         { tool: "Read", action: "allow" },
         { tool: "Exec", pattern: "rm -rf", action: "deny" },
+        {
+          tool: "Bash",
+          action: "deny",
+          principalType: "service_account",
+          principalIdPattern: "discord-main",
+          source: "api",
+          workspaceIdPattern: "public",
+        },
         { tool: "*", action: "ask" },
       ],
     })).toBe(true);
@@ -31,6 +39,14 @@ describe("isPolicyConfig", () => {
 
   it("rejects rules with missing tool", () => {
     expect(isPolicyConfig({ rules: [{ action: "allow" }] })).toBe(false);
+  });
+
+  it("rejects rules with invalid principalType", () => {
+    expect(isPolicyConfig({ rules: [{ tool: "Bash", action: "deny", principalType: "admin" }] })).toBe(false);
+  });
+
+  it("rejects rules with invalid source", () => {
+    expect(isPolicyConfig({ rules: [{ tool: "Bash", action: "deny", source: "slack" }] })).toBe(false);
   });
 
   it("rejects null", () => {

@@ -90,7 +90,7 @@ describe("E2E: WS client -> Gateway -> mock ACP session -> events back", () => {
     stateStore = createStateStore(":memory:");
 
     const router = createRouter({
-      createAcpSession: async (_runtimeId, _model, _onEvent: EventEmitter) => {
+      createAcpSession: async (_runtimeId, _model, _onEvent: EventEmitter, _policyContext) => {
         sessionCounter += 1;
         return createMockAcpSession(`gw-session-${sessionCounter}`);
       },

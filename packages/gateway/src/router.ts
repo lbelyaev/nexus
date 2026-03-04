@@ -27,11 +27,19 @@ export interface ManagedAcpSession extends AcpSession {
   runtimeDefaults?: Record<string, string>;
 }
 
+export interface SessionPolicyContext {
+  principalType: PrincipalType;
+  principalId: string;
+  source: PromptSource;
+  workspaceId: string;
+}
+
 export interface RouterDeps {
   createAcpSession: (
     runtimeId: string | undefined,
     model: string | undefined,
     onEvent: EventEmitter,
+    policyContext?: SessionPolicyContext,
   ) => Promise<ManagedAcpSession>;
   stateStore: StateStore;
   policyConfig: PolicyConfig;
@@ -262,6 +270,7 @@ export const createRouter = (deps: RouterDeps): Router => {
     principalId: string;
     source: PromptSource;
   }>();
+  const sessionPolicyContexts = new Map<string, SessionPolicyContext>();
   const sessionLastActivityMs = new Map<string, number>();
   const sessionInFlightTurns = new Map<string, number>();
   const sessionOwners = new Map<string, EventEmitter>();
@@ -394,6 +403,7 @@ export const createRouter = (deps: RouterDeps): Router => {
     sessions.delete(sessionId);
     sessionWorkspaces.delete(sessionId);
     sessionPrincipals.delete(sessionId);
+    sessionPolicyContexts.delete(sessionId);
     sessionOwners.delete(sessionId);
     sessionLastActivityMs.delete(sessionId);
     sessionInFlightTurns.delete(sessionId);
@@ -502,7 +512,13 @@ export const createRouter = (deps: RouterDeps): Router => {
       ? connectionPrincipal.principalId
       : (requestedPrincipalId || "user:local");
     const source: PromptSource = msg.source ?? "interactive";
-    createAcpSession(msg.runtimeId, msg.model, emit).then(
+    const policyContext: SessionPolicyContext = {
+      principalType,
+      principalId,
+      source,
+      workspaceId,
+    };
+    createAcpSession(msg.runtimeId, msg.model, emit, policyContext).then(
       (acpSession) => {
         const sessionId = acpSession.id;
         const now = new Date().toISOString();
@@ -525,6 +541,7 @@ export const createRouter = (deps: RouterDeps): Router => {
         sessions.set(sessionId, acpSession);
         sessionWorkspaces.set(sessionId, workspaceId);
         sessionPrincipals.set(sessionId, { principalType, principalId, source });
+        sessionPolicyContexts.set(sessionId, policyContext);
         sessionOwners.set(sessionId, emit);
         sessionLastActivityMs.set(sessionId, Date.now());
         emit({
@@ -842,6 +859,12 @@ export const createRouter = (deps: RouterDeps): Router => {
       principalId: principal.principalId,
       source: "interactive",
     });
+    const policyContext = sessionPolicyContexts.get(msg.sessionId);
+    if (policyContext) {
+      policyContext.principalType = principal.principalType;
+      policyContext.principalId = principal.principalId;
+      policyContext.source = "interactive";
+    }
     touchSession(msg.sessionId);
     try {
       stateStore.updateSession(msg.sessionId, {

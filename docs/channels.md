@@ -5,7 +5,7 @@ This milestone adds a pluggable channels layer in `@nexus/channels` and startup 
 ## Current status
 
 - Telegram: implemented (Bot API long-poll + send messages).
-- Discord: scaffolded only (adapter exists, logs warning, transport not yet connected).
+- Discord: implemented via `discord.js` (message intake, send, typing indicator, streaming-edit mode).
 
 ## Config shape
 
@@ -24,15 +24,21 @@ Add a `channels` object to your gateway config (`NEXUS_CONFIG` file):
       "workspaceId": "default",
       "typingIndicator": true,
       "streamingMode": "off",
+      "steeringMode": "on",
       "pollTimeoutSeconds": 25,
       "pollIntervalMs": 500
     },
     "discord-main": {
       "kind": "discord",
-      "enabled": false,
+      "enabled": true,
       "botToken": "<discord-bot-token>",
+      "guildId": "<optional-guild-id-filter>",
+      "allowedUserIds": ["<your-discord-user-id>"],
       "runtimeId": "codex",
-      "workspaceId": "default"
+      "workspaceId": "default",
+      "typingIndicator": true,
+      "streamingMode": "edit",
+      "steeringMode": "on"
     }
   }
 }
@@ -48,8 +54,13 @@ Field notes:
 - `typingIndicator` controls chat typing pulses while a turn is in progress (default: `true`).
 - `streamingMode` controls channel rendering behavior:
   - `off` (default): aggregate deltas and send one final message on `turn_end`.
-  - `edit`: stream by editing a single in-flight message (currently implemented for Telegram).
-- `discord` is accepted by config validation, but currently runs as a stub adapter.
+  - `edit`: stream by editing a single in-flight message.
+- `steeringMode` controls what happens when user sends a new message while a turn is running:
+  - `off` (default): send as a normal prompt (runtime behavior applies).
+  - `on`: queue as steer, cancel current turn, then auto-prompt after `turn_end`.
+- `discord.guildId` is optional; if set, guild messages are filtered to that guild. DMs are still accepted.
+- `discord.allowedUserIds` is optional; if set, only listed Discord user IDs can invoke Nexus (DMs + guild).
+- Discord guild mode requires bot intent for message content in Discord developer settings.
 
 ## Run
 
@@ -76,9 +87,19 @@ Inside Telegram chats connected to the bot:
 - `/approve <requestId|all>`
 - `/deny <requestId>`
 
+## Discord input behavior
+
+- DMs: plain text messages are accepted.
+- Guild channels:
+  - mention the bot (`@TeleNexus ...`) for plain prompts, or
+  - use slash-like text commands (`/status`, `/help`, etc.).
+- In guild channels, sessions are isolated per `(channel, user)` pair.
+
 ## Session mapping model
 
 - One Nexus session per `(adapterId, conversationId)` pair.
 - Principal is mapped as `user:<adapterId>:<senderId>`.
 - Text deltas are buffered and sent as one message on `turn_end`.
 - Tool approvals are surfaced into chat as commands.
+
+This principal format is now usable in policy rules via `principalIdPattern`, which lets you scope allow/deny behavior to a channel or user without changing global policy for everyone.

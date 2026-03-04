@@ -352,6 +352,32 @@ describe("loadConfig", () => {
     expect(config.channels?.telegramMain?.streamingMode).toBe("edit");
   });
 
+  it("supports discord channel adapter config with allowed user filtering", () => {
+    const configPath = join(tmpDir, "nexus.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        auth: { token: "mytoken" },
+        runtimes: {
+          codex: { command: ["npx", "@zed-industries/codex-acp"] },
+        },
+        channels: {
+          discordMain: {
+            kind: "discord",
+            botToken: "discord-token",
+            runtimeId: "codex",
+            guildId: "123456",
+            allowedUserIds: ["111", "222"],
+          },
+        },
+      }),
+    );
+
+    const config = loadConfig(configPath);
+    expect(config.channels?.discordMain?.kind).toBe("discord");
+    expect((config.channels?.discordMain as { allowedUserIds?: string[] }).allowedUserIds).toEqual(["111", "222"]);
+  });
+
   it("rejects channels pointing to unknown runtime", () => {
     const configPath = join(tmpDir, "nexus.json");
     writeFileSync(
@@ -428,5 +454,66 @@ describe("loadConfig", () => {
     );
 
     expect(() => loadConfig(configPath)).toThrow(/channels.telegramMain.typingIndicator/);
+  });
+
+  it("rejects invalid discord allowedUserIds", () => {
+    const configPath = join(tmpDir, "nexus.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        auth: { token: "mytoken" },
+        runtime: { command: ["npx", "@zed-industries/claude-agent-acp"] },
+        channels: {
+          discordMain: {
+            kind: "discord",
+            botToken: "discord-token",
+            allowedUserIds: [1234],
+          },
+        },
+      }),
+    );
+
+    expect(() => loadConfig(configPath)).toThrow(/channels.discordMain.allowedUserIds/);
+  });
+
+  it("supports channel steeringMode", () => {
+    const configPath = join(tmpDir, "nexus.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        auth: { token: "mytoken" },
+        runtime: { command: ["npx", "@zed-industries/claude-agent-acp"] },
+        channels: {
+          telegramMain: {
+            kind: "telegram",
+            botToken: "123:abc",
+            steeringMode: "on",
+          },
+        },
+      }),
+    );
+
+    const config = loadConfig(configPath);
+    expect(config.channels?.telegramMain?.steeringMode).toBe("on");
+  });
+
+  it("rejects invalid channel steeringMode", () => {
+    const configPath = join(tmpDir, "nexus.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        auth: { token: "mytoken" },
+        runtime: { command: ["npx", "@zed-industries/claude-agent-acp"] },
+        channels: {
+          telegramMain: {
+            kind: "telegram",
+            botToken: "123:abc",
+            steeringMode: "auto",
+          },
+        },
+      }),
+    );
+
+    expect(() => loadConfig(configPath)).toThrow(/channels.telegramMain.steeringMode/);
   });
 });

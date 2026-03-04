@@ -29,6 +29,7 @@ export interface ChannelBaseConfig {
   workspaceId?: string;
   typingIndicator?: boolean;
   streamingMode?: "off" | "edit";
+  steeringMode?: "off" | "on";
 }
 
 export interface TelegramChannelConfig extends ChannelBaseConfig {
@@ -45,6 +46,7 @@ export interface DiscordChannelConfig extends ChannelBaseConfig {
   botToken: string;
   applicationId?: string;
   guildId?: string;
+  allowedUserIds?: string[];
 }
 
 export type ChannelConfig =

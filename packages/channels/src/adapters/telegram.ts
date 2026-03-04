@@ -2,6 +2,7 @@ import type {
   ChannelAdapter,
   ChannelAdapterContext,
   ChannelOutboundMessage,
+  ChannelQuickAction,
   ChannelStreamingState,
   ChannelTypingState,
 } from "../types.js";
@@ -36,6 +37,28 @@ interface TelegramUpdate {
     };
     text?: string;
   };
+  callback_query?: {
+    id: string;
+    from?: {
+      id: number;
+      is_bot: boolean;
+      username?: string;
+      first_name?: string;
+      last_name?: string;
+    };
+    data?: string;
+    message?: {
+      message_id: number;
+      chat: {
+        id: number;
+        type: string;
+        title?: string;
+        username?: string;
+        first_name?: string;
+        last_name?: string;
+      };
+    };
+  };
 }
 
 interface TelegramResponse<T> {
@@ -46,6 +69,91 @@ interface TelegramResponse<T> {
 interface TelegramMessageResponse {
   message_id: number;
 }
+
+const TELEGRAM_CALLBACK_PREFIX = "nx:";
+
+const escapeHtml = (text: string): string => text
+  .replaceAll("&", "&amp;")
+  .replaceAll("<", "&lt;")
+  .replaceAll(">", "&gt;");
+
+const markdownToTelegramHtml = (text: string): string => {
+  let working = text.replaceAll("\r\n", "\n");
+  const placeholders: string[] = [];
+  const toPlaceholder = (value: string): string => {
+    const token = `\u0000${placeholders.length}\u0000`;
+    placeholders.push(value);
+    return token;
+  };
+
+  // Preserve code fences and inline code before markdown substitutions.
+  working = working.replace(/```[a-zA-Z0-9_-]*\n?([\s\S]*?)```/g, (_match, code: string) =>
+    toPlaceholder(`<pre>${escapeHtml(code.replace(/\n$/, ""))}</pre>`));
+  working = working.replace(/`([^`\n]+)`/g, (_match, code: string) =>
+    toPlaceholder(`<code>${escapeHtml(code)}</code>`));
+
+  working = escapeHtml(working);
+  working = working.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, "<a href=\"$2\">$1</a>");
+  working = working.replace(/\*\*([^*\n][^*]*?)\*\*/g, "<b>$1</b>");
+  working = working.replace(/(^|[\s(>])\*([^*\n]+)\*(?=[\s).,!?:;]|$)/g, "$1<i>$2</i>");
+  working = working.replace(/~~([^~\n]+)~~/g, "<s>$1</s>");
+
+  working = working.replace(/\u0000(\d+)\u0000/g, (_match, index: string) => {
+    const value = placeholders[Number(index)];
+    return value ?? "";
+  });
+
+  return working;
+};
+
+const isEntityParseError = (error: unknown): boolean => {
+  const message = error instanceof Error ? error.message : String(error);
+  return /can't parse entities|parse entities|parse_mode|entity/i.test(message);
+};
+
+const toCallbackData = (command: string): string | undefined => {
+  const data = `${TELEGRAM_CALLBACK_PREFIX}${command}`;
+  if (Buffer.byteLength(data, "utf8") > 64) return undefined;
+  return data;
+};
+
+const fromCallbackData = (data: string | undefined): string | undefined => {
+  if (!data || !data.startsWith(TELEGRAM_CALLBACK_PREFIX)) return undefined;
+  return data.slice(TELEGRAM_CALLBACK_PREFIX.length).trim() || undefined;
+};
+
+const toInlineKeyboard = (quickActions: ChannelQuickAction[] | undefined): { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> } | undefined => {
+  if (!quickActions || quickActions.length === 0) return undefined;
+  const buttons = quickActions
+    .map((action) => {
+      const callbackData = toCallbackData(action.command);
+      if (!callbackData) return null;
+      return { text: action.label, callback_data: callbackData };
+    })
+    .filter((value): value is { text: string; callback_data: string } => value !== null);
+  if (buttons.length === 0) return undefined;
+
+  const rows: Array<Array<{ text: string; callback_data: string }>> = [];
+  for (let i = 0; i < buttons.length; i += 2) {
+    rows.push(buttons.slice(i, i + 2));
+  }
+  return { inline_keyboard: rows };
+};
+
+const removeInlineKeyboard = async (
+  apiCall: <T>(method: string, payload: Record<string, unknown>, signal?: AbortSignal) => Promise<T>,
+  chatId: string,
+  messageId?: number,
+): Promise<void> => {
+  if (!messageId) return;
+  await apiCall("editMessageReplyMarkup", {
+    chat_id: chatId,
+    message_id: messageId,
+    reply_markup: {
+      inline_keyboard: [],
+    },
+  }).catch(() => undefined);
+};
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => {
   setTimeout(resolve, ms);
@@ -88,6 +196,7 @@ export const createTelegramAdapter = (options: TelegramAdapterOptions): ChannelA
   let updateOffset = 0;
   let pollAbort: AbortController | null = null;
   const streamingMessageIds = new Map<string, number>();
+  const streamWritesInFlight = new Map<string, Promise<void>>();
 
   const allowed = allowedChatIds && allowedChatIds.length > 0
     ? new Set(allowedChatIds.map((v) => v.trim()).filter(Boolean))
@@ -123,6 +232,42 @@ export const createTelegramAdapter = (options: TelegramAdapterOptions): ChannelA
         updateOffset = update.update_id + 1;
       }
 
+      const callbackQuery = update.callback_query;
+      if (callbackQuery?.id && callbackQuery.message?.chat?.id) {
+        const chatId = String(callbackQuery.message.chat.id);
+        if (allowed && !allowed.has(chatId)) {
+          ctx.log.debug("telegram_callback_filtered_chat", {
+            adapterId: id,
+            chatId,
+          });
+          await apiCall("answerCallbackQuery", {
+            callback_query_id: callbackQuery.id,
+          }).catch(() => undefined);
+          continue;
+        }
+
+        const command = fromCallbackData(callbackQuery.data);
+        if (command) {
+          const senderId = String(callbackQuery.from?.id ?? callbackQuery.message.chat.id);
+          await ctx.onMessage({
+            adapterId: id,
+            conversationId: chatId,
+            senderId,
+            senderDisplayName: callbackQuery.from
+              ? [callbackQuery.from.first_name, callbackQuery.from.last_name].filter(Boolean).join(" ")
+                || callbackQuery.from.username
+              : undefined,
+            text: command,
+          });
+          await removeInlineKeyboard(apiCall, chatId, callbackQuery.message.message_id);
+        }
+
+        await apiCall("answerCallbackQuery", {
+          callback_query_id: callbackQuery.id,
+        }).catch(() => undefined);
+        continue;
+      }
+
       const message = update.message;
       if (!message?.text) continue;
 
@@ -153,7 +298,7 @@ export const createTelegramAdapter = (options: TelegramAdapterOptions): ChannelA
       {
         timeout: pollTimeoutSeconds,
         offset: updateOffset,
-        allowed_updates: ["message"],
+        allowed_updates: ["message", "callback_query"],
       },
       pollAbort.signal,
     );
@@ -176,12 +321,33 @@ export const createTelegramAdapter = (options: TelegramAdapterOptions): ChannelA
     }
   };
 
-  const sendText = async (conversationId: string, text: string): Promise<void> => {
-    await apiCall<TelegramMessageResponse>("sendMessage", {
-      chat_id: conversationId,
-      text,
-      disable_web_page_preview: false,
-    });
+  const sendText = async (
+    conversationId: string,
+    text: string,
+    quickActions?: ChannelQuickAction[],
+  ): Promise<void> => {
+    const inlineKeyboard = toInlineKeyboard(quickActions);
+    try {
+      await apiCall<TelegramMessageResponse>("sendMessage", {
+        chat_id: conversationId,
+        text: markdownToTelegramHtml(text),
+        parse_mode: "HTML",
+        disable_web_page_preview: false,
+        ...(inlineKeyboard ? { reply_markup: inlineKeyboard } : {}),
+      });
+    } catch (error) {
+      if (!isEntityParseError(error)) throw error;
+      ctx?.log.warn("telegram_parse_mode_fallback_plain", {
+        adapterId: id,
+        conversationId,
+      });
+      await apiCall<TelegramMessageResponse>("sendMessage", {
+        chat_id: conversationId,
+        text,
+        disable_web_page_preview: false,
+        ...(inlineKeyboard ? { reply_markup: inlineKeyboard } : {}),
+      });
+    }
   };
 
   const setTyping = async (state: ChannelTypingState): Promise<void> => {
@@ -193,42 +359,81 @@ export const createTelegramAdapter = (options: TelegramAdapterOptions): ChannelA
   };
 
   const upsertStreamingMessage = async (state: ChannelStreamingState): Promise<void> => {
-    if (!state.text && !state.done) return;
-    const currentMessageId = streamingMessageIds.get(state.streamId);
-    if (!currentMessageId) {
-      if (!state.text) return;
-      const created = await apiCall<TelegramMessageResponse>("sendMessage", {
-        chat_id: state.conversationId,
-        text: state.text,
-        disable_web_page_preview: false,
+    const previous = streamWritesInFlight.get(state.streamId) ?? Promise.resolve();
+    const next = previous
+      .catch(() => undefined)
+      .then(async () => {
+        if (!state.text && !state.done) return;
+        const currentMessageId = streamingMessageIds.get(state.streamId);
+        if (!currentMessageId) {
+          if (!state.text) return;
+          const created = await apiCall<TelegramMessageResponse>("sendMessage", {
+            chat_id: state.conversationId,
+            text: state.text,
+            disable_web_page_preview: false,
+          });
+          streamingMessageIds.set(state.streamId, created.message_id);
+          if (state.done) {
+            streamingMessageIds.delete(state.streamId);
+          }
+          return;
+        }
+
+        if (!state.text) {
+          if (state.done) {
+            streamingMessageIds.delete(state.streamId);
+          }
+          return;
+        }
+
+        if (state.done) {
+          try {
+            await apiCall("editMessageText", {
+              chat_id: state.conversationId,
+              message_id: currentMessageId,
+              text: markdownToTelegramHtml(state.text),
+              parse_mode: "HTML",
+              disable_web_page_preview: false,
+            });
+          } catch (error) {
+            if (!isEntityParseError(error)) throw error;
+            ctx?.log.warn("telegram_parse_mode_fallback_plain_edit", {
+              adapterId: id,
+              conversationId: state.conversationId,
+              streamId: state.streamId,
+            });
+            await apiCall("editMessageText", {
+              chat_id: state.conversationId,
+              message_id: currentMessageId,
+              text: state.text,
+              disable_web_page_preview: false,
+            });
+          }
+        } else {
+          await apiCall("editMessageText", {
+            chat_id: state.conversationId,
+            message_id: currentMessageId,
+            text: state.text,
+            disable_web_page_preview: false,
+          });
+        }
+        if (state.done) {
+          streamingMessageIds.delete(state.streamId);
+        }
       });
-      streamingMessageIds.set(state.streamId, created.message_id);
-      if (state.done) {
-        streamingMessageIds.delete(state.streamId);
+    streamWritesInFlight.set(state.streamId, next);
+    try {
+      await next;
+    } finally {
+      if (streamWritesInFlight.get(state.streamId) === next) {
+        streamWritesInFlight.delete(state.streamId);
       }
-      return;
-    }
-
-    if (!state.text) {
-      if (state.done) {
-        streamingMessageIds.delete(state.streamId);
-      }
-      return;
-    }
-
-    await apiCall("editMessageText", {
-      chat_id: state.conversationId,
-      message_id: currentMessageId,
-      text: state.text,
-      disable_web_page_preview: false,
-    });
-    if (state.done) {
-      streamingMessageIds.delete(state.streamId);
     }
   };
 
   return {
     id,
+    supportsQuickActions: true,
     start: async (context) => {
       ctx = context;
       running = true;
@@ -245,13 +450,18 @@ export const createTelegramAdapter = (options: TelegramAdapterOptions): ChannelA
       pollAbort?.abort();
       pollAbort = null;
       streamingMessageIds.clear();
+      streamWritesInFlight.clear();
       ctx?.log.info("telegram_adapter_stopped", { adapterId: id });
       ctx = null;
     },
     sendMessage: async (message: ChannelOutboundMessage) => {
       const chunks = splitMessage(message.text);
-      for (const chunk of chunks) {
-        await sendText(message.conversationId, chunk);
+      for (const [index, chunk] of chunks.entries()) {
+        await sendText(
+          message.conversationId,
+          chunk,
+          index === 0 ? message.quickActions : undefined,
+        );
       }
     },
     setTyping,

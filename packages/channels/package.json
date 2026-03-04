@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@nexus/types": "workspace:*",
+    "discord.js": "^14.22.1",
     "ws": "^8"
   },
   "devDependencies": {

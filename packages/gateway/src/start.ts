@@ -1,7 +1,13 @@
 import { readFileSync, mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { loadConfig, repoRoot } from "./config.js";
-import { createRouter, type EventEmitter, type ManagedAcpSession, type Router } from "./router.js";
+import {
+  createRouter,
+  type EventEmitter,
+  type ManagedAcpSession,
+  type Router,
+  type SessionPolicyContext,
+} from "./router.js";
 import { createGatewayServer } from "./server.js";
 import { createStateStore } from "@nexus/state";
 import { loadPolicyFromString } from "@nexus/policy";
@@ -246,6 +252,7 @@ export const startGateway = async (configPath?: string) => {
             principalType: "user",
             typingIndicator: channel.typingIndicator,
             streamingMode: channel.streamingMode,
+            steeringMode: channel.steeringMode,
           },
         });
         continue;
@@ -258,6 +265,7 @@ export const startGateway = async (configPath?: string) => {
             botToken: channel.botToken,
             applicationId: channel.applicationId,
             guildId: channel.guildId,
+            allowedUserIds: channel.allowedUserIds,
           }),
           route: {
             runtimeId: channel.runtimeId,
@@ -267,6 +275,7 @@ export const startGateway = async (configPath?: string) => {
             principalType: "user",
             typingIndicator: channel.typingIndicator,
             streamingMode: channel.streamingMode,
+            steeringMode: channel.steeringMode,
           },
         });
       }
@@ -386,6 +395,7 @@ export const startGateway = async (configPath?: string) => {
       requestedRuntimeId: string | undefined,
       requestedModel: string | undefined,
       onEvent: EventEmitter,
+      policyContext?: SessionPolicyContext,
     ): Promise<ManagedAcpSession> => {
       const runtimeId = resolveRuntimeId(requestedRuntimeId, requestedModel);
       const runtime = runtimeAgents.get(runtimeId);
@@ -460,7 +470,7 @@ export const startGateway = async (configPath?: string) => {
       });
 
       const session = createAcpSession(runtime.agent.rpc, acpSessionId, gatewaySessionId, {
-        policyEvaluator: (tool, params) => evaluatePolicy(policyConfig, tool, params),
+        policyEvaluator: (tool, params) => evaluatePolicy(policyConfig, tool, params, policyContext),
       });
       session.onEvent(onEvent);
 
@@ -530,11 +540,27 @@ export const startGateway = async (configPath?: string) => {
         error: (message, fields) => log.error(message, fields),
       },
     });
-    await channelManager.start();
-    log.info("channel_manager_started", {
-      adapterCount: channelRegistrations.length,
-      adapterIds: channelRegistrations.map((registration) => registration.adapter.id),
-    });
+    try {
+      await channelManager.start();
+      log.info("channel_manager_started", {
+        adapterCount: channelRegistrations.length,
+        adapterIds: channelRegistrations.map((registration) => registration.adapter.id),
+      });
+    } catch (error) {
+      log.error("channel_manager_start_failed", {
+        adapterCount: channelRegistrations.length,
+        adapterIds: channelRegistrations.map((registration) => registration.adapter.id),
+        error: error instanceof Error ? error.message : String(error),
+      });
+      try {
+        await channelManager.stop();
+      } catch (stopError) {
+        log.warn("channel_manager_stop_after_failed_start_failed", {
+          error: stopError instanceof Error ? stopError.message : String(stopError),
+        });
+      }
+      channelManager = null;
+    }
   }
 
   // Graceful shutdown

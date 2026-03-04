@@ -4,7 +4,9 @@ import type {
   ChannelAdapter,
   ChannelAdapterRegistration,
   ChannelInboundMessage,
+  ChannelQuickAction,
   ChannelRouteConfig,
+  ChannelSteeringMode,
   ChannelStreamingMode,
   LoggerLike,
 } from "./types.js";
@@ -33,6 +35,7 @@ interface ConversationBinding {
   workspaceId?: string;
   typingIndicator: boolean;
   streamingMode: ChannelStreamingMode;
+  steeringMode: ChannelSteeringMode;
   createdAt: string;
 }
 
@@ -49,6 +52,8 @@ interface PendingApproval {
   tool: string;
   adapterId: string;
   conversationId: string;
+  allowOptionId?: string;
+  rejectOptionId?: string;
 }
 
 interface PendingPrompt {
@@ -114,8 +119,26 @@ const isSessionNotFoundMessage = (message: string): boolean =>
 
 const DEFAULT_TYPING_INDICATOR = true;
 const DEFAULT_STREAMING_MODE: ChannelStreamingMode = "off";
+const DEFAULT_STEERING_MODE: ChannelSteeringMode = "off";
 const STREAM_EDIT_FLUSH_MS = 350;
 const TYPING_PULSE_MS = 4_000;
+
+const compactApprovalTool = (tool: string): string => {
+  const cleaned = tool.replace(/\s+/g, " ").trim();
+  if (!cleaned) return "tool";
+
+  const match = cleaned.match(/^([A-Za-z][A-Za-z0-9_-]*)\s+(.+)$/);
+  if (!match) {
+    return cleaned.length > 120 ? `${cleaned.slice(0, 117)}...` : cleaned;
+  }
+
+  const [, name, target] = match;
+  if (target.includes("/") || target.includes("\\")) {
+    const leaf = target.split(/[\\/]/).filter(Boolean).at(-1);
+    if (leaf) return `${name} ${leaf}`;
+  }
+  return cleaned.length > 120 ? `${cleaned.slice(0, 117)}...` : cleaned;
+};
 
 export const createChannelManager = (options: ChannelManagerOptions): ChannelManager => {
   const {
@@ -138,9 +161,13 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
   const sessionMetadataById = new Map<string, SessionMetadata>();
   const streamBuffers = new Map<string, string>();
   const streamFlushTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const streamFlushInFlight = new Map<string, Promise<void>>();
   const typingTimers = new Map<string, ReturnType<typeof setInterval>>();
   const pendingPrompts = new Map<string, PendingPrompt>();
   const pendingApprovalsById = new Map<string, PendingApproval>();
+  const runningTurns = new Set<string>();
+  const cancelRequested = new Set<string>();
+  const queuedSteers = new Map<string, ChannelInboundMessage>();
 
   let running = false;
   let startedAdapters = false;
@@ -156,13 +183,14 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     adapterId: string,
     conversationId: string,
     text: string,
+    quickActions?: ChannelQuickAction[],
   ): Promise<void> => {
     const adapter = adapterById.get(adapterId);
     if (!adapter) {
       logger.warn("channel_send_missing_adapter", { adapterId, conversationId });
       return;
     }
-    await adapter.sendMessage({ conversationId, text });
+    await adapter.sendMessage({ conversationId, text, quickActions });
   };
 
   const resolveBindingBySession = (sessionId: string): ConversationBinding | undefined => {
@@ -229,8 +257,12 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     sessionMetadataById.delete(sessionId);
     streamBuffers.delete(sessionId);
     clearStreamFlushTimer(sessionId);
+    streamFlushInFlight.delete(sessionId);
     stopTyping(sessionId);
     pendingPrompts.delete(sessionId);
+    runningTurns.delete(sessionId);
+    cancelRequested.delete(sessionId);
+    queuedSteers.delete(sessionId);
     for (const [requestId, approval] of pendingApprovalsById) {
       if (approval.sessionId === sessionId) pendingApprovalsById.delete(requestId);
     }
@@ -244,7 +276,14 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
   };
 
   const waitForSessionCreated = (conversationKey: string): Promise<string> => {
-    return new Promise((resolve, reject) => {
+    const promise = new Promise<string>((resolve, reject) => {
+      if (pendingSessionCreate) {
+        const previous = pendingSessionCreate;
+        pendingSessionCreate = null;
+        clearTimeout(previous.timeout);
+        previous.reject(new Error(`Superseded pending session creation (${previous.conversationKey})`));
+      }
+
       const timeout = setTimeout(() => {
         if (pendingSessionCreate?.conversationKey === conversationKey) {
           pendingSessionCreate = null;
@@ -265,6 +304,10 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         timeout,
       };
     });
+
+    // Avoid fatal unhandled rejections if caller aborts before awaiting.
+    void promise.catch(() => undefined);
+    return promise;
   };
 
   const enqueueSessionCreation = async (task: () => Promise<void>): Promise<void> => {
@@ -295,17 +338,28 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
       const source: PromptSource = route.source ?? "api";
       const typingIndicator = route.typingIndicator ?? DEFAULT_TYPING_INDICATOR;
       const streamingMode = route.streamingMode ?? DEFAULT_STREAMING_MODE;
+      const steeringMode = route.steeringMode ?? DEFAULT_STEERING_MODE;
 
       const awaiting = waitForSessionCreated(key);
-      gatewayClient.send({
-        type: "session_new",
-        runtimeId: route.runtimeId,
-        model: route.model,
-        workspaceId: route.workspaceId,
-        principalType,
-        principalId,
-        source,
-      });
+      try {
+        gatewayClient.send({
+          type: "session_new",
+          runtimeId: route.runtimeId,
+          model: route.model,
+          workspaceId: route.workspaceId,
+          principalType,
+          principalId,
+          source,
+        });
+      } catch (error) {
+        if (pendingSessionCreate?.conversationKey === key) {
+          const pending = pendingSessionCreate;
+          pendingSessionCreate = null;
+          clearTimeout(pending.timeout);
+          pending.reject(error instanceof Error ? error : new Error(String(error)));
+        }
+        throw error;
+      }
 
       createdSessionId = await awaiting;
       const sessionMetadata = sessionMetadataById.get(createdSessionId);
@@ -321,6 +375,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         workspaceId: sessionMetadata?.workspaceId ?? route.workspaceId ?? "default",
         typingIndicator,
         streamingMode,
+        steeringMode,
         createdAt: new Date().toISOString(),
       };
       conversationBindings.set(key, binding);
@@ -336,6 +391,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         workspaceId: binding.workspaceId ?? "default",
         streamingMode,
         typingIndicator,
+        steeringMode,
       });
     });
 
@@ -346,15 +402,64 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     return resolved.sessionId;
   };
 
-  const sendPrompt = async (message: ChannelInboundMessage, retryCount: number = 0): Promise<void> => {
-    const sessionId = await ensureSession(message);
+  const sendPromptForSession = async (
+    sessionId: string,
+    message: ChannelInboundMessage,
+    retryCount: number = 0,
+  ): Promise<void> => {
     pendingPrompts.set(sessionId, { message, retryCount });
     startTyping(sessionId);
-    gatewayClient.send({
-      type: "prompt",
-      sessionId,
-      text: message.text,
-    });
+    try {
+      gatewayClient.send({
+        type: "prompt",
+        sessionId,
+        text: message.text,
+      });
+      runningTurns.add(sessionId);
+      cancelRequested.delete(sessionId);
+    } catch (error) {
+      pendingPrompts.delete(sessionId);
+      stopTyping(sessionId);
+      throw error;
+    }
+  };
+
+  const sendPrompt = async (message: ChannelInboundMessage, retryCount: number = 0): Promise<void> => {
+    const sessionId = await ensureSession(message);
+    await sendPromptForSession(sessionId, message, retryCount);
+  };
+
+  const queueSteer = async (sessionId: string, message: ChannelInboundMessage): Promise<void> => {
+    const binding = resolveBindingBySession(sessionId);
+    if (!binding) {
+      await sendPromptForSession(sessionId, message, 0);
+      return;
+    }
+    queuedSteers.set(sessionId, message);
+
+    if (!cancelRequested.has(sessionId)) {
+      try {
+        gatewayClient.send({ type: "cancel", sessionId });
+        cancelRequested.add(sessionId);
+      } catch (error) {
+        queuedSteers.delete(sessionId);
+        throw error;
+      }
+      await sendToConversation(binding.adapterId, binding.conversationId, "Steering queued. Cancelling current turn...");
+      return;
+    }
+
+    await sendToConversation(binding.adapterId, binding.conversationId, "Steering updated. Waiting for turn to stop...");
+  };
+
+  const sendPromptOrSteer = async (message: ChannelInboundMessage): Promise<void> => {
+    const sessionId = await ensureSession(message);
+    const binding = resolveBindingBySession(sessionId);
+    if (binding?.steeringMode === "on" && runningTurns.has(sessionId)) {
+      await queueSteer(sessionId, message);
+      return;
+    }
+    await sendPromptForSession(sessionId, message, 0);
   };
 
   const sendHelp = async (adapterId: string, conversationId: string): Promise<void> => {
@@ -407,6 +512,8 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
               `Runtime: ${binding.runtimeId ?? "default"}`,
               `Model: ${binding.model ?? "runtime-default"}`,
               `Workspace: ${binding.workspaceId ?? "default"}`,
+              `Steering: ${binding.steeringMode}`,
+              `Running: ${runningTurns.has(binding.sessionId) ? "yes" : "no"}`,
             ].join("\n")
           : "No active session for this conversation. Send any prompt to create one.",
       );
@@ -419,6 +526,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         return true;
       }
       gatewayClient.send({ type: "cancel", sessionId: binding.sessionId });
+      cancelRequested.add(binding.sessionId);
       await sendToConversation(message.adapterId, message.conversationId, "Cancelled current turn.");
       return true;
     }
@@ -432,7 +540,15 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
       const approvalsForSession = Array.from(pendingApprovalsById.values()).filter((approval) => approval.sessionId === binding.sessionId);
       if (arg === "all") {
         for (const approval of approvalsForSession) {
-          gatewayClient.send({ type: "approval_response", requestId: approval.requestId, allow: true });
+          if (approval.allowOptionId) {
+            gatewayClient.send({
+              type: "approval_response",
+              requestId: approval.requestId,
+              optionId: approval.allowOptionId,
+            });
+          } else {
+            gatewayClient.send({ type: "approval_response", requestId: approval.requestId, allow: true });
+          }
           pendingApprovalsById.delete(approval.requestId);
         }
         await sendToConversation(message.adapterId, message.conversationId, `Approved ${approvalsForSession.length} request(s).`);
@@ -443,21 +559,83 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         await sendToConversation(message.adapterId, message.conversationId, "Usage: /approve <requestId|all>");
         return true;
       }
-      gatewayClient.send({ type: "approval_response", requestId, allow: true });
+      const pending = pendingApprovalsById.get(requestId);
+      if (!pending) {
+        await sendToConversation(
+          message.adapterId,
+          message.conversationId,
+          `No pending approval request: ${requestId}`,
+        );
+        return true;
+      }
+      if (pending.sessionId !== binding.sessionId) {
+        await sendToConversation(
+          message.adapterId,
+          message.conversationId,
+          `Approval request belongs to another session: ${requestId}`,
+        );
+        return true;
+      }
+      if (pending.allowOptionId) {
+        gatewayClient.send({
+          type: "approval_response",
+          requestId,
+          optionId: pending.allowOptionId,
+        });
+      } else {
+        gatewayClient.send({ type: "approval_response", requestId, allow: true });
+      }
       pendingApprovalsById.delete(requestId);
-      await sendToConversation(message.adapterId, message.conversationId, `Approved ${requestId}.`);
+      await sendToConversation(
+        message.adapterId,
+        message.conversationId,
+        `Approved ${compactApprovalTool(pending.tool)}.`,
+      );
       return true;
     }
 
     if (command === "deny" || command === "reject") {
+      if (!binding) {
+        await sendToConversation(message.adapterId, message.conversationId, "No active session.");
+        return true;
+      }
       const requestId = parts[0]?.trim();
       if (!requestId) {
         await sendToConversation(message.adapterId, message.conversationId, "Usage: /deny <requestId>");
         return true;
       }
-      gatewayClient.send({ type: "approval_response", requestId, allow: false });
+      const pending = pendingApprovalsById.get(requestId);
+      if (!pending) {
+        await sendToConversation(
+          message.adapterId,
+          message.conversationId,
+          `No pending approval request: ${requestId}`,
+        );
+        return true;
+      }
+      if (pending.sessionId !== binding.sessionId) {
+        await sendToConversation(
+          message.adapterId,
+          message.conversationId,
+          `Approval request belongs to another session: ${requestId}`,
+        );
+        return true;
+      }
+      if (pending.rejectOptionId) {
+        gatewayClient.send({
+          type: "approval_response",
+          requestId,
+          optionId: pending.rejectOptionId,
+        });
+      } else {
+        gatewayClient.send({ type: "approval_response", requestId, allow: false });
+      }
       pendingApprovalsById.delete(requestId);
-      await sendToConversation(message.adapterId, message.conversationId, `Denied ${requestId}.`);
+      await sendToConversation(
+        message.adapterId,
+        message.conversationId,
+        `Denied ${compactApprovalTool(pending.tool)}.`,
+      );
       return true;
     }
 
@@ -498,11 +676,24 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     }
   };
 
+  const flushStreamBufferQueued = (sessionId: string, done: boolean): Promise<void> => {
+    const previous = streamFlushInFlight.get(sessionId) ?? Promise.resolve();
+    const next = previous
+      .catch(() => undefined)
+      .then(() => flushStreamBuffer(sessionId, done));
+    streamFlushInFlight.set(sessionId, next);
+    return next.finally(() => {
+      if (streamFlushInFlight.get(sessionId) === next) {
+        streamFlushInFlight.delete(sessionId);
+      }
+    });
+  };
+
   const scheduleStreamFlush = (sessionId: string): void => {
     if (streamFlushTimers.has(sessionId)) return;
     const timer = setTimeout(() => {
       streamFlushTimers.delete(sessionId);
-      void flushStreamBuffer(sessionId, false).catch((error) => {
+      void flushStreamBufferQueued(sessionId, false).catch((error) => {
         logger.warn("channel_stream_flush_failed", {
           sessionId,
           error: formatChannelError(error),
@@ -551,9 +742,16 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
       }
       case "turn_end": {
         clearStreamFlushTimer(event.sessionId);
-        await flushStreamBuffer(event.sessionId, true);
+        await flushStreamBufferQueued(event.sessionId, true);
         pendingPrompts.delete(event.sessionId);
         stopTyping(event.sessionId);
+        runningTurns.delete(event.sessionId);
+        cancelRequested.delete(event.sessionId);
+        const queuedSteer = queuedSteers.get(event.sessionId);
+        if (queuedSteer) {
+          queuedSteers.delete(event.sessionId);
+          await sendPromptForSession(event.sessionId, queuedSteer, 0);
+        }
         break;
       }
       case "approval_request": {
@@ -567,11 +765,26 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
           tool: event.tool,
           adapterId: binding.adapterId,
           conversationId: binding.conversationId,
+          allowOptionId: event.options?.find((opt) => opt.kind.startsWith("allow"))?.optionId,
+          rejectOptionId: event.options?.find((opt) => opt.kind.startsWith("reject"))?.optionId,
         });
+        const adapter = adapterById.get(binding.adapterId);
+        const supportsQuickActions = adapter?.supportsQuickActions === true;
+        const quickActions: ChannelQuickAction[] | undefined = supportsQuickActions
+          ? [
+              { label: "Approve", command: `/approve ${event.requestId}` },
+              { label: "Deny", command: `/deny ${event.requestId}` },
+            ]
+          : undefined;
+        const toolLabel = compactApprovalTool(event.tool);
+        const text = supportsQuickActions
+          ? `Approval required: ${toolLabel}\nTap Approve or Deny below.`
+          : `Approval required for ${toolLabel}\nrequestId=${event.requestId}\nUse /approve ${event.requestId} or /deny ${event.requestId}`;
         await sendToConversation(
           binding.adapterId,
           binding.conversationId,
-          `Approval required for ${event.tool}\nrequestId=${event.requestId}\nUse /approve ${event.requestId} or /deny ${event.requestId}`,
+          text,
+          quickActions,
         );
         stopTyping(event.sessionId);
         break;
@@ -605,6 +818,8 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         }
         pendingPrompts.delete(event.sessionId);
         stopTyping(event.sessionId);
+        runningTurns.delete(event.sessionId);
+        cancelRequested.delete(event.sessionId);
         await sendToConversation(binding.adapterId, binding.conversationId, `Error: ${event.message}`);
         break;
       }
@@ -648,7 +863,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     try {
       const handled = await handleCommand(message);
       if (!handled) {
-        await sendPrompt(message);
+        await sendPromptOrSteer(message);
       }
     } catch (error) {
       logger.error("channel_inbound_failed", {

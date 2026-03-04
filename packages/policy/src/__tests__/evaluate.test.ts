@@ -65,6 +65,45 @@ describe("evaluatePolicy", () => {
     expect(evaluatePolicy(config, "Anything")).toBe("ask");
   });
 
+  it("matches principalType-scoped rules", () => {
+    const config: PolicyConfig = {
+      rules: [
+        { tool: "Write", action: "deny", principalType: "service_account" },
+        { tool: "Write", action: "ask" },
+      ],
+    };
+
+    expect(evaluatePolicy(config, "Write", undefined, { principalType: "service_account" })).toBe("deny");
+    expect(evaluatePolicy(config, "Write", undefined, { principalType: "user" })).toBe("ask");
+  });
+
+  it("matches principal/source/workspace pattern filters", () => {
+    const config: PolicyConfig = {
+      rules: [
+        {
+          tool: "Bash",
+          action: "deny",
+          principalIdPattern: "discord-main:",
+          source: "api",
+          workspaceIdPattern: "sandbox",
+        },
+        { tool: "Bash", action: "ask" },
+      ],
+    };
+
+    expect(evaluatePolicy(config, "Bash", "ls", {
+      principalId: "user:discord-main:291716660644282368",
+      source: "api",
+      workspaceId: "sandbox-team",
+    })).toBe("deny");
+
+    expect(evaluatePolicy(config, "Bash", "ls", {
+      principalId: "user:discord-main:291716660644282368",
+      source: "interactive",
+      workspaceId: "sandbox-team",
+    })).toBe("ask");
+  });
+
   it("full default policy scenario", () => {
     const config: PolicyConfig = {
       rules: [
