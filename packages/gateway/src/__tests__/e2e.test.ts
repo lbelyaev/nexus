@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import WebSocket from "ws";
+import { generateKeyPairSync, sign } from "node:crypto";
 import { createGatewayServer, type GatewayServer } from "../server.js";
 import { createRouter, type EventEmitter, type ManagedAcpSession } from "../router.js";
 import { createStateStore, type StateStore } from "@nexus/state";
@@ -74,6 +75,67 @@ const waitForClose = (ws: WebSocket): Promise<void> =>
     }
     ws.once("close", () => resolve());
   });
+
+const waitForEvent = <T extends GatewayEvent["type"]>(
+  messages: string[],
+  type: T,
+  timeout = 2000,
+): Promise<Extract<GatewayEvent, { type: T }>> =>
+  new Promise((resolve, reject) => {
+    const start = Date.now();
+    const check = () => {
+      while (messages.length > 0) {
+        const next = messages.shift()!;
+        let parsed: GatewayEvent | null = null;
+        try {
+          parsed = JSON.parse(next) as GatewayEvent;
+        } catch {
+          continue;
+        }
+        if (parsed.type === type) {
+          resolve(parsed as Extract<GatewayEvent, { type: T }>);
+          return;
+        }
+      }
+      if (Date.now() - start > timeout) {
+        reject(new Error(`Timeout waiting for event: ${type}`));
+        return;
+      }
+      setTimeout(check, 10);
+    };
+    check();
+  });
+
+const sendAuthProof = async (
+  ws: WebSocket,
+  messages: string[],
+  principalId: string,
+): Promise<void> => {
+  const challenge = await waitForEvent(messages, "auth_challenge");
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  const payload = `${challenge.nonce}:user:${principalId}`;
+  const signature = sign(null, Buffer.from(payload, "utf8"), privateKey).toString("base64");
+  const exportedPublicKey = publicKey.export({
+    type: "spki",
+    format: "pem",
+  }).toString();
+
+  ws.send(JSON.stringify({
+    type: "auth_proof",
+    principalType: "user",
+    principalId,
+    publicKey: exportedPublicKey,
+    nonce: challenge.nonce,
+    signature,
+    algorithm: "ed25519",
+  }));
+
+  const result = await waitForEvent(messages, "auth_result");
+  expect(result.ok).toBe(true);
+  if (!result.ok) {
+    throw new Error(result.message ?? "auth_proof was rejected");
+  }
+};
 
 describe("E2E: WS client -> Gateway -> mock ACP session -> events back", () => {
   let server: GatewayServer;
@@ -267,6 +329,103 @@ describe("E2E: WS client -> Gateway -> mock ACP session -> events back", () => {
       expect(replayEvent.messages.some((m) => m.role === "user" && m.content.includes("remember this line"))).toBe(true);
 
       second.ws.close();
+    });
+  });
+
+  describe("authenticated session transfer", () => {
+    it("transfers ownership to target principal and enforces new owner", async () => {
+      const owner = await connectWs(port, TEST_TOKEN);
+      const target = await connectWs(port, TEST_TOKEN);
+
+      await sendAuthProof(owner.ws, owner.messages, "user:owner:e2e");
+      await sendAuthProof(target.ws, target.messages, "user:target:e2e");
+
+      owner.ws.send(JSON.stringify({ type: "session_new" }));
+      const created = await waitForEvent(owner.messages, "session_created");
+
+      owner.ws.send(JSON.stringify({
+        type: "session_transfer_request",
+        sessionId: created.sessionId,
+        targetPrincipalId: "user:target:e2e",
+      }));
+
+      const requestedForTarget = await waitForEvent(target.messages, "session_transfer_requested");
+      expect(requestedForTarget.sessionId).toBe(created.sessionId);
+      expect(requestedForTarget.targetPrincipalId).toBe("user:target:e2e");
+
+      target.ws.send(JSON.stringify({
+        type: "session_transfer_accept",
+        sessionId: created.sessionId,
+      }));
+
+      const transferredTarget = await waitForEvent(target.messages, "session_transferred");
+      const transferredOwner = await waitForEvent(owner.messages, "session_transferred");
+      expect(transferredTarget.sessionId).toBe(created.sessionId);
+      expect(transferredOwner.sessionId).toBe(created.sessionId);
+
+      owner.ws.send(JSON.stringify({
+        type: "prompt",
+        sessionId: created.sessionId,
+        text: "old owner prompt should be blocked",
+      }));
+      const ownerPromptRejected = await waitForEvent(owner.messages, "error");
+      expect(ownerPromptRejected.message).toMatch(/owned by another connection/i);
+
+      target.ws.send(JSON.stringify({
+        type: "prompt",
+        sessionId: created.sessionId,
+        text: "new owner prompt should succeed",
+      }));
+      const targetTurnEnd = await waitForEvent(target.messages, "turn_end");
+      expect(targetTurnEnd.sessionId).toBe(created.sessionId);
+
+      owner.ws.close();
+      target.ws.close();
+      await waitForClose(owner.ws);
+      await waitForClose(target.ws);
+    });
+  });
+
+  describe("auth proof lifecycle", () => {
+    it("rejects replayed auth nonce on the same connection", async () => {
+      const conn = await connectWs(port, TEST_TOKEN);
+      const challenge = await waitForEvent(conn.messages, "auth_challenge");
+      const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+      const principalId = "user:replay:e2e";
+      const payload = `${challenge.nonce}:user:${principalId}`;
+      const signature = sign(null, Buffer.from(payload, "utf8"), privateKey).toString("base64");
+      const exportedPublicKey = publicKey.export({
+        type: "spki",
+        format: "pem",
+      }).toString();
+
+      conn.ws.send(JSON.stringify({
+        type: "auth_proof",
+        principalType: "user",
+        principalId,
+        publicKey: exportedPublicKey,
+        nonce: challenge.nonce,
+        signature,
+        algorithm: "ed25519",
+      }));
+      const first = await waitForEvent(conn.messages, "auth_result");
+      expect(first.ok).toBe(true);
+
+      conn.ws.send(JSON.stringify({
+        type: "auth_proof",
+        principalType: "user",
+        principalId,
+        publicKey: exportedPublicKey,
+        nonce: challenge.nonce,
+        signature,
+        algorithm: "ed25519",
+      }));
+      const replay = await waitForEvent(conn.messages, "auth_result");
+      expect(replay.ok).toBe(false);
+      expect(replay.message).toMatch(/already used/i);
+
+      conn.ws.close();
+      await waitForClose(conn.ws);
     });
   });
 });
