@@ -49,6 +49,8 @@ const serializePrettyEvent = (event: GatewayEvent): string => {
   switch (event.type) {
     case "session_created":
       return `[session_created] session=${event.sessionId} runtime=${event.runtimeId ?? "default"} model=${event.model} principal=${event.principalType ?? "user"}:${event.principalId ?? "user:local"} source=${event.source ?? "interactive"}`;
+    case "session_invalidated":
+      return `[session_invalidated] session=${event.sessionId} reason=${event.reason} message=${event.message}`;
     case "session_closed":
       return `[session_closed] session=${event.sessionId} reason=${event.reason}`;
     case "auth_challenge":

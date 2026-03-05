@@ -18,14 +18,21 @@ interface GatewayHandlers {
 
 const createMockGateway = () => {
   const handlers: GatewayHandlers = {};
+  let open = false;
   const gatewayClient = {
     connect: vi.fn(async () => {
+      open = true;
       handlers.onOpen?.();
     }),
     close: vi.fn(() => {
+      open = false;
       handlers.onClose?.();
     }),
-    send: vi.fn(),
+    send: vi.fn((_message: unknown) => {
+      if (!open) {
+        throw new Error("Gateway websocket is not connected");
+      }
+    }),
     onEvent: vi.fn((handler: (event: GatewayEvent) => void) => {
       handlers.onEvent = handler;
     }),
@@ -38,7 +45,7 @@ const createMockGateway = () => {
     onError: vi.fn((handler: (error: Error) => void) => {
       handlers.onError = handler;
     }),
-    isOpen: vi.fn(() => true),
+    isOpen: vi.fn(() => open),
   };
 
   return { gatewayClient, handlers };
@@ -286,6 +293,120 @@ describe("createChannelManager", () => {
       expect(adapterFixture.sendMessage).toHaveBeenCalledWith({
         conversationId: "chat-1",
         text: "Response timed out. You can retry, use /cancel, or send a new message to steer.",
+      });
+    });
+
+    await manager.stop();
+  });
+
+  it("surfaces session_invalidated as cold-recovery notice", async () => {
+    const { gatewayClient, handlers } = createMockGateway();
+    createGatewayClientMock.mockReturnValue(gatewayClient);
+    const adapterFixture = createAdapter();
+
+    const manager = createChannelManager({
+      gatewayUrl: "ws://127.0.0.1:18800/ws",
+      token: "test-token",
+      adapters: [{ adapter: adapterFixture.adapter }],
+    });
+
+    await manager.start();
+    const context = adapterFixture.getContext();
+    expect(context).toBeDefined();
+
+    const inboundPromise = context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-invalidate",
+      senderId: "user-1",
+      text: "hello",
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith(expect.objectContaining({ type: "session_new" }));
+    });
+
+    handlers.onEvent?.({
+      type: "session_created",
+      sessionId: "gw-session-invalidate",
+      runtimeId: "claude",
+      model: "claude-sonnet-4-6",
+      workspaceId: "default",
+    });
+    await inboundPromise;
+
+    handlers.onEvent?.({
+      type: "session_invalidated",
+      sessionId: "gw-session-invalidate",
+      reason: "runtime_state_lost",
+      message: "Session runtime state was lost after restart and cold-restored.",
+    });
+
+    await vi.waitFor(() => {
+      expect(adapterFixture.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+        conversationId: "chat-invalidate",
+        text: expect.stringContaining("Session runtime restarted"),
+      }));
+    });
+
+    await manager.stop();
+  });
+
+  it("queues prompts while disconnected and flushes them after reconnect", async () => {
+    const { gatewayClient, handlers } = createMockGateway();
+    createGatewayClientMock.mockReturnValue(gatewayClient);
+    const adapterFixture = createAdapter();
+
+    const manager = createChannelManager({
+      gatewayUrl: "ws://127.0.0.1:18800/ws",
+      token: "test-token",
+      reconnectDelayMs: 30,
+      adapters: [{ adapter: adapterFixture.adapter }],
+    });
+
+    await manager.start();
+    const context = adapterFixture.getContext();
+    expect(context).toBeDefined();
+
+    const firstPrompt = context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-reconnect-queue",
+      senderId: "user-1",
+      text: "first",
+    });
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith(expect.objectContaining({ type: "session_new" }));
+    });
+    handlers.onEvent?.({
+      type: "session_created",
+      sessionId: "gw-session-reconnect-1",
+      runtimeId: "claude",
+      model: "claude-sonnet-4-6",
+      workspaceId: "default",
+    });
+    await firstPrompt;
+
+    gatewayClient.close();
+
+    await context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-reconnect-queue",
+      senderId: "user-1",
+      text: "second while disconnected",
+    });
+
+    await vi.waitFor(() => {
+      expect(adapterFixture.sendMessage).toHaveBeenCalledWith({
+        conversationId: "chat-reconnect-queue",
+        text: "Nexus is reconnecting. I will send your message when the connection is back.",
+      });
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith({
+        type: "prompt",
+        sessionId: "gw-session-reconnect-1",
+        text: "second while disconnected",
+        images: undefined,
       });
     });
 
@@ -943,10 +1064,108 @@ describe("createChannelManager", () => {
     await vi.waitFor(() => {
       expect(adapterFixture.sendMessage).toHaveBeenCalledWith({
         conversationId: "chat-qa",
-        text: "Approval required: Read file.ts\nTap Approve or Deny below.",
+        text: "Approval required: Read file.ts\nTap Approve, Approve All, or Deny below.",
         quickActions: [
           { label: "Approve", command: "/approve req-qa-1" },
+          { label: "Approve All", command: "/approve all" },
           { label: "Deny", command: "/deny req-qa-1" },
+        ],
+      });
+    });
+
+    await manager.stop();
+  });
+
+  it("queues approval prompts and surfaces next prompt after single approval", async () => {
+    const { gatewayClient, handlers } = createMockGateway();
+    createGatewayClientMock.mockReturnValue(gatewayClient);
+    const adapterFixture = createAdapter();
+    adapterFixture.adapter.supportsQuickActions = true;
+
+    const manager = createChannelManager({
+      gatewayUrl: "ws://127.0.0.1:18800/ws",
+      token: "test-token",
+      adapters: [{ adapter: adapterFixture.adapter }],
+    });
+
+    await manager.start();
+    const context = adapterFixture.getContext();
+    expect(context).toBeDefined();
+
+    const prompt = context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-approval-queue",
+      senderId: "user-1",
+      text: "need multiple approvals",
+    });
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith(expect.objectContaining({ type: "session_new" }));
+    });
+    handlers.onEvent?.({
+      type: "session_created",
+      sessionId: "gw-session-approval-queue",
+      runtimeId: "claude",
+      model: "claude-sonnet-4-6",
+      workspaceId: "default",
+    });
+    await prompt;
+
+    handlers.onEvent?.({
+      type: "approval_request",
+      sessionId: "gw-session-approval-queue",
+      requestId: "req-queue-1",
+      tool: "Bash",
+      description: "Run command",
+      options: [
+        { optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+        { optionId: "reject_once", name: "Reject once", kind: "reject_once" },
+      ],
+    });
+    handlers.onEvent?.({
+      type: "approval_request",
+      sessionId: "gw-session-approval-queue",
+      requestId: "req-queue-2",
+      tool: "Read /tmp/b.ts",
+      description: "Read file",
+      options: [
+        { optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+        { optionId: "reject_once", name: "Reject once", kind: "reject_once" },
+      ],
+    });
+
+    await vi.waitFor(() => {
+      const approvalMessages = adapterFixture.sendMessage.mock.calls
+        .map(([msg]) => msg)
+        .filter((msg) => msg.conversationId === "chat-approval-queue" && msg.text.startsWith("Approval required:"));
+      expect(approvalMessages).toHaveLength(1);
+      expect(approvalMessages[0]).toMatchObject({
+        text: "Approval required: Bash\nTap Approve, Approve All, or Deny below.",
+      });
+    });
+
+    await context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-approval-queue",
+      senderId: "user-1",
+      text: "/approve req-queue-1",
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith({
+        type: "approval_response",
+        requestId: "req-queue-1",
+        optionId: "allow_once",
+      });
+    });
+
+    await vi.waitFor(() => {
+      expect(adapterFixture.sendMessage).toHaveBeenCalledWith({
+        conversationId: "chat-approval-queue",
+        text: "Approval required: Read b.ts\nTap Approve, Approve All, or Deny below.",
+        quickActions: [
+          { label: "Approve", command: "/approve req-queue-2" },
+          { label: "Approve All", command: "/approve all" },
+          { label: "Deny", command: "/deny req-queue-2" },
         ],
       });
     });
@@ -1616,6 +1835,66 @@ describe("createChannelManager", () => {
         text: "after transfer",
         images: undefined,
       });
+    });
+
+    await manager.stop();
+  });
+
+  it("detaches source conversation session after transfer away", async () => {
+    const { gatewayClient, handlers } = createMockGateway();
+    createGatewayClientMock.mockReturnValue(gatewayClient);
+    const adapterFixture = createAdapter();
+
+    const manager = createChannelManager({
+      gatewayUrl: "ws://127.0.0.1:18800/ws",
+      token: "test-token",
+      adapters: [{ adapter: adapterFixture.adapter }],
+    });
+
+    await manager.start();
+    const context = adapterFixture.getContext();
+    expect(context).toBeDefined();
+
+    const prompt = context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-transfer-away",
+      senderId: "user-1",
+      text: "seed session",
+    });
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith(expect.objectContaining({ type: "session_new" }));
+    });
+    handlers.onEvent?.({
+      type: "session_created",
+      sessionId: "gw-session-away",
+      runtimeId: "claude",
+      model: "claude-sonnet-4-6",
+      workspaceId: "default",
+    });
+    await prompt;
+
+    handlers.onEvent?.({
+      type: "session_transferred",
+      sessionId: "gw-session-away",
+      fromPrincipalType: "user",
+      fromPrincipalId: "user:telegram-test:user-1",
+      targetPrincipalType: "user",
+      targetPrincipalId: "user:web:user-1",
+      transferredAt: new Date().toISOString(),
+    });
+
+    await context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-transfer-away",
+      senderId: "user-1",
+      text: "/status",
+    });
+
+    await vi.waitFor(() => {
+      expect(adapterFixture.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+        conversationId: "chat-transfer-away",
+        text: "No active session for this conversation. Send any prompt to create one.",
+      }));
     });
 
     await manager.stop();

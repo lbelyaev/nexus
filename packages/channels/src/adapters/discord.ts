@@ -43,116 +43,16 @@ interface SendableChannel {
   };
 }
 
+import { formatMarkdownTables } from "./tables.js";
+
 const DISCORD_QUICK_ACTION_PREFIX = "nx:";
 
-type TableAlign = "left" | "center" | "right";
-
-const splitTableRow = (line: string): string[] => {
-  const trimmed = line.trim();
-  if (!trimmed.includes("|")) return [];
-  const inner = trimmed.replace(/^\|/, "").replace(/\|$/, "");
-  return inner.split("|").map((cell) => cell.trim());
-};
-
-const isTableSeparatorCell = (cell: string): boolean => /^:?-{3,}:?$/.test(cell.trim());
-
-const parseTableAlignment = (cell: string): TableAlign => {
-  const normalized = cell.trim();
-  if (normalized.startsWith(":") && normalized.endsWith(":")) return "center";
-  if (normalized.endsWith(":")) return "right";
-  return "left";
-};
-
-const padCell = (value: string, width: number, align: TableAlign): string => {
-  if (value.length >= width) return value;
-  const pad = width - value.length;
-  if (align === "right") return `${" ".repeat(pad)}${value}`;
-  if (align === "center") {
-    const left = Math.floor(pad / 2);
-    const right = pad - left;
-    return `${" ".repeat(left)}${value}${" ".repeat(right)}`;
-  }
-  return `${value}${" ".repeat(pad)}`;
-};
-
-const renderTableRow = (cells: string[], widths: number[], aligns: TableAlign[]): string =>
-  `| ${widths.map((width, idx) => padCell(cells[idx] ?? "", width, aligns[idx])).join(" | ")} |`;
-
-const renderTableSeparator = (widths: number[]): string =>
-  `| ${widths.map((width) => "-".repeat(Math.max(3, width))).join(" | ")} |`;
-
-export const formatMarkdownTablesForDiscord = (text: string): string => {
-  const lines = text.replace(/\r/g, "").split("\n");
-  const out: string[] = [];
-  let inFence = false;
-  let fenceMarker = "";
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const trimmed = line.trim();
-
-    if (trimmed.startsWith("```") || trimmed.startsWith("~~~")) {
-      if (!inFence) {
-        inFence = true;
-        fenceMarker = trimmed.slice(0, 3);
-      } else if (trimmed.startsWith(fenceMarker)) {
-        inFence = false;
-      }
-      out.push(line);
-      continue;
-    }
-
-    if (inFence) {
-      out.push(line);
-      continue;
-    }
-
-    const header = splitTableRow(line);
-    const separator = i + 1 < lines.length ? splitTableRow(lines[i + 1] ?? "") : [];
-    const isTable = (
-      header.length >= 2
-      && separator.length >= 2
-      && header.length === separator.length
-      && separator.every(isTableSeparatorCell)
-    );
-
-    if (!isTable) {
-      out.push(line);
-      continue;
-    }
-
-    const aligns = separator.map(parseTableAlignment);
-    const rows: string[][] = [];
-    let j = i + 2;
-    while (j < lines.length) {
-      const row = splitTableRow(lines[j] ?? "");
-      if (row.length < 2) break;
-      if (row.every(isTableSeparatorCell)) break;
-      rows.push(row);
-      j += 1;
-    }
-
-    const colCount = header.length;
-    const normalizedRows = rows.map((row) =>
-      Array.from({ length: colCount }, (_unused, idx) => row[idx] ?? ""));
-    const widths = Array.from({ length: colCount }, (_unused, idx) =>
-      Math.max(
-        header[idx]?.length ?? 0,
-        ...normalizedRows.map((row) => row[idx]?.length ?? 0),
-      ));
-
-    out.push("```text");
-    out.push(renderTableRow(header, widths, aligns));
-    out.push(renderTableSeparator(widths));
-    for (const row of normalizedRows) {
-      out.push(renderTableRow(row, widths, aligns));
-    }
-    out.push("```");
-    i = j - 1;
-  }
-
-  return out.join("\n");
-};
+export const formatMarkdownTablesForDiscord = (text: string): string =>
+  formatMarkdownTables(text, (tableLines) => [
+    "```text",
+    ...tableLines,
+    "```",
+  ]);
 
 const splitMessage = (text: string, max: number = 1800): string[] => {
   if (text.length <= max) return [text];
@@ -162,7 +62,10 @@ const splitMessage = (text: string, max: number = 1800): string[] => {
     let cut = remaining.lastIndexOf("\n", max);
     if (cut <= 0) cut = max;
     chunks.push(remaining.slice(0, cut));
-    remaining = remaining.slice(cut).trimStart();
+    remaining = remaining.slice(cut);
+    if (remaining.startsWith("\n")) {
+      remaining = remaining.slice(1);
+    }
   }
   if (remaining.length > 0) chunks.push(remaining);
   return chunks;

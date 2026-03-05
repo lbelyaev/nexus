@@ -277,6 +277,90 @@ describe("createTelegramAdapter", () => {
     expect(methods.filter((m) => m === "editMessageText")).toHaveLength(1);
   });
 
+  it("renders markdown tables as preformatted HTML blocks", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ message_id: 80 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const adapter = createTelegramAdapter({ botToken: "token" });
+    await adapter.sendMessage({
+      conversationId: "chat-table",
+      text: [
+        "Here are the results:",
+        "",
+        "| Package | Lines |",
+        "|---------|------:|",
+        "| gateway | 4701 |",
+        "| channels | 2065 |",
+      ].join("\n"),
+    });
+
+    const payload = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(payload.parse_mode).toBe("HTML");
+    // Table should be wrapped in <pre> tags with aligned columns
+    expect(payload.text).toContain("<pre>");
+    expect(payload.text).toContain("</pre>");
+    expect(payload.text).toContain("| gateway  |  4701 |");
+    expect(payload.text).toContain("| channels |  2065 |");
+    // Surrounding text should still be present and not inside <pre>
+    expect(payload.text).toMatch(/Here are the results:[\s\S]*<pre>/);
+  });
+
+  it("does not wrap tables inside code fences as double-pre", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ message_id: 81 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const adapter = createTelegramAdapter({ botToken: "token" });
+    await adapter.sendMessage({
+      conversationId: "chat-fenced",
+      text: [
+        "```",
+        "| a | b |",
+        "|---|---|",
+        "| 1 | 2 |",
+        "```",
+      ].join("\n"),
+    });
+
+    const payload = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    // The code fence becomes a single <pre> — the table inside should NOT be double-wrapped
+    const preCount = (payload.text.match(/<pre>/g) ?? []).length;
+    expect(preCount).toBe(1);
+  });
+
+  it("renders tables correctly in final streaming edit", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ message_id: 82 }))
+      .mockResolvedValueOnce(jsonResponse(true));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tableText = [
+      "| Name | Score |",
+      "|------|------:|",
+      "| Alice | 95 |",
+      "| Bob | 87 |",
+    ].join("\n");
+
+    const adapter = createTelegramAdapter({ botToken: "token" });
+    await adapter.upsertStreamingMessage?.({
+      conversationId: "chat-stream-table",
+      streamId: "stream-table",
+      text: tableText,
+      done: false,
+    });
+    await adapter.upsertStreamingMessage?.({
+      conversationId: "chat-stream-table",
+      streamId: "stream-table",
+      text: tableText,
+      done: true,
+    });
+
+    const finalPayload = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body));
+    expect(finalPayload.parse_mode).toBe("HTML");
+    expect(finalPayload.text).toContain("<pre>");
+    expect(finalPayload.text).toContain("| Alice |");
+    expect(finalPayload.text).toContain("95 |");
+  });
+
   it("registers slash commands on startup", async () => {
     const onMessage = vi.fn().mockResolvedValue(undefined);
     const fetchMock = vi.fn(async (url: string, _init?: RequestInit) => {

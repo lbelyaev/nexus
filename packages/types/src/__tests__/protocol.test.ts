@@ -249,6 +249,15 @@ describe("isGatewayEvent", () => {
     expect(isGatewayEvent({ type: "session_closed", sessionId: "s1", reason: "client_close" })).toBe(true);
   });
 
+  it("validates session_invalidated", () => {
+    expect(isGatewayEvent({
+      type: "session_invalidated",
+      sessionId: "s1",
+      reason: "runtime_state_lost",
+      message: "Session runtime state was lost and cold-restored.",
+    })).toBe(true);
+  });
+
   it("validates auth and transfer gateway events", () => {
     expect(isGatewayEvent({
       type: "auth_challenge",

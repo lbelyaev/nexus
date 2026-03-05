@@ -37,4 +37,18 @@ describe("serializeGatewayEvent", () => {
     expect(out).toContain("session_created");
     expect(out).toContain("codex");
   });
+
+  it("serializes session_invalidated in pretty mode", () => {
+    const out = serializeGatewayEvent(
+      {
+        type: "session_invalidated",
+        sessionId: "s1",
+        reason: "runtime_state_lost",
+        message: "Session runtime state was lost after restart and cold-restored.",
+      },
+      "pretty",
+    );
+    expect(out).toContain("session_invalidated");
+    expect(out).toContain("runtime_state_lost");
+  });
 });

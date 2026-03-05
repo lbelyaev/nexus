@@ -594,6 +594,12 @@ export const createRouter = (deps: RouterDeps): Router => {
           workspaceId,
           lastActivityAt: new Date().toISOString(),
         });
+        emit({
+          type: "session_invalidated",
+          sessionId,
+          reason: "runtime_state_lost",
+          message: "Session runtime state was lost after restart and cold-restored. Replay transcript if needed.",
+        });
         log.info("session_rehydrated", {
           connectionId: connectionId ?? null,
           sessionId,
@@ -820,11 +826,12 @@ export const createRouter = (deps: RouterDeps): Router => {
       source,
       workspaceId,
     };
-    createAcpSession(msg.runtimeId, msg.model, emit, policyContext).then(
-      (acpSession) => {
-        const sessionId = acpSession.id;
-        const now = new Date().toISOString();
+    void (async () => {
+      const acpSession = await createAcpSession(msg.runtimeId, msg.model, emit, policyContext);
+      const sessionId = acpSession.id;
+      const now = new Date().toISOString();
 
+      try {
         stateStore.createSession({
           id: sessionId,
           workspaceId,
@@ -839,52 +846,58 @@ export const createRouter = (deps: RouterDeps): Router => {
           tokenUsage: { input: 0, output: 0 },
           model: acpSession.model,
         });
+      } catch (error) {
+        try {
+          acpSession.cancel();
+        } catch {
+          // Best-effort cleanup when persistence fails after ACP allocation.
+        }
+        throw error;
+      }
 
-        sessions.set(sessionId, acpSession);
-        sessionWorkspaces.set(sessionId, workspaceId);
-        sessionPrincipals.set(sessionId, { principalType, principalId, source });
-        sessionPolicyContexts.set(sessionId, policyContext);
-        sessionOwners.set(sessionId, emit);
-        sessionLastActivityMs.set(sessionId, Date.now());
-        emit({
-          type: "session_created",
-          sessionId,
-          model: acpSession.model,
-          runtimeId: acpSession.runtimeId,
-          workspaceId,
-          principalType,
-          principalId,
-          source,
-          modelRouting: acpSession.modelRouting,
-          modelAliases: acpSession.modelAliases,
-          modelCatalog: acpSession.modelCatalog,
-          runtimeDefaults: acpSession.runtimeDefaults,
-        });
-        log.info("session_created", {
-          sessionId,
-          runtimeId: acpSession.runtimeId,
-          model: acpSession.model,
-          workspaceId,
-          principalType,
-          principalId,
-          source,
-          connectionId: context?.connectionId ?? emitterConnectionIds.get(emit) ?? null,
-        });
-      },
-      (err: unknown) => {
-        log.error("session_create_failed", {
-          runtimeId: msg.runtimeId ?? null,
-          model: msg.model ?? null,
-          connectionId: context?.connectionId ?? emitterConnectionIds.get(emit) ?? null,
-          error: err instanceof Error ? err.message : "Unknown error",
-        });
-        emit({
-          type: "error",
-          sessionId: "",
-          message: `Failed to create session: ${err instanceof Error ? err.message : "Unknown error"}`,
-        });
-      },
-    );
+      sessions.set(sessionId, acpSession);
+      sessionWorkspaces.set(sessionId, workspaceId);
+      sessionPrincipals.set(sessionId, { principalType, principalId, source });
+      sessionPolicyContexts.set(sessionId, policyContext);
+      sessionOwners.set(sessionId, emit);
+      sessionLastActivityMs.set(sessionId, Date.now());
+      emit({
+        type: "session_created",
+        sessionId,
+        model: acpSession.model,
+        runtimeId: acpSession.runtimeId,
+        workspaceId,
+        principalType,
+        principalId,
+        source,
+        modelRouting: acpSession.modelRouting,
+        modelAliases: acpSession.modelAliases,
+        modelCatalog: acpSession.modelCatalog,
+        runtimeDefaults: acpSession.runtimeDefaults,
+      });
+      log.info("session_created", {
+        sessionId,
+        runtimeId: acpSession.runtimeId,
+        model: acpSession.model,
+        workspaceId,
+        principalType,
+        principalId,
+        source,
+        connectionId: context?.connectionId ?? emitterConnectionIds.get(emit) ?? null,
+      });
+    })().catch((err: unknown) => {
+      log.error("session_create_failed", {
+        runtimeId: msg.runtimeId ?? null,
+        model: msg.model ?? null,
+        connectionId: context?.connectionId ?? emitterConnectionIds.get(emit) ?? null,
+        error: err instanceof Error ? err.message : "Unknown error",
+      });
+      emit({
+        type: "error",
+        sessionId: "",
+        message: `Failed to create session: ${err instanceof Error ? err.message : "Unknown error"}`,
+      });
+    });
   };
 
   const handleAuthProof = (

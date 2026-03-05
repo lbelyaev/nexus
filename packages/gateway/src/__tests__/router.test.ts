@@ -171,6 +171,26 @@ describe("createRouter", () => {
     expect(stored?.workspaceId).toBe("acme");
   });
 
+  it("session_new emits error when state persistence fails after ACP creation", async () => {
+    const { emit, events } = collectEvents();
+    const createSessionSpy = vi.spyOn(stateStore, "createSession").mockImplementation(() => {
+      throw new Error("db write failed");
+    });
+
+    router.handleMessage({ type: "session_new" }, emit);
+
+    await vi.waitFor(() => {
+      expect(events.some((event) => event.type === "error")).toBe(true);
+    });
+    const errorEvent = events.find((event): event is Extract<GatewayEvent, { type: "error" }> => event.type === "error");
+    expect(errorEvent).toBeDefined();
+    expect(errorEvent?.message).toContain("db write failed");
+    expect(events.some((event) => event.type === "session_created")).toBe(false);
+    expect(acpSession.cancel).toHaveBeenCalledTimes(1);
+
+    createSessionSpy.mockRestore();
+  });
+
   it("session_new uses provided principal and source", async () => {
     const { emit, events } = collectEvents();
     router.handleMessage({
@@ -248,6 +268,9 @@ describe("createRouter", () => {
       expect(promptSpy).toHaveBeenCalledWith("resume turn", []);
     });
     await vi.waitFor(() => {
+      expect(events.some((event) => event.type === "session_invalidated" && event.sessionId === "gw-persisted-1")).toBe(true);
+    });
+    await vi.waitFor(() => {
       expect(events.some((event) => event.type === "turn_end" && event.sessionId === "gw-persisted-1")).toBe(true);
     });
   });
@@ -297,6 +320,7 @@ describe("createRouter", () => {
       expect(usageEvent).toBeDefined();
       expect(usageEvent?.summary.tokens.total).toBe(10);
     });
+    expect(events.some((event) => event.type === "session_invalidated" && event.sessionId === "gw-persisted-usage")).toBe(true);
   });
 
   it("auth_proof binds a verified principal that session_new reuses", async () => {

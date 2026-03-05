@@ -221,6 +221,7 @@ export const App = ({ url, token }: AppProps) => {
 
   // Finalize response into messages when streaming stops
   const prevStreamingRef = useRef(false);
+  const previousSessionIdRef = useRef<string | null>(null);
   const processedUsageResultsRef = useRef(0);
   const lastErrorRef = useRef<string | null>(null);
   const pendingSessionListLimitRef = useRef<number | null>(null);
@@ -257,6 +258,50 @@ export const App = ({ url, token }: AppProps) => {
     lastErrorRef.current = session.error;
     setMessages((prev) => [...prev, { role: "system", text: `  Error: ${session.error}` }]);
   }, [session.error]);
+
+  useEffect(() => {
+    const previousSessionId = previousSessionIdRef.current;
+    const nextSessionId = session.sessionId;
+    if (previousSessionId === nextSessionId) return;
+
+    if (!previousSessionId && nextSessionId) {
+      setMessages((prev) => [
+        ...prev,
+        { role: "system", text: "  ----- Session attached -----" },
+        { role: "system", text: `    session=${nextSessionId}` },
+        { role: "system", text: `    workspace=${session.sessionWorkspaceId ?? preferredWorkspaceId}` },
+        { role: "system", text: `    runtime=${session.sessionRuntimeId ?? preferredRuntimeId ?? "default"}` },
+        { role: "system", text: `    model=${session.sessionModel ?? preferredModel ?? "runtime-default"}` },
+      ]);
+    } else if (previousSessionId && nextSessionId) {
+      setMessages((prev) => [
+        ...prev,
+        { role: "system", text: "  ----- Session switched -----" },
+        { role: "system", text: `    from=${previousSessionId}` },
+        { role: "system", text: `    to=${nextSessionId}` },
+        { role: "system", text: `    workspace=${session.sessionWorkspaceId ?? preferredWorkspaceId}` },
+        { role: "system", text: `    runtime=${session.sessionRuntimeId ?? preferredRuntimeId ?? "default"}` },
+        { role: "system", text: `    model=${session.sessionModel ?? preferredModel ?? "runtime-default"}` },
+      ]);
+    } else if (previousSessionId && !nextSessionId) {
+      setMessages((prev) => [
+        ...prev,
+        { role: "system", text: "  ----- Session detached -----" },
+        { role: "system", text: `    previous=${previousSessionId}` },
+        { role: "system", text: "    No active session." },
+      ]);
+    }
+
+    previousSessionIdRef.current = nextSessionId;
+  }, [
+    preferredModel,
+    preferredRuntimeId,
+    preferredWorkspaceId,
+    session.sessionId,
+    session.sessionModel,
+    session.sessionRuntimeId,
+    session.sessionWorkspaceId,
+  ]);
 
   useEffect(() => {
     const pendingLimit = pendingSessionListLimitRef.current;

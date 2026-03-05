@@ -7,6 +7,8 @@ import type {
   ChannelTypingState,
 } from "../types.js";
 
+import { formatMarkdownTables } from "./tables.js";
+
 export interface TelegramAdapterOptions {
   id?: string;
   botToken: string;
@@ -123,6 +125,11 @@ const markdownToTelegramHtml = (text: string): string => {
   working = working.replace(/`([^`\n]+)`/g, (_match, code: string) =>
     toPlaceholder(`<code>${escapeHtml(code)}</code>`));
 
+  // Convert markdown tables to <pre> blocks before HTML-escaping the rest.
+  working = formatMarkdownTables(working, (tableLines) => [
+    toPlaceholder(`<pre>${escapeHtml(tableLines.join("\n"))}</pre>`),
+  ]);
+
   working = escapeHtml(working);
   working = working.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, "<a href=\"$2\">$1</a>");
   working = working.replace(/\*\*([^*\n][^*]*?)\*\*/g, "<b>$1</b>");
@@ -206,7 +213,10 @@ const splitMessage = (text: string, max: number = 3800): string[] => {
     let cut = remaining.lastIndexOf("\n", max);
     if (cut <= 0) cut = max;
     chunks.push(remaining.slice(0, cut));
-    remaining = remaining.slice(cut).trimStart();
+    remaining = remaining.slice(cut);
+    if (remaining.startsWith("\n")) {
+      remaining = remaining.slice(1);
+    }
   }
   if (remaining.length > 0) chunks.push(remaining);
   return chunks;

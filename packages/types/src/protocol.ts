@@ -179,6 +179,12 @@ export type GatewayEvent =
       modelCatalog?: Record<string, string[]>;
       runtimeDefaults?: Record<string, string>;
     }
+  | {
+      type: "session_invalidated";
+      sessionId: string;
+      reason: string;
+      message: string;
+    }
   | { type: "session_closed"; sessionId: string; reason: string }
   | {
       type: "auth_challenge";
@@ -332,6 +338,7 @@ const GATEWAY_EVENT_TYPES = new Set([
   "turn_end",
   "error",
   "session_created",
+  "session_invalidated",
   "session_closed",
   "auth_challenge",
   "auth_result",
@@ -590,6 +597,12 @@ export const isGatewayEvent = (value: unknown): value is GatewayEvent => {
         && (obj.modelAliases === undefined || isStringRecord(obj.modelAliases))
         && (obj.modelCatalog === undefined || isStringArrayRecord(obj.modelCatalog))
         && (obj.runtimeDefaults === undefined || isStringRecord(obj.runtimeDefaults))
+      );
+    case "session_invalidated":
+      return (
+        typeof obj.sessionId === "string"
+        && typeof obj.reason === "string"
+        && typeof obj.message === "string"
       );
     case "session_closed":
       return (

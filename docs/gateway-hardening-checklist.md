@@ -108,6 +108,30 @@ Acceptance:
 Tests:
 - state unit tests validating arithmetic update behavior.
 
+---
+
+### P0.6 Explicit cold-recovery event contract
+
+Goal: make gateway restarts visible to clients instead of silent rehydrate.
+
+Code touchpoints:
+- `packages/types/src/protocol.ts`
+  - add `session_invalidated` gateway event variant.
+- `packages/gateway/src/router.ts`
+  - emit `session_invalidated` when persisted session is cold-restored.
+- `packages/client-core`, `packages/channels`, `packages/cli`, `packages/tui`, `packages/web-client`
+  - surface user-facing notice and reset streaming UX state safely.
+
+Acceptance:
+- on runtime/gateway restart recovery, client receives explicit `session_invalidated`.
+- message explains process-bound context loss and recovery path.
+- no silent behavior changes; existing `session_replay`/`/session resume` flow remains.
+
+Tests:
+- protocol validation tests for new event.
+- router rehydrate tests assert `session_invalidated` emission.
+- client/channels/CLI rendering tests for event handling.
+
 ## P1 (next)
 
 ### P1.1 DB-side paginated session list
@@ -157,11 +181,12 @@ Follow-up:
 1. P0.1 floating promise
 2. P0.2 event binding/concurrency
 3. P0.5 atomic token counters
-4. P0.3 WS backpressure
-5. P0.4 runtime restart
-6. P1.1 session-list pagination
-7. P1.2 usage aggregation
-8. P1.3 alias removal cleanup
+4. P0.6 cold-recovery event contract
+5. P0.3 WS backpressure
+6. P0.4 runtime restart
+7. P1.1 session-list pagination
+8. P1.2 usage aggregation
+9. P1.3 alias removal cleanup
 
 ## Release gates
 

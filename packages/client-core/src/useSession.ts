@@ -287,6 +287,25 @@ export const useSession = (
         }
         setPendingSessionTransfers((prev) => prev.filter((transfer) => transfer.sessionId !== event.sessionId));
         break;
+      case "session_invalidated":
+        if (event.sessionId !== sessionId) break;
+        queuedSteerRef.current = null;
+        ignoreCancelledTurnEndRef.current = false;
+        textBufferRef.current = "";
+        thinkingBufferRef.current = "";
+        if (flushTimerRef.current) {
+          clearTimeout(flushTimerRef.current);
+          flushTimerRef.current = null;
+        }
+        setResponseText("");
+        setThinkingText("");
+        setIsStreaming(false);
+        setActiveTools([]);
+        setToolCalls((prev) => prev.map((tool) => (
+          tool.status === "running" ? { ...tool, status: "failed" } : tool
+        )));
+        setError(event.message);
+        break;
       case "runtime_health":
         setRuntimeHealth((prev) => ({
           ...prev,
@@ -365,6 +384,12 @@ export const useSession = (
           && authPrincipalTypeRef.current !== null
           && event.targetPrincipalId === authPrincipalIdRef.current
           && event.targetPrincipalType === authPrincipalTypeRef.current;
+        const isSource =
+          authStatusRef.current === "verified"
+          && authPrincipalIdRef.current !== null
+          && authPrincipalTypeRef.current !== null
+          && event.fromPrincipalId === authPrincipalIdRef.current
+          && event.fromPrincipalType === authPrincipalTypeRef.current;
 
         if (isTarget) {
           queuedSteerRef.current = null;
@@ -389,6 +414,31 @@ export const useSession = (
           setSessionPrincipalId(event.targetPrincipalId);
           setSessionSource("interactive");
           sendMessage({ type: "session_replay", sessionId: event.sessionId });
+        } else if (isSource && sessionId === event.sessionId) {
+          // Session ownership moved away from this client; detach local active session pointer.
+          queuedSteerRef.current = null;
+          ignoreCancelledTurnEndRef.current = false;
+          textBufferRef.current = "";
+          thinkingBufferRef.current = "";
+          if (flushTimerRef.current) {
+            clearTimeout(flushTimerRef.current);
+            flushTimerRef.current = null;
+          }
+          setSessionId(null);
+          setSessionModel(null);
+          setSessionRuntimeId(null);
+          setSessionWorkspaceId(null);
+          sessionPrincipalTypeRef.current = null;
+          sessionPrincipalIdRef.current = null;
+          sessionSourceRef.current = null;
+          setSessionPrincipalType(null);
+          setSessionPrincipalId(null);
+          setSessionSource(null);
+          setResponseText("");
+          setThinkingText("");
+          setIsStreaming(false);
+          setActiveTools([]);
+          setToolCalls([]);
         }
         break;
       }

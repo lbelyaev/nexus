@@ -241,6 +241,7 @@ const ConnectedClient = ({
   const chatViewportRef = useRef<HTMLDivElement | null>(null);
   const shouldAutoScrollRef = useRef(true);
   const previousStatusRef = useRef<"connecting" | "connected" | "disconnected" | "error">("connecting");
+  const previousSessionIdRef = useRef<string | null>(null);
 
   const sessionRef = useRef<UseSessionResult | null>(null);
   const approvalRef = useRef<UseApprovalResult | null>(null);
@@ -375,6 +376,48 @@ const ConnectedClient = ({
     lastErrorRef.current = session.error;
     appendSystem(`Error: ${session.error}`);
   }, [appendSystem, session.error]);
+
+  useEffect(() => {
+    const previousSessionId = previousSessionIdRef.current;
+    const nextSessionId = session.sessionId;
+    if (previousSessionId === nextSessionId) return;
+
+    if (!previousSessionId && nextSessionId) {
+      appendSystem([
+        "----- Session attached -----",
+        `session=${nextSessionId}`,
+        `workspace=${session.sessionWorkspaceId ?? preferredWorkspaceId}`,
+        `runtime=${session.sessionRuntimeId ?? preferredRuntimeId ?? "default"}`,
+        `model=${session.sessionModel ?? preferredModel ?? "runtime-default"}`,
+      ].join("\n"));
+    } else if (previousSessionId && nextSessionId) {
+      appendSystem([
+        "----- Session switched -----",
+        `from=${previousSessionId}`,
+        `to=${nextSessionId}`,
+        `workspace=${session.sessionWorkspaceId ?? preferredWorkspaceId}`,
+        `runtime=${session.sessionRuntimeId ?? preferredRuntimeId ?? "default"}`,
+        `model=${session.sessionModel ?? preferredModel ?? "runtime-default"}`,
+      ].join("\n"));
+    } else if (previousSessionId && !nextSessionId) {
+      appendSystem([
+        "----- Session detached -----",
+        `previous=${previousSessionId}`,
+        "No active session.",
+      ].join("\n"));
+    }
+
+    previousSessionIdRef.current = nextSessionId;
+  }, [
+    appendSystem,
+    preferredModel,
+    preferredRuntimeId,
+    preferredWorkspaceId,
+    session.sessionId,
+    session.sessionModel,
+    session.sessionRuntimeId,
+    session.sessionWorkspaceId,
+  ]);
 
   useEffect(() => {
     if (!shouldAutoScrollRef.current) return;

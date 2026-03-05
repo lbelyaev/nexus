@@ -881,6 +881,87 @@ describe("useSession", () => {
     });
   });
 
+  it("session_transferred from authenticated principal detaches active session", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "auth_result",
+        ok: true,
+        principalType: "user",
+        principalId: "user:web:xyz",
+      });
+      result.current.handleEvent({
+        type: "session_created",
+        sessionId: "sess-owned",
+        model: "claude-4",
+        principalType: "user",
+        principalId: "user:web:xyz",
+        source: "interactive",
+      });
+    });
+    sendMessage.mockClear();
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_transferred",
+        sessionId: "sess-owned",
+        fromPrincipalType: "user",
+        fromPrincipalId: "user:web:xyz",
+        targetPrincipalType: "user",
+        targetPrincipalId: "user:telegram-main:139038976",
+        transferredAt: "2026-01-01T00:00:01Z",
+      });
+    });
+
+    expect(result.current.sessionId).toBeNull();
+    expect(result.current.sessionModel).toBeNull();
+    expect(result.current.sessionPrincipalType).toBeNull();
+    expect(result.current.sessionPrincipalId).toBeNull();
+    expect(result.current.isStreaming).toBe(false);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("session_invalidated stops streaming and surfaces cold-recovery message", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_created",
+        sessionId: "sess-rehydrate",
+        model: "claude-4",
+      });
+      result.current.handleEvent({
+        type: "tool_start",
+        sessionId: "sess-rehydrate",
+        tool: "Bash",
+        params: { command: "ls" },
+      });
+      result.current.handleEvent({
+        type: "text_delta",
+        sessionId: "sess-rehydrate",
+        delta: "hello",
+      });
+    });
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_invalidated",
+        sessionId: "sess-rehydrate",
+        reason: "runtime_state_lost",
+        message: "Session runtime state was lost after restart and cold-restored.",
+      });
+    });
+
+    expect(result.current.sessionId).toBe("sess-rehydrate");
+    expect(result.current.isStreaming).toBe(false);
+    expect(result.current.activeTools).toEqual([]);
+    expect(result.current.toolCalls[0]?.status).toBe("failed");
+    expect(result.current.error).toContain("cold-restored");
+  });
+
   it("requestUsage sends usage_query for active session", () => {
     const sendMessage = vi.fn();
     const { result } = renderHook(() => useSession(sendMessage));
