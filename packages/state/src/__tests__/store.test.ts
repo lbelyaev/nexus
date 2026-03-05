@@ -17,7 +17,9 @@ describe("createStateStore", () => {
     expect(typeof store.createSession).toBe("function");
     expect(typeof store.getSession).toBe("function");
     expect(typeof store.listSessions).toBe("function");
+    expect(typeof store.listSessionsPage).toBe("function");
     expect(typeof store.updateSession).toBe("function");
+    expect(typeof store.incrementSessionTokenUsage).toBe("function");
     expect(typeof store.logEvent).toBe("function");
     expect(typeof store.getEvents).toBe("function");
     expect(typeof store.appendMessage).toBe("function");
@@ -28,6 +30,7 @@ describe("createStateStore", () => {
     expect(typeof store.createExecution).toBe("function");
     expect(typeof store.getExecution).toBe("function");
     expect(typeof store.listExecutions).toBe("function");
+    expect(typeof store.getExecutionStateCounts).toBe("function");
     expect(typeof store.transitionExecutionState).toBe("function");
     expect(typeof store.upsertChannelBinding).toBe("function");
     expect(typeof store.getChannelBinding).toBe("function");

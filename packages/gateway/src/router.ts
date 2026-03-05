@@ -94,11 +94,18 @@ interface SessionTransferRequest {
   expiresAtMs: number;
 }
 
+interface ActivePromptTurn {
+  executionId: string;
+  emit: EventEmitter;
+}
+
 const AUTH_CHALLENGE_TTL_MS = 60_000;
 const TRANSFER_MIN_TTL_MS = 5_000;
 const TRANSFER_MAX_TTL_MS = 10 * 60 * 1000;
 const TRANSFER_DEFAULT_TTL_MS = 60_000;
 const CONSUMED_AUTH_CHALLENGE_TTL_MS = 15 * 60 * 1000;
+const DEFAULT_SESSION_LIST_LIMIT = 20;
+const MAX_SESSION_LIST_LIMIT = 100;
 
 const normalizePublicKey = (publicKey: string): string => {
   const trimmed = publicKey.trim();
@@ -315,6 +322,7 @@ export const createRouter = (deps: RouterDeps): Router => {
   }>>();
   const pendingSessionHydrations = new Map<string, Promise<boolean>>();
   const sessionToPendingRequests = new Map<string, Set<string>>();
+  const sessionActivePromptTurns = new Map<string, ActivePromptTurn[]>();
   const activeConnections = new Map<string, EventEmitter>();
   const emitterConnectionIds = new WeakMap<EventEmitter, string>();
   const connectionPrincipals = new Map<string, ConnectionPrincipal>();
@@ -500,16 +508,7 @@ export const createRouter = (deps: RouterDeps): Router => {
     const normalizedInput = Math.max(0, Math.floor(inputDelta));
     const normalizedOutput = Math.max(0, Math.floor(outputDelta));
     if (normalizedInput === 0 && normalizedOutput === 0) return;
-
-    const sessionRecord = stateStore.getSession(sessionId);
-    if (!sessionRecord) return;
-
-    stateStore.updateSession(sessionId, {
-      tokenUsage: {
-        input: sessionRecord.tokenUsage.input + normalizedInput,
-        output: sessionRecord.tokenUsage.output + normalizedOutput,
-      },
-    });
+    stateStore.incrementSessionTokenUsage(sessionId, normalizedInput, normalizedOutput);
   };
 
   const hydrateSessionIfPersisted = (
@@ -575,6 +574,7 @@ export const createRouter = (deps: RouterDeps): Router => {
           { gatewaySessionId: sessionId },
         );
         sessions.set(sessionId, restored);
+        bindSessionEventDispatcher(sessionId, restored);
         sessionWorkspaces.set(sessionId, workspaceId);
         sessionPrincipals.set(sessionId, {
           principalType,
@@ -686,6 +686,51 @@ export const createRouter = (deps: RouterDeps): Router => {
     sessionInFlightTurns.set(sessionId, next);
   };
 
+  const enqueueActivePromptTurn = (
+    sessionId: string,
+    turn: ActivePromptTurn,
+  ): void => {
+    const turns = sessionActivePromptTurns.get(sessionId) ?? [];
+    turns.push(turn);
+    sessionActivePromptTurns.set(sessionId, turns);
+  };
+
+  const dequeueActivePromptTurn = (
+    sessionId: string,
+    executionId: string,
+  ): void => {
+    const turns = sessionActivePromptTurns.get(sessionId);
+    if (!turns) return;
+    const next = turns.filter((turn) => turn.executionId !== executionId);
+    if (next.length === 0) {
+      sessionActivePromptTurns.delete(sessionId);
+      return;
+    }
+    sessionActivePromptTurns.set(sessionId, next);
+  };
+
+  const bindSessionEventDispatcher = (
+    sessionId: string,
+    session: ManagedAcpSession,
+  ): void => {
+    session.onEvent((event) => {
+      const activeTurn = sessionActivePromptTurns.get(sessionId)?.[0];
+      if (activeTurn) {
+        activeTurn.emit(event);
+        return;
+      }
+      const owner = sessionOwners.get(sessionId);
+      if (owner) {
+        owner(event);
+        return;
+      }
+      log.debug("session_event_dropped_without_owner", {
+        sessionId,
+        eventType: event.type,
+      });
+    });
+  };
+
   const closeSession = (
     sessionId: string,
     reason: string,
@@ -702,6 +747,7 @@ export const createRouter = (deps: RouterDeps): Router => {
     sessionLastActivityMs.delete(sessionId);
     sessionInFlightTurns.delete(sessionId);
     sessionIdempotency.delete(sessionId);
+    sessionActivePromptTurns.delete(sessionId);
     sessionTransfers.delete(sessionId);
     clearSessionPendingApprovals(sessionId);
 
@@ -856,6 +902,7 @@ export const createRouter = (deps: RouterDeps): Router => {
       }
 
       sessions.set(sessionId, acpSession);
+      bindSessionEventDispatcher(sessionId, acpSession);
       sessionWorkspaces.set(sessionId, workspaceId);
       sessionPrincipals.set(sessionId, { principalType, principalId, source });
       sessionPolicyContexts.set(sessionId, policyContext);
@@ -1478,6 +1525,12 @@ export const createRouter = (deps: RouterDeps): Router => {
     let assistantMessageForTurn = "";
     let turnCompleted = false;
     let executionFinalized = false;
+    const markTurnCompleted = (): void => {
+      if (turnCompleted) return;
+      turnCompleted = true;
+      bumpInFlightTurns(msg.sessionId, -1);
+      dequeueActivePromptTurn(msg.sessionId, executionId);
+    };
     const finalizeExecution = (
       state: ExecutionState,
       options: {
@@ -1530,8 +1583,7 @@ export const createRouter = (deps: RouterDeps): Router => {
           });
         }
         if (event.type === "turn_end" && !turnCompleted) {
-          turnCompleted = true;
-          bumpInFlightTurns(msg.sessionId, -1);
+          markTurnCompleted();
           finalizeExecution(
             mapStopReasonToExecutionState(event.stopReason),
             { stopReason: event.stopReason },
@@ -1610,13 +1662,58 @@ export const createRouter = (deps: RouterDeps): Router => {
       });
     }
 
-    // Always bind prompt-time emitter so streaming events (approval/tool/text)
-    // are delivered to the same client that initiated this prompt.
-    session.onEvent(recordingEmitWithHooks);
+    enqueueActivePromptTurn(msg.sessionId, {
+      executionId,
+      emit: recordingEmitWithHooks,
+    });
 
-    // ACP streaming events flow via session.onEvent → emit
+    // ACP streaming events flow via session-scoped dispatcher → active prompt turn emitter.
     // prompt() resolves when the turn ends (PromptResponse with stopReason)
-    session.prompt(promptText, imageInputs).then(
+    let promptPromise: Promise<unknown>;
+    try {
+      promptPromise = Promise.resolve(session.prompt(promptText, imageInputs));
+    } catch (err) {
+      if (idempotencyKey) {
+        sessionIdempotency.get(msg.sessionId)?.delete(idempotencyKey);
+      }
+      finalizeExecution("failed", {
+        errorMessage: err instanceof Error ? err.message : "Unknown error",
+      });
+      markTurnCompleted();
+      touchSession(msg.sessionId);
+      log.error("prompt_failed", {
+        connectionId,
+        sessionId: msg.sessionId,
+        runtimeId: session.runtimeId,
+        executionId,
+        parentExecutionId: parentExecutionId ?? null,
+        turnId,
+        policySnapshotId,
+        error: err instanceof Error ? err.message : "Unknown error",
+      });
+      stateStore.logEvent({
+        sessionId: msg.sessionId,
+        timestamp: new Date().toISOString(),
+        type: "error",
+        detail: safeStringify({
+          executionId,
+          parentExecutionId,
+          turnId,
+          policySnapshotId,
+          principalType: principal.principalType,
+          principalId: principal.principalId,
+          source: principal.source,
+          error: err instanceof Error ? err.message : "Unknown error",
+        }),
+      });
+      emitWithCorrelation({
+        type: "error",
+        sessionId: msg.sessionId,
+        message: err instanceof Error ? err.message : "Unknown error",
+      });
+      return;
+    }
+    promptPromise.then(
       (result) => {
         log.info("prompt_response", {
           connectionId,
@@ -1723,10 +1820,7 @@ export const createRouter = (deps: RouterDeps): Router => {
         finalizeExecution("failed", {
           errorMessage: err instanceof Error ? err.message : "Unknown error",
         });
-        if (!turnCompleted) {
-          turnCompleted = true;
-          bumpInFlightTurns(msg.sessionId, -1);
-        }
+        markTurnCompleted();
         touchSession(msg.sessionId);
         log.error("prompt_failed", {
           connectionId,
@@ -1763,34 +1857,66 @@ export const createRouter = (deps: RouterDeps): Router => {
   };
 
   const handleSessionList = (
+    msg: Extract<ClientMessage, { type: "session_list" }>,
     emit: EventEmitter,
     context?: RouterMessageContext,
   ): void => {
-    const sessionsList = stateStore.listSessions();
+    const requestedLimit = Math.max(
+      1,
+      Math.min(
+        Number.isFinite(msg.limit) ? Math.floor(msg.limit as number) : DEFAULT_SESSION_LIST_LIMIT,
+        MAX_SESSION_LIST_LIMIT,
+      ),
+    );
     const connectionId = context?.connectionId ?? emitterConnectionIds.get(emit);
     const connectionPrincipal = resolvePrincipal(connectionId);
-    const sessions = connectionPrincipal?.verified
-      ? sessionsList.filter((session) => {
-          const principalType = session.principalType ?? "user";
-          const principalId = session.principalId ?? "user:local";
-          const source = session.source ?? "interactive";
-          if (
-            principalType === "user"
-            && principalId === "user:local"
-            && source === "interactive"
-          ) {
-            return sessionOwners.get(session.id) === emit;
-          }
-          return (
-            principalType === connectionPrincipal.principalType
-            && principalId === connectionPrincipal.principalId
-          );
-        })
-      : sessionsList.filter((session) => sessionOwners.get(session.id) === emit);
+    if (connectionPrincipal?.verified) {
+      try {
+        const page = stateStore.listSessionsPage({
+          principalType: connectionPrincipal.principalType,
+          principalId: connectionPrincipal.principalId,
+          limit: requestedLimit,
+          ...(msg.cursor ? { cursor: msg.cursor } : {}),
+        });
+        emit({
+          type: "session_list",
+          sessions: page.sessions,
+          hasMore: page.hasMore,
+          ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+        });
+      } catch (error) {
+        log.warn("session_list_failed", {
+          connectionId: connectionId ?? null,
+          principalType: connectionPrincipal.principalType,
+          principalId: connectionPrincipal.principalId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        emit({
+          type: "error",
+          sessionId: "session-list",
+          message: error instanceof Error ? error.message : "Unable to list sessions.",
+        });
+      }
+      return;
+    }
 
+    if (msg.cursor) {
+      emit({
+        type: "error",
+        sessionId: "session-list",
+        message: "Session list cursor requires authenticated principal.",
+      });
+      return;
+    }
+
+    const sessionsList = stateStore
+      .listSessions()
+      .filter((session) => sessionOwners.get(session.id) === emit);
+    const hasMore = sessionsList.length > requestedLimit;
     emit({
       type: "session_list",
-      sessions,
+      sessions: hasMore ? sessionsList.slice(0, requestedLimit) : sessionsList,
+      hasMore,
     });
   };
 
@@ -1985,39 +2111,7 @@ export const createRouter = (deps: RouterDeps): Router => {
     const sessionRecord = stateStore.getSession(sessionId);
     const tokensInput = sessionRecord?.tokenUsage.input ?? 0;
     const tokensOutput = sessionRecord?.tokenUsage.output ?? 0;
-    const executions = stateStore.listExecutions(sessionId, 5_000);
-    const executionCounts: UsageSummary["executions"] = {
-      total: executions.length,
-      queued: 0,
-      running: 0,
-      succeeded: 0,
-      failed: 0,
-      cancelled: 0,
-      timedOut: 0,
-    };
-
-    for (const execution of executions) {
-      switch (execution.state) {
-        case "queued":
-          executionCounts.queued += 1;
-          break;
-        case "running":
-          executionCounts.running += 1;
-          break;
-        case "succeeded":
-          executionCounts.succeeded += 1;
-          break;
-        case "failed":
-          executionCounts.failed += 1;
-          break;
-        case "cancelled":
-          executionCounts.cancelled += 1;
-          break;
-        case "timed_out":
-          executionCounts.timedOut += 1;
-          break;
-      }
-    }
+    const executionCounts = stateStore.getExecutionStateCounts(sessionId);
 
     const summary: UsageSummary = {
       tokens: {
@@ -2429,7 +2523,7 @@ export const createRouter = (deps: RouterDeps): Router => {
       case "prompt":
         return handlePrompt(msg, emit, context);
       case "session_list":
-        return handleSessionList(emit, context);
+        return handleSessionList(msg, emit, context);
       case "cancel":
         return handleCancel(msg, emit, context);
       case "session_close":

@@ -1,11 +1,26 @@
 import type { DatabaseAdapter } from "./database.js";
 import type { SessionRecord, SessionInfo } from "@nexus/types";
 
+export interface SessionListPageQuery {
+  principalType?: SessionRecord["principalType"];
+  principalId?: string;
+  limit?: number;
+  cursor?: string;
+}
+
+export interface SessionListPage {
+  sessions: SessionInfo[];
+  hasMore: boolean;
+  nextCursor?: string;
+}
+
 export interface SessionStore {
   createSession: (session: SessionRecord) => void;
   getSession: (id: string) => SessionRecord | null;
   listSessions: () => SessionInfo[];
+  listSessionsPage: (query: SessionListPageQuery) => SessionListPage;
   updateSession: (id: string, patch: Partial<Omit<SessionRecord, "id">>) => void;
+  incrementSessionTokenUsage: (id: string, inputDelta: number, outputDelta: number) => void;
 }
 
 interface SessionRow {
@@ -51,6 +66,27 @@ const rowToInfo = (row: SessionRow): SessionInfo => ({
   lastActivityAt: row.lastActivityAt,
 });
 
+const encodeSessionListCursor = (row: Pick<SessionRow, "id" | "lastActivityAt">): string =>
+  Buffer.from(JSON.stringify({
+    id: row.id,
+    lastActivityAt: row.lastActivityAt,
+  }), "utf8").toString("base64url");
+
+const decodeSessionListCursor = (cursor: string): { id: string; lastActivityAt: string } => {
+  try {
+    const parsed = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as Record<string, unknown>;
+    if (typeof parsed.id !== "string" || typeof parsed.lastActivityAt !== "string") {
+      throw new Error("Invalid cursor payload");
+    }
+    return {
+      id: parsed.id,
+      lastActivityAt: parsed.lastActivityAt,
+    };
+  } catch {
+    throw new Error("Invalid session list cursor");
+  }
+};
+
 export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
   const insertStmt = db.prepare(
     `INSERT INTO sessions (id, workspaceId, principalType, principalId, source, runtimeId, acpSessionId, status, createdAt, lastActivityAt, tokenInput, tokenOutput, model)
@@ -61,6 +97,18 @@ export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
 
   const listStmt = db.prepare(
     "SELECT * FROM sessions ORDER BY lastActivityAt DESC",
+  );
+  const listPageStmt = db.prepare(
+    `SELECT * FROM sessions
+     WHERE (@principalType IS NULL OR principalType = @principalType)
+       AND (@principalId IS NULL OR principalId = @principalId)
+       AND (
+         @cursorLastActivityAt IS NULL
+         OR lastActivityAt < @cursorLastActivityAt
+         OR (lastActivityAt = @cursorLastActivityAt AND id < @cursorId)
+       )
+     ORDER BY lastActivityAt DESC, id DESC
+     LIMIT @limitPlusOne`,
   );
 
   const createSession = (session: SessionRecord): void => {
@@ -89,6 +137,29 @@ export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
   const listSessions = (): SessionInfo[] => {
     const rows = listStmt.all() as SessionRow[];
     return rows.map(rowToInfo);
+  };
+
+  const listSessionsPage = (query: SessionListPageQuery): SessionListPage => {
+    const safeLimit = Math.max(1, Math.min(Math.floor(query.limit ?? 20), 100));
+    const cursor = query.cursor ? decodeSessionListCursor(query.cursor) : null;
+    const rows = listPageStmt.all({
+      principalType: query.principalType ?? null,
+      principalId: query.principalId ?? null,
+      cursorLastActivityAt: cursor?.lastActivityAt ?? null,
+      cursorId: cursor?.id ?? null,
+      limitPlusOne: safeLimit + 1,
+    }) as SessionRow[];
+    const hasMore = rows.length > safeLimit;
+    const pageRows = hasMore ? rows.slice(0, safeLimit) : rows;
+    const sessions = pageRows.map(rowToInfo);
+    const nextCursor = hasMore && pageRows.length > 0
+      ? encodeSessionListCursor(pageRows[pageRows.length - 1])
+      : undefined;
+    return {
+      sessions,
+      hasMore,
+      ...(nextCursor ? { nextCursor } : {}),
+    };
   };
 
   const updateSession = (
@@ -154,5 +225,37 @@ export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
     }
   };
 
-  return { createSession, getSession, listSessions, updateSession };
+  const incrementSessionTokenUsage = (
+    id: string,
+    inputDelta: number,
+    outputDelta: number,
+  ): void => {
+    const normalizedInput = Number.isFinite(inputDelta) ? Math.floor(inputDelta) : 0;
+    const normalizedOutput = Number.isFinite(outputDelta) ? Math.floor(outputDelta) : 0;
+    if (normalizedInput === 0 && normalizedOutput === 0) return;
+
+    const result = db.prepare(
+      `UPDATE sessions
+       SET tokenInput = tokenInput + @inputDelta,
+           tokenOutput = tokenOutput + @outputDelta
+       WHERE id = @id`,
+    ).run({
+      id,
+      inputDelta: normalizedInput,
+      outputDelta: normalizedOutput,
+    });
+
+    if (result.changes === 0) {
+      throw new Error(`Session not found: ${id}`);
+    }
+  };
+
+  return {
+    createSession,
+    getSession,
+    listSessions,
+    listSessionsPage,
+    updateSession,
+    incrementSessionTokenUsage,
+  };
 };

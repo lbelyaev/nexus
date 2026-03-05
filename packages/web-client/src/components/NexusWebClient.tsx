@@ -158,6 +158,7 @@ const formatSessionListResult = (
   sessions: UseSessionResult["sessionList"],
   limit: number,
   activeSessionId: string | null,
+  hasMore: boolean,
 ): ChatMessage[] => {
   if (sessions.length === 0) {
     return [{ id: makeId(), role: "system", text: "No sessions found." }];
@@ -171,6 +172,7 @@ const formatSessionListResult = (
       role: "system" as const,
       text: `- ${session.id}${session.id === activeSessionId ? " (current)" : ""} status=${session.status} workspace=${session.workspaceId ?? "default"} model=${session.model} last=${session.lastActivityAt}`,
     })),
+    ...(hasMore ? [{ id: makeId(), role: "system" as const, text: "More sessions available. Use /session list next." }] : []),
   ];
 };
 
@@ -237,6 +239,7 @@ const ConnectedClient = ({
   const prevStreamingRef = useRef(false);
   const processedUsageResultsRef = useRef(0);
   const pendingSessionListLimitRef = useRef<number | null>(null);
+  const sessionListLimitRef = useRef(10);
   const lastErrorRef = useRef<string | null>(null);
   const chatViewportRef = useRef<HTMLDivElement | null>(null);
   const shouldAutoScrollRef = useRef(true);
@@ -367,8 +370,15 @@ const ConnectedClient = ({
     const pendingLimit = pendingSessionListLimitRef.current;
     if (pendingLimit === null) return;
     pendingSessionListLimitRef.current = null;
-    appendMessages(formatSessionListResult(session.sessionList, pendingLimit, session.sessionId));
-  }, [appendMessages, session.sessionId, session.sessionList]);
+    appendMessages(
+      formatSessionListResult(
+        session.sessionList,
+        pendingLimit,
+        session.sessionId,
+        session.sessionListHasMore,
+      ),
+    );
+  }, [appendMessages, session.sessionId, session.sessionList, session.sessionListHasMore]);
 
   useEffect(() => {
     if (!session.error) return;
@@ -828,7 +838,7 @@ const ConnectedClient = ({
           const sub = restParts[0]?.toLowerCase();
           if (!sub || sub === "help") {
             appendSystem("Usage: /session <command>");
-            appendSystem("/session list [limit]");
+            appendSystem("/session list [limit|next [limit]]");
             appendSystem("/session resume <sessionId>");
             appendSystem("/session takeover <sessionId>");
             appendSystem("/session transfer pending|request|accept|dismiss");
@@ -837,15 +847,33 @@ const ConnectedClient = ({
             return;
           }
           if (sub === "list") {
-            const requestedLimit = restParts[1] ? Number.parseInt(restParts[1], 10) : undefined;
-            if (restParts[1] && (!Number.isFinite(requestedLimit) || (requestedLimit ?? 0) <= 0)) {
-              appendSystem("Usage: /session list [limit]");
+            const rawArg = restParts[1]?.toLowerCase();
+            const isNext = rawArg === "next";
+            const limitArg = isNext ? restParts[2] : restParts[1];
+            const requestedLimit = limitArg ? Number.parseInt(limitArg, 10) : undefined;
+            if (limitArg && (!Number.isFinite(requestedLimit) || (requestedLimit ?? 0) <= 0)) {
+              appendSystem("Usage: /session list [limit|next [limit]]");
               setPromptInput("");
               return;
             }
-            pendingSessionListLimitRef.current = requestedLimit ?? 10;
+            const limit = requestedLimit ?? sessionListLimitRef.current;
+            if (isNext) {
+              if (!session.sessionListHasMore || !session.sessionListNextCursor) {
+                appendSystem("No additional sessions in the current list window.");
+                setPromptInput("");
+                return;
+              }
+              pendingSessionListLimitRef.current = limit;
+              sessionListLimitRef.current = limit;
+              appendSystem("Fetching next sessions page...");
+              session.requestSessionList({ limit, cursor: session.sessionListNextCursor });
+              setPromptInput("");
+              return;
+            }
+            pendingSessionListLimitRef.current = limit;
+            sessionListLimitRef.current = limit;
             appendSystem("Fetching sessions...");
-            session.requestSessionList();
+            session.requestSessionList({ limit });
             setPromptInput("");
             return;
           }

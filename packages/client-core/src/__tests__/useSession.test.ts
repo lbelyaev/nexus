@@ -38,6 +38,9 @@ describe("useSession", () => {
     expect(result.current.error).toBeNull();
     expect(result.current.usageResults).toEqual([]);
     expect(result.current.pendingSessionTransfers).toEqual([]);
+    expect(result.current.sessionList).toEqual([]);
+    expect(result.current.sessionListHasMore).toBe(false);
+    expect(result.current.sessionListNextCursor).toBeNull();
   });
 
   it("sets sessionId on session_created event", () => {
@@ -642,6 +645,45 @@ describe("useSession", () => {
       type: "session_replay",
       sessionId: "sess-42",
     });
+  });
+
+  it("requestSessionList sends paginated session_list message", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.requestSessionList({ limit: 15, cursor: "cursor-1" });
+    });
+
+    expect(sendMessage).toHaveBeenCalledWith({
+      type: "session_list",
+      limit: 15,
+      cursor: "cursor-1",
+    });
+  });
+
+  it("stores session_list page metadata", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_list",
+        sessions: [{
+          id: "sess-a",
+          status: "active",
+          model: "claude-4",
+          createdAt: "2026-01-01T00:00:00Z",
+          lastActivityAt: "2026-01-01T00:05:00Z",
+        }],
+        hasMore: true,
+        nextCursor: "cursor-2",
+      });
+    });
+
+    expect(result.current.sessionList).toHaveLength(1);
+    expect(result.current.sessionListHasMore).toBe(true);
+    expect(result.current.sessionListNextCursor).toBe("cursor-2");
   });
 
   it("requestSessionTransfer targets current session by default", () => {

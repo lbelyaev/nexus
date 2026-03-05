@@ -32,6 +32,16 @@ const collectEvents = (): { emit: EventEmitter; events: GatewayEvent[] } => {
   return { emit, events };
 };
 
+const createDeferred = <T>() => {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+};
+
 const createAuthProof = (params: {
   challengeId: string;
   nonce: string;
@@ -680,7 +690,7 @@ describe("createRouter", () => {
     }
   });
 
-  it("prompt rebinds session event emitter on each prompt for owner connection", async () => {
+  it("binds session event emitter once and reuses dispatcher across prompts", async () => {
     const owner = collectEvents();
     router.handleMessage({ type: "session_new" }, owner.emit);
 
@@ -702,9 +712,75 @@ describe("createRouter", () => {
       owner.emit,
     );
 
-    expect(acpSession.onEvent).toHaveBeenCalledTimes(2);
+    expect(acpSession.onEvent).toHaveBeenCalledTimes(1);
     expect(typeof (acpSession.onEvent as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe("function");
-    expect(typeof (acpSession.onEvent as ReturnType<typeof vi.fn>).mock.calls[1][0]).toBe("function");
+  });
+
+  it("keeps overlapping prompt turn routing and finalization independent", async () => {
+    const firstPrompt = createDeferred<{ stopReason?: string; content?: unknown }>();
+    const secondPrompt = createDeferred<{ stopReason?: string; content?: unknown }>();
+    (acpSession.prompt as ReturnType<typeof vi.fn>)
+      .mockImplementationOnce(() => firstPrompt.promise)
+      .mockImplementationOnce(() => secondPrompt.promise);
+
+    const owner = collectEvents();
+    router.handleMessage({ type: "session_new" }, owner.emit);
+    await vi.waitFor(() => {
+      expect(owner.events.some((e) => e.type === "session_created")).toBe(true);
+    });
+    const sessionCreated = owner.events.find((e) => e.type === "session_created");
+    if (!sessionCreated || sessionCreated.type !== "session_created") {
+      throw new Error("session_created event missing");
+    }
+
+    owner.events.length = 0;
+    router.handleMessage(
+      { type: "prompt", sessionId: sessionCreated.sessionId, text: "first prompt" },
+      owner.emit,
+    );
+    router.handleMessage(
+      { type: "prompt", sessionId: sessionCreated.sessionId, text: "second prompt" },
+      owner.emit,
+    );
+
+    const eventHandler = (acpSession.onEvent as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as EventEmitter;
+    eventHandler({
+      type: "text_delta",
+      sessionId: sessionCreated.sessionId,
+      delta: "first-stream",
+    });
+    eventHandler({
+      type: "turn_end",
+      sessionId: sessionCreated.sessionId,
+      stopReason: "end_turn",
+    });
+    firstPrompt.resolve({ stopReason: "end_turn" });
+    secondPrompt.resolve({
+      stopReason: "end_turn",
+      content: { type: "text", text: "second-final" },
+    });
+
+    await vi.waitFor(() => {
+      expect(owner.events.filter((e) => e.type === "turn_end")).toHaveLength(2);
+    });
+
+    const turnEnds = owner.events.filter((e): e is Extract<GatewayEvent, { type: "turn_end" }> => e.type === "turn_end");
+    const firstText = owner.events.find((e): e is Extract<GatewayEvent, { type: "text_delta" }> => (
+      e.type === "text_delta" && e.delta === "first-stream"
+    ));
+    const secondText = owner.events.find((e): e is Extract<GatewayEvent, { type: "text_delta" }> => (
+      e.type === "text_delta" && e.delta === "second-final"
+    ));
+
+    expect(firstText?.executionId).toBe(turnEnds[0]?.executionId);
+    expect(secondText?.executionId).toBe(turnEnds[1]?.executionId);
+
+    const executions = stateStore.listExecutions(sessionCreated.sessionId, 10);
+    const succeeded = executions.filter((execution) => execution.state === "succeeded");
+    expect(succeeded).toHaveLength(2);
+
+    const closed = router.sweepIdleSessions(new Date(Date.now() + 31 * 60 * 1000));
+    expect(closed).toContain(sessionCreated.sessionId);
   });
 
   it("session_list emits session_list event from state store", async () => {
@@ -723,6 +799,7 @@ describe("createRouter", () => {
     if (events[0].type === "session_list") {
       expect(events[0].sessions).toHaveLength(1);
       expect(events[0].sessions[0].status).toBe("active");
+      expect(events[0].hasMore).toBe(false);
     }
   });
 
@@ -801,6 +878,82 @@ describe("createRouter", () => {
     expect(events[0].type).toBe("session_list");
     if (events[0].type !== "session_list") throw new Error("expected session_list");
     expect(events[0].sessions.map((session) => session.id)).toEqual(["sess-owned"]);
+  });
+
+  it("session_list supports principal pagination via limit and cursor", async () => {
+    stateStore.createSession({
+      id: "sess-owned-1",
+      workspaceId: "default",
+      principalType: "user",
+      principalId: "user:web:user-1",
+      source: "interactive",
+      runtimeId: "claude",
+      acpSessionId: "acp-owned-1",
+      status: "active",
+      createdAt: "2026-03-01T00:00:00.000Z",
+      lastActivityAt: "2026-03-01T00:03:00.000Z",
+      tokenUsage: { input: 1, output: 1 },
+      model: "claude",
+    });
+    stateStore.createSession({
+      id: "sess-owned-2",
+      workspaceId: "default",
+      principalType: "user",
+      principalId: "user:web:user-1",
+      source: "interactive",
+      runtimeId: "claude",
+      acpSessionId: "acp-owned-2",
+      status: "active",
+      createdAt: "2026-03-01T00:00:00.000Z",
+      lastActivityAt: "2026-03-01T00:02:00.000Z",
+      tokenUsage: { input: 1, output: 1 },
+      model: "claude",
+    });
+
+    const { emit, events } = collectEvents();
+    router.registerConnection("conn-list-page", emit);
+    router.handleMessage({
+      type: "auth_proof",
+      principalId: "user:web:user-1",
+      publicKey: "",
+      challengeId: "",
+      nonce: "",
+      signature: "",
+      algorithm: "ed25519",
+    }, emit, { connectionId: "conn-list-page" });
+    const challenge = events.find((event): event is Extract<GatewayEvent, { type: "auth_challenge" }> => event.type === "auth_challenge");
+    if (!challenge) throw new Error("expected auth_challenge");
+    events.length = 0;
+    router.handleMessage(createAuthProof({
+      challengeId: challenge.challengeId,
+      nonce: challenge.nonce,
+      principalId: "user:web:user-1",
+    }), emit, { connectionId: "conn-list-page" });
+    await vi.waitFor(() => {
+      expect(events.some((event) => event.type === "auth_result" && event.ok)).toBe(true);
+    });
+
+    events.length = 0;
+    router.handleMessage({ type: "session_list", limit: 1 }, emit, { connectionId: "conn-list-page" });
+    expect(events).toHaveLength(1);
+    const firstPage = events[0];
+    if (firstPage.type !== "session_list") throw new Error("expected session_list");
+    expect(firstPage.sessions.map((session) => session.id)).toEqual(["sess-owned-1"]);
+    expect(firstPage.hasMore).toBe(true);
+    expect(firstPage.nextCursor).toBeDefined();
+    if (!firstPage.nextCursor) throw new Error("expected nextCursor");
+
+    events.length = 0;
+    router.handleMessage({
+      type: "session_list",
+      limit: 1,
+      cursor: firstPage.nextCursor,
+    }, emit, { connectionId: "conn-list-page" });
+    expect(events).toHaveLength(1);
+    const secondPage = events[0];
+    if (secondPage.type !== "session_list") throw new Error("expected session_list");
+    expect(secondPage.sessions.map((session) => session.id)).toEqual(["sess-owned-2"]);
+    expect(secondPage.hasMore).toBe(false);
   });
 
   it("cancel calls acpSession.cancel()", async () => {

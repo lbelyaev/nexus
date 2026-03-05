@@ -80,7 +80,16 @@ interface PendingSessionListRequest {
   principalType: PrincipalType;
   principalId: string;
   limit: number;
+  cursor?: string;
   activeSessionId?: string;
+}
+
+interface SessionListPageState {
+  principalType: PrincipalType;
+  principalId: string;
+  limit: number;
+  hasMore: boolean;
+  nextCursor?: string;
 }
 
 interface PendingSessionResume {
@@ -295,6 +304,7 @@ const formatSessionList = (
   sessions: SessionInfo[],
   limit: number,
   activeSessionId?: string,
+  hasMore = false,
 ): string => {
   if (sessions.length === 0) {
     return "No sessions found for this principal.";
@@ -306,6 +316,7 @@ const formatSessionList = (
     ...shown.map((session) => (
       `- ${session.id}${session.id === activeSessionId ? " (current)" : ""} status=${session.status} workspace=${session.workspaceId ?? "default"} model=${session.model} last=${session.lastActivityAt}`
     )),
+    ...(hasMore ? ["More sessions available. Use /session list next."] : []),
     "Use /session resume <sessionId> to attach this conversation.",
   ].join("\n");
 };
@@ -347,6 +358,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
   const pendingTransfersBySession = new Map<string, PendingTransfer>();
   const transferCommandRoutes = new Map<string, { adapterId: string; conversationId: string }>();
   const pendingSessionListRequests: PendingSessionListRequest[] = [];
+  const sessionListStateByConversation = new Map<string, SessionListPageState>();
   const pendingSessionResumeBySession = new Map<string, PendingSessionResume>();
   const sessionInfoById = new Map<string, SessionInfo>();
   const runningTurns = new Set<string>();
@@ -1429,7 +1441,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
           message.conversationId,
           [
             "Usage: /session <command>",
-            "/session list [limit]",
+            "/session list [limit|next [limit]]",
             "/session resume <sessionId>",
             "/session takeover <sessionId>",
             "/session transfer pending|request|accept|dismiss",
@@ -1440,9 +1452,27 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
       }
 
       if (sub === "list") {
-        const requestedLimit = parsePositiveInteger(parts[1]);
-        if (parts[1] && requestedLimit === undefined) {
-          await sendToConversation(message.adapterId, message.conversationId, "Usage: /session list [limit]");
+        const rawArg = parts[1]?.trim().toLowerCase();
+        const isNext = rawArg === "next";
+        const limitArg = isNext ? parts[2] : parts[1];
+        const requestedLimit = parsePositiveInteger(limitArg);
+        if (limitArg && requestedLimit === undefined) {
+          await sendToConversation(message.adapterId, message.conversationId, "Usage: /session list [limit|next [limit]]");
+          return true;
+        }
+        const sessionListState = sessionListStateByConversation.get(key);
+        const limit = requestedLimit ?? sessionListState?.limit ?? DEFAULT_SESSION_LIST_LIMIT;
+        const cursor = isNext ? sessionListState?.nextCursor : undefined;
+        const isSamePrincipal = !sessionListState || (
+          sessionListState.principalType === resolvedPrincipal.principalType
+          && sessionListState.principalId === resolvedPrincipal.principalId
+        );
+        if (isNext && !isSamePrincipal) {
+          await sendToConversation(message.adapterId, message.conversationId, "Principal changed. Run /session list first.");
+          return true;
+        }
+        if (isNext && (!sessionListState?.hasMore || !cursor)) {
+          await sendToConversation(message.adapterId, message.conversationId, "No additional sessions in the current list window.");
           return true;
         }
         await ensureConnectionPrincipal(resolvedPrincipal.principalType, resolvedPrincipal.principalId);
@@ -1451,11 +1481,20 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
           conversationId: message.conversationId,
           principalType: resolvedPrincipal.principalType,
           principalId: resolvedPrincipal.principalId,
-          limit: requestedLimit ?? DEFAULT_SESSION_LIST_LIMIT,
+          limit,
+          ...(cursor ? { cursor } : {}),
           activeSessionId: binding?.sessionId,
         });
-        gatewayClient.send({ type: "session_list" });
-        await sendToConversation(message.adapterId, message.conversationId, "Fetching sessions...");
+        gatewayClient.send({
+          type: "session_list",
+          limit,
+          ...(cursor ? { cursor } : {}),
+        });
+        await sendToConversation(
+          message.adapterId,
+          message.conversationId,
+          isNext ? "Fetching next sessions page..." : "Fetching sessions...",
+        );
         return true;
       }
 
@@ -2046,6 +2085,14 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         }
         const pending = pendingSessionListRequests.shift();
         if (!pending) break;
+        const conversationKey = conversationKeyOf(pending.adapterId, pending.conversationId);
+        sessionListStateByConversation.set(conversationKey, {
+          principalType: pending.principalType,
+          principalId: pending.principalId,
+          limit: pending.limit,
+          hasMore: event.hasMore ?? false,
+          ...(event.nextCursor ? { nextCursor: event.nextCursor } : {}),
+        });
         const visibleSessions = event.sessions.filter((session) => (
           (session.principalType ?? "user") === pending.principalType
           && (session.principalId ?? "user:local") === pending.principalId
@@ -2053,7 +2100,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         await sendToConversation(
           pending.adapterId,
           pending.conversationId,
-          formatSessionList(visibleSessions, pending.limit, pending.activeSessionId),
+          formatSessionList(visibleSessions, pending.limit, pending.activeSessionId, event.hasMore ?? false),
         );
         break;
       }
@@ -2315,6 +2362,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
   gatewayClient.onClose(() => {
     logger.warn("channel_gateway_closed");
     pendingSessionListRequests.length = 0;
+    sessionListStateByConversation.clear();
     pendingSessionResumeBySession.clear();
     for (const sessionId of Array.from(runningTurns)) {
       stopTyping(sessionId);
@@ -2353,6 +2401,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     stop: async () => {
       running = false;
       pendingSessionListRequests.length = 0;
+      sessionListStateByConversation.clear();
       pendingSessionResumeBySession.clear();
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
