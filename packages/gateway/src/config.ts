@@ -80,6 +80,9 @@ export const loadConfig = (configPath?: string): NexusConfig => {
     sessionSweepIntervalMs: raw.sessionSweepIntervalMs as number | undefined,
     wsPingIntervalMs: raw.wsPingIntervalMs as number | undefined,
     wsPongGraceMs: raw.wsPongGraceMs as number | undefined,
+    runtimeRestartMaxAttempts: raw.runtimeRestartMaxAttempts as number | undefined,
+    runtimeRestartBaseDelayMs: raw.runtimeRestartBaseDelayMs as number | undefined,
+    runtimeRestartMaxDelayMs: raw.runtimeRestartMaxDelayMs as number | undefined,
     memory: raw.memory as MemoryConfig | undefined,
     channels: raw.channels as Record<string, ChannelConfig> | undefined,
     dataDir: (raw.dataDir as string) ?? DEFAULTS.dataDir,
@@ -277,12 +280,24 @@ export const loadConfig = (configPath?: string): NexusConfig => {
     "sessionSweepIntervalMs",
     "wsPingIntervalMs",
     "wsPongGraceMs",
+    "runtimeRestartBaseDelayMs",
+    "runtimeRestartMaxDelayMs",
   ];
   for (const field of positiveNumericRootFields) {
     const value = config[field];
     if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value) || value <= 0)) {
       throw new Error(`Invalid config: ${field} must be a positive number`);
     }
+  }
+  if (
+    config.runtimeRestartMaxAttempts !== undefined
+    && (
+      typeof config.runtimeRestartMaxAttempts !== "number"
+      || !Number.isInteger(config.runtimeRestartMaxAttempts)
+      || config.runtimeRestartMaxAttempts < 0
+    )
+  ) {
+    throw new Error("Invalid config: runtimeRestartMaxAttempts must be a non-negative integer");
   }
 
   return config;

@@ -305,6 +305,25 @@ describe("loadConfig", () => {
     expect(config.wsPongGraceMs).toBe(10000);
   });
 
+  it("supports runtime restart policy settings", () => {
+    const configPath = join(tmpDir, "nexus.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        auth: { token: "mytoken" },
+        runtime: { command: ["npx", "@zed-industries/claude-agent-acp"] },
+        runtimeRestartMaxAttempts: 5,
+        runtimeRestartBaseDelayMs: 1500,
+        runtimeRestartMaxDelayMs: 45000,
+      }),
+    );
+
+    const config = loadConfig(configPath);
+    expect(config.runtimeRestartMaxAttempts).toBe(5);
+    expect(config.runtimeRestartBaseDelayMs).toBe(1500);
+    expect(config.runtimeRestartMaxDelayMs).toBe(45000);
+  });
+
   it("rejects invalid lifecycle and heartbeat settings", () => {
     const configPath = join(tmpDir, "nexus.json");
     writeFileSync(
@@ -317,6 +336,20 @@ describe("loadConfig", () => {
     );
 
     expect(() => loadConfig(configPath)).toThrow(/sessionIdleTimeoutMs/);
+  });
+
+  it("rejects invalid runtime restart policy settings", () => {
+    const configPath = join(tmpDir, "nexus.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        auth: { token: "mytoken" },
+        runtime: { command: ["npx", "@zed-industries/claude-agent-acp"] },
+        runtimeRestartMaxAttempts: 1.5,
+      }),
+    );
+
+    expect(() => loadConfig(configPath)).toThrow(/runtimeRestartMaxAttempts/);
   });
 
   it("supports telegram channel adapter config", () => {
