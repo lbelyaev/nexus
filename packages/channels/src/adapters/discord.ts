@@ -60,12 +60,13 @@ const splitMessage = (text: string, max: number = 1800): string[] => {
   let remaining = text;
   while (remaining.length > max) {
     let cut = remaining.lastIndexOf("\n", max);
-    if (cut <= 0) cut = max;
+    if (cut > 0) {
+      cut += 1;
+    } else {
+      cut = max;
+    }
     chunks.push(remaining.slice(0, cut));
     remaining = remaining.slice(cut);
-    if (remaining.startsWith("\n")) {
-      remaining = remaining.slice(1);
-    }
   }
   if (remaining.length > 0) chunks.push(remaining);
   return chunks;

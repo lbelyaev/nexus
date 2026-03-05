@@ -1064,7 +1064,7 @@ describe("createChannelManager", () => {
     await vi.waitFor(() => {
       expect(adapterFixture.sendMessage).toHaveBeenCalledWith({
         conversationId: "chat-qa",
-        text: "Approval required: Read file.ts\nTap Approve, Approve All, or Deny below.",
+        text: "Approval required: Read file.ts",
         quickActions: [
           { label: "Approve", command: "/approve req-qa-1" },
           { label: "Approve All", command: "/approve all" },
@@ -1139,7 +1139,7 @@ describe("createChannelManager", () => {
         .filter((msg) => msg.conversationId === "chat-approval-queue" && msg.text.startsWith("Approval required:"));
       expect(approvalMessages).toHaveLength(1);
       expect(approvalMessages[0]).toMatchObject({
-        text: "Approval required: Bash\nTap Approve, Approve All, or Deny below.",
+        text: "Approval required: Bash",
       });
     });
 
@@ -1157,11 +1157,16 @@ describe("createChannelManager", () => {
         optionId: "allow_once",
       });
     });
+    expect(
+      adapterFixture.sendMessage.mock.calls.some(([msg]) => (
+        msg.conversationId === "chat-approval-queue" && msg.text === "Approved Bash."
+      )),
+    ).toBe(false);
 
     await vi.waitFor(() => {
       expect(adapterFixture.sendMessage).toHaveBeenCalledWith({
         conversationId: "chat-approval-queue",
-        text: "Approval required: Read b.ts\nTap Approve, Approve All, or Deny below.",
+        text: "Approval required: Read b.ts",
         quickActions: [
           { label: "Approve", command: "/approve req-queue-2" },
           { label: "Approve All", command: "/approve all" },

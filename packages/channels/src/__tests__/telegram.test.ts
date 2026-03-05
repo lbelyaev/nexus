@@ -111,6 +111,23 @@ describe("createTelegramAdapter", () => {
     ]);
   });
 
+  it("preserves paragraph newlines across chunked messages", async () => {
+    const fetchMock = vi.fn().mockImplementation(async () => jsonResponse({ message_id: 101 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const adapter = createTelegramAdapter({ botToken: "token" });
+    const text = `${"a".repeat(3799)}\n\nnext paragraph`;
+    await adapter.sendMessage({
+      conversationId: "chat-split",
+      text,
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const firstPayload = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    const secondPayload = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body));
+    expect(`${firstPayload.text}${secondPayload.text}`).toBe(text);
+  });
+
   it("maps callback query button presses into inbound slash commands", async () => {
     const onMessage = vi.fn().mockResolvedValue(undefined);
     const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {

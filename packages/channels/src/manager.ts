@@ -783,11 +783,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
       : undefined;
     const toolLabel = compactApprovalTool(pending.tool);
     const text = supportsQuickActions
-      ? [
-          `Approval required: ${toolLabel}`,
-          ...(totalPendingForSession > 1 ? [`Pending approvals: ${totalPendingForSession}`] : []),
-          "Tap Approve, Approve All, or Deny below.",
-        ].join("\n")
+      ? `Approval required: ${toolLabel}${totalPendingForSession > 1 ? ` (${totalPendingForSession} pending)` : ""}`
       : [
           `Approval required for ${toolLabel}`,
           `requestId=${pending.requestId}`,
@@ -1704,12 +1700,16 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         gatewayClient.send({ type: "approval_response", requestId, allow: true });
       }
       pendingApprovalsById.delete(requestId);
-      await sendToConversation(
-        message.adapterId,
-        message.conversationId,
-        `Approved ${compactApprovalTool(pending.tool)}.`,
-      );
-      await maybeSendNextApprovalPrompt(binding.sessionId);
+      const remaining = listPendingApprovalsForSession(binding.sessionId).length;
+      if (remaining > 0) {
+        await maybeSendNextApprovalPrompt(binding.sessionId);
+      } else {
+        await sendToConversation(
+          message.adapterId,
+          message.conversationId,
+          `Approved ${compactApprovalTool(pending.tool)}.`,
+        );
+      }
       return true;
     }
 
@@ -1750,12 +1750,16 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         gatewayClient.send({ type: "approval_response", requestId, allow: false });
       }
       pendingApprovalsById.delete(requestId);
-      await sendToConversation(
-        message.adapterId,
-        message.conversationId,
-        `Denied ${compactApprovalTool(pending.tool)}.`,
-      );
-      await maybeSendNextApprovalPrompt(binding.sessionId);
+      const remaining = listPendingApprovalsForSession(binding.sessionId).length;
+      if (remaining > 0) {
+        await maybeSendNextApprovalPrompt(binding.sessionId);
+      } else {
+        await sendToConversation(
+          message.adapterId,
+          message.conversationId,
+          `Denied ${compactApprovalTool(pending.tool)}.`,
+        );
+      }
       return true;
     }
 
