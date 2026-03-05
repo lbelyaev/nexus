@@ -94,6 +94,15 @@ const waitForMessage = (messages: string[], timeout = 2000): Promise<string> =>
     check();
   });
 
+const waitForSilence = (messages: string[], durationMs = 200): Promise<void> =>
+  new Promise((resolve) => {
+    const startLength = messages.length;
+    setTimeout(() => {
+      expect(messages.length).toBe(startLength);
+      resolve();
+    }, durationMs);
+  });
+
 describe("createGatewayServer", () => {
   let server: GatewayServer;
   let port: number;
@@ -198,6 +207,63 @@ describe("createGatewayServer", () => {
     expect(parsed2.type).toBe("session_list");
 
     ws.close();
+  });
+
+  it("drops text deltas when soft backpressure threshold is exceeded", async () => {
+    await server.stop();
+    stopped = true;
+    const deltaRouter: Router = {
+      ...mockRouter,
+      handleMessage: (msg, emit) => {
+        if (msg.type === "session_list") {
+          emit({
+            type: "text_delta",
+            sessionId: "sess-backpressure",
+            delta: "stream chunk",
+          } as GatewayEvent);
+        }
+      },
+    };
+    server = createGatewayServer({
+      port: 0,
+      host: "127.0.0.1",
+      token: TEST_TOKEN,
+      router: deltaRouter,
+      wsBackpressureWarnBytes: 64,
+      wsBackpressureTerminateBytes: 4096,
+      wsBufferedAmountProvider: () => 256,
+    });
+    ({ port } = await server.start());
+    stopped = false;
+
+    const { ws, messages } = await connectWs(port, TEST_TOKEN);
+    ws.send(JSON.stringify({ type: "session_list" }));
+    await waitForSilence(messages, 250);
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+
+    ws.close();
+  });
+
+  it("terminates connection when hard backpressure threshold is exceeded", async () => {
+    await server.stop();
+    stopped = true;
+    server = createGatewayServer({
+      port: 0,
+      host: "127.0.0.1",
+      token: TEST_TOKEN,
+      router: mockRouter,
+      wsBackpressureWarnBytes: 64,
+      wsBackpressureTerminateBytes: 128,
+      wsBufferedAmountProvider: () => 1024,
+    });
+    ({ port } = await server.start());
+    stopped = false;
+
+    const { ws, messages } = await connectWs(port, TEST_TOKEN);
+    ws.send(JSON.stringify({ type: "session_list" }));
+    await waitForDisconnect(ws);
+    expect(messages).toHaveLength(0);
+    expect(ws.readyState).toBe(WebSocket.CLOSED);
   });
 
   it("server graceful shutdown closes connections", async () => {

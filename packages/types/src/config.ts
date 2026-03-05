@@ -68,6 +68,9 @@ export interface NexusConfig {
   sessionSweepIntervalMs?: number;
   wsPingIntervalMs?: number;
   wsPongGraceMs?: number;
+  runtimeRestartMaxAttempts?: number;
+  runtimeRestartBaseDelayMs?: number;
+  runtimeRestartMaxDelayMs?: number;
   memory?: MemoryConfig;
   channels?: Record<string, ChannelConfig>;
   dataDir: string;

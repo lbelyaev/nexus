@@ -18,6 +18,9 @@ export const createGatewayServer = (deps: {
   healthProvider?: () => Record<string, unknown>;
   wsPingIntervalMs?: number;
   wsPongGraceMs?: number;
+  wsBackpressureWarnBytes?: number;
+  wsBackpressureTerminateBytes?: number;
+  wsBufferedAmountProvider?: (ws: WebSocket) => number;
 }): GatewayServer => {
   const {
     port,
@@ -27,6 +30,9 @@ export const createGatewayServer = (deps: {
     healthProvider,
     wsPingIntervalMs = 20_000,
     wsPongGraceMs = 10_000,
+    wsBackpressureWarnBytes = 512_000,
+    wsBackpressureTerminateBytes = 2_000_000,
+    wsBufferedAmountProvider = (ws: WebSocket) => ws.bufferedAmount,
   } = deps;
   const log = createLogger("gateway.server");
 
@@ -67,10 +73,55 @@ export const createGatewayServer = (deps: {
 
   wss.on("connection", (ws: WebSocket) => {
     const connectionId = `conn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    let backpressureWarned = false;
+    let droppedBackpressureDeltas = 0;
     const emit = (event: GatewayEvent) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(event));
+      if (ws.readyState !== WebSocket.OPEN) return;
+
+      const bufferedAmount = Math.max(0, Math.floor(wsBufferedAmountProvider(ws)));
+      if (bufferedAmount >= wsBackpressureTerminateBytes) {
+        log.warn("ws_backpressure_terminate", {
+          connectionId,
+          bufferedAmount,
+          terminateBytes: wsBackpressureTerminateBytes,
+          eventType: event.type,
+        });
+        ws.terminate();
+        return;
       }
+
+      const isDroppableDelta = event.type === "text_delta" || event.type === "thinking_delta";
+      if (bufferedAmount >= wsBackpressureWarnBytes) {
+        if (!backpressureWarned) {
+          backpressureWarned = true;
+          log.warn("ws_backpressure_high", {
+            connectionId,
+            bufferedAmount,
+            warnBytes: wsBackpressureWarnBytes,
+          });
+        }
+        if (isDroppableDelta) {
+          droppedBackpressureDeltas += 1;
+          if (droppedBackpressureDeltas === 1 || droppedBackpressureDeltas % 100 === 0) {
+            log.warn("ws_backpressure_dropped_delta", {
+              connectionId,
+              droppedCount: droppedBackpressureDeltas,
+              bufferedAmount,
+              eventType: event.type,
+            });
+          }
+          return;
+        }
+      } else if (backpressureWarned) {
+        backpressureWarned = false;
+        droppedBackpressureDeltas = 0;
+        log.info("ws_backpressure_recovered", {
+          connectionId,
+          bufferedAmount,
+        });
+      }
+
+      ws.send(JSON.stringify(event));
     };
 
     router.registerConnection(connectionId, emit);

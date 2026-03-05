@@ -37,6 +37,15 @@ interface RuntimeRegistry {
   runtimeDefaults: Record<string, string>;
 }
 
+interface RuntimeRestartState {
+  attempts: number;
+  timer: NodeJS.Timeout | null;
+}
+
+const DEFAULT_RUNTIME_RESTART_MAX_ATTEMPTS = 3;
+const DEFAULT_RUNTIME_RESTART_BASE_DELAY_MS = 1_000;
+const DEFAULT_RUNTIME_RESTART_MAX_DELAY_MS = 30_000;
+
 const normalizeRuntimeRegistry = (config: NexusConfig): RuntimeRegistry => {
   const modelRouting: Record<string, string> = {};
   for (const [model, runtimeId] of Object.entries(config.modelRouting ?? {})) {
@@ -126,6 +135,20 @@ export const startGateway = async (configPath?: string) => {
   const runtimeRegistry = normalizeRuntimeRegistry(config);
   const runtimeAgents = new Map<string, { profile: RuntimeProfile; agent: AgentProcess }>();
   const runtimeHealth = new Map<string, RuntimeHealthInfo>();
+  const runtimeRestartState = new Map<string, RuntimeRestartState>();
+  const restartMaxAttempts = Math.max(
+    0,
+    config.runtimeRestartMaxAttempts ?? DEFAULT_RUNTIME_RESTART_MAX_ATTEMPTS,
+  );
+  const restartBaseDelayMs = Math.max(
+    1,
+    config.runtimeRestartBaseDelayMs ?? DEFAULT_RUNTIME_RESTART_BASE_DELAY_MS,
+  );
+  const restartMaxDelayMs = Math.max(
+    restartBaseDelayMs,
+    config.runtimeRestartMaxDelayMs ?? DEFAULT_RUNTIME_RESTART_MAX_DELAY_MS,
+  );
+  let shuttingDown = false;
   let routerRef: Router | null = null;
   let channelManager: ReturnType<typeof createChannelManager> | null = null;
 
@@ -157,6 +180,9 @@ export const startGateway = async (configPath?: string) => {
     workspaceDefaultId: config.workspaceDefaultId ?? "default",
     sessionIdleTimeoutMs: config.sessionIdleTimeoutMs ?? 30 * 60 * 1000,
     sessionSweepIntervalMs: config.sessionSweepIntervalMs ?? 30_000,
+    runtimeRestartMaxAttempts: restartMaxAttempts,
+    runtimeRestartBaseDelayMs: restartBaseDelayMs,
+    runtimeRestartMaxDelayMs: restartMaxDelayMs,
   });
   if (Object.keys(runtimeRegistry.modelAliases).length > 0) {
     log.info("model_aliases_loaded", {
@@ -210,7 +236,185 @@ export const startGateway = async (configPath?: string) => {
     log.warn("policy_file_missing_using_permissive_defaults");
   }
 
+  const getRestartState = (runtimeProfileId: string): RuntimeRestartState => {
+    const existing = runtimeRestartState.get(runtimeProfileId);
+    if (existing) return existing;
+    const created: RuntimeRestartState = { attempts: 0, timer: null };
+    runtimeRestartState.set(runtimeProfileId, created);
+    return created;
+  };
+
+  const clearRestartTimer = (runtimeProfileId: string): void => {
+    const state = runtimeRestartState.get(runtimeProfileId);
+    if (!state?.timer) return;
+    clearTimeout(state.timer);
+    state.timer = null;
+  };
+
+  const clearAllRestartTimers = (): void => {
+    for (const runtimeProfileId of runtimeRestartState.keys()) {
+      clearRestartTimer(runtimeProfileId);
+    }
+  };
+
+  const restartDelayMsForAttempt = (attempt: number): number =>
+    Math.min(restartMaxDelayMs, restartBaseDelayMs * Math.max(1, 2 ** (attempt - 1)));
+
+  const closeRuntimeSessions = (
+    runtimeProfileId: string,
+    reason: string,
+    logMessage: string,
+  ): void => {
+    const closedSessionIds = routerRef?.closeSessionsByRuntime(runtimeProfileId, reason) ?? [];
+    if (closedSessionIds.length === 0) return;
+    log.warn(logMessage, {
+      runtimeProfileId,
+      reason,
+      closedCount: closedSessionIds.length,
+      sessionIds: closedSessionIds,
+    });
+  };
+
+  const scheduleRuntimeRestart = (runtimeProfileId: string, reason: string): void => {
+    if (shuttingDown) return;
+    const profile = runtimeRegistry.profiles[runtimeProfileId];
+    if (!profile) {
+      setRuntimeHealth(runtimeProfileId, "unavailable", "runtime_profile_missing");
+      return;
+    }
+
+    const state = getRestartState(runtimeProfileId);
+    if (state.timer) return;
+    state.attempts += 1;
+    const attempt = state.attempts;
+    if (attempt > restartMaxAttempts) {
+      setRuntimeHealth(runtimeProfileId, "unavailable", "restart_exhausted");
+      log.error("runtime_restart_exhausted", {
+        runtimeProfileId,
+        maxAttempts: restartMaxAttempts,
+        trigger: reason,
+      });
+      closeRuntimeSessions(runtimeProfileId, "runtime_unavailable", "runtime_restart_sessions_closed");
+      return;
+    }
+
+    const delayMs = restartDelayMsForAttempt(attempt);
+    setRuntimeHealth(runtimeProfileId, "degraded", `restart_scheduled:${attempt}`);
+    log.warn("runtime_restart_scheduled", {
+      runtimeProfileId,
+      attempt,
+      maxAttempts: restartMaxAttempts,
+      delayMs,
+      trigger: reason,
+    });
+    state.timer = setTimeout(() => {
+      state.timer = null;
+      void restartRuntime(runtimeProfileId, attempt);
+    }, delayMs);
+    state.timer.unref?.();
+  };
+
+  const startRuntime = async (
+    runtimeProfileId: string,
+    profile: RuntimeProfile,
+    options?: { reason?: string; attempt?: number },
+  ): Promise<void> => {
+    const reason = options?.reason ?? "boot";
+    const inferred = inferRuntimeId(profile.command);
+    const authSource = inferAuthSource(runtimeProfileId, profile.command, profile.env);
+    setRuntimeHealth(runtimeProfileId, "starting", reason);
+    log.info("runtime_spawning", {
+      runtimeProfileId,
+      inferred,
+      command: profile.command.join(" "),
+      reason,
+      attempt: options?.attempt ?? 0,
+    });
+    if (profile.defaultModel) {
+      const resolvedDefaultModel = resolveModelAlias(profile.defaultModel, runtimeRegistry.modelAliases);
+      const aliasNote = resolvedDefaultModel.requested === resolvedDefaultModel.resolved
+        ? ""
+        : ` (alias -> ${resolvedDefaultModel.resolved})`;
+      log.info("runtime_default_model", {
+        runtimeProfileId,
+        defaultModel: `${resolvedDefaultModel.requested}${aliasNote}`,
+      });
+    }
+    if (inferred === "codex") {
+      log.info("runtime_auth_source", {
+        runtimeProfileId,
+        authSource,
+      });
+    }
+
+    const agent = spawnAgent(profile.command, {
+      cwd: profile.cwd,
+      env: profile.env,
+      timeout: 300_000, // 5 min — tool-using prompts can be slow
+    });
+    runtimeAgents.set(runtimeProfileId, { profile, agent });
+    let allowRestartOnExit = true;
+
+    agent.onExit((code) => {
+      runtimeAgents.delete(runtimeProfileId);
+      if (shuttingDown || !allowRestartOnExit) return;
+      const exitReason = `process_exit:${code ?? "null"}`;
+      log.error("runtime_exited", { runtimeProfileId, code });
+      closeRuntimeSessions(runtimeProfileId, "runtime_restarting", "runtime_exit_sessions_closed");
+      scheduleRuntimeRestart(runtimeProfileId, exitReason);
+    });
+
+    log.info("runtime_initializing", { runtimeProfileId });
+    try {
+      const initResult = await agent.rpc.sendRequest("initialize", {
+        protocolVersion: 1,
+        clientCapabilities: {},
+      });
+      const state = getRestartState(runtimeProfileId);
+      state.attempts = 0;
+      setRuntimeHealth(runtimeProfileId, "healthy");
+      log.info("runtime_initialized", { runtimeProfileId, initResult });
+    } catch (error) {
+      allowRestartOnExit = false;
+      runtimeAgents.delete(runtimeProfileId);
+      try {
+        await agent.kill();
+      } catch (killError) {
+        log.warn("runtime_kill_after_initialize_failure_failed", {
+          runtimeProfileId,
+          error: killError instanceof Error ? killError.message : String(killError),
+        });
+      }
+      throw error;
+    }
+  };
+
+  const restartRuntime = async (runtimeProfileId: string, attempt: number): Promise<void> => {
+    if (shuttingDown) return;
+    const profile = runtimeRegistry.profiles[runtimeProfileId];
+    if (!profile) {
+      setRuntimeHealth(runtimeProfileId, "unavailable", "runtime_profile_missing");
+      return;
+    }
+    try {
+      await startRuntime(runtimeProfileId, profile, {
+        reason: `restart_attempt:${attempt}`,
+        attempt,
+      });
+      log.info("runtime_restart_succeeded", { runtimeProfileId, attempt });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log.error("runtime_restart_failed", {
+        runtimeProfileId,
+        attempt,
+        error: message,
+      });
+      scheduleRuntimeRestart(runtimeProfileId, `initialize_failed:${message}`);
+    }
+  };
+
   const killRuntimeAgents = async (): Promise<void> => {
+    clearAllRestartTimers();
     for (const [runtimeProfileId, runtime] of runtimeAgents) {
       try {
         await runtime.agent.kill();
@@ -287,67 +491,10 @@ export const startGateway = async (configPath?: string) => {
   // Spawn and initialize one ACP process per runtime profile.
   try {
     for (const [runtimeProfileId, profile] of Object.entries(runtimeRegistry.profiles)) {
-      const inferred = inferRuntimeId(profile.command);
-      const authSource = inferAuthSource(runtimeProfileId, profile.command, profile.env);
-      setRuntimeHealth(runtimeProfileId, "starting", "boot");
-      log.info("runtime_spawning", {
-        runtimeProfileId,
-        inferred,
-        command: profile.command.join(" "),
-      });
-      if (profile.defaultModel) {
-        const resolvedDefaultModel = resolveModelAlias(profile.defaultModel, runtimeRegistry.modelAliases);
-        const aliasNote = resolvedDefaultModel.requested === resolvedDefaultModel.resolved
-          ? ""
-          : ` (alias -> ${resolvedDefaultModel.resolved})`;
-        log.info("runtime_default_model", {
-          runtimeProfileId,
-          defaultModel: `${resolvedDefaultModel.requested}${aliasNote}`,
-        });
-      }
-      if (inferred === "codex") {
-        log.info("runtime_auth_source", {
-          runtimeProfileId,
-          authSource,
-        });
-      }
-
-      const agent = spawnAgent(profile.command, {
-        cwd: profile.cwd,
-        env: profile.env,
-        timeout: 300_000, // 5 min — tool-using prompts can be slow
-      });
-      runtimeAgents.set(runtimeProfileId, { profile, agent });
-
-      agent.onExit((code) => {
-        const exitReason = `process_exit:${code ?? "null"}`;
-        log.error("runtime_exited", { runtimeProfileId, code });
-        setRuntimeHealth(runtimeProfileId, "unavailable", exitReason);
-        const closedSessionIds = routerRef?.closeSessionsByRuntime(runtimeProfileId, "runtime_unavailable") ?? [];
-        if (closedSessionIds.length > 0) {
-          log.warn("runtime_exit_sessions_closed", {
-            runtimeProfileId,
-            exitReason,
-            closedCount: closedSessionIds.length,
-            sessionIds: closedSessionIds,
-          });
-        }
-      });
-
-      log.info("runtime_initializing", { runtimeProfileId });
-      try {
-        const initResult = await agent.rpc.sendRequest("initialize", {
-          protocolVersion: 1,
-          clientCapabilities: {},
-        });
-        setRuntimeHealth(runtimeProfileId, "healthy");
-        log.info("runtime_initialized", { runtimeProfileId, initResult });
-      } catch (error) {
-        setRuntimeHealth(runtimeProfileId, "unavailable", "initialize_failed");
-        throw error;
-      }
+      await startRuntime(runtimeProfileId, profile, { reason: "boot" });
     }
   } catch (error) {
+    shuttingDown = true;
     await killRuntimeAgents();
     stateStore.close();
     throw error;
@@ -572,6 +719,7 @@ export const startGateway = async (configPath?: string) => {
 
   // Graceful shutdown
   const shutdown = async () => {
+    shuttingDown = true;
     log.info("gateway_shutdown_start");
     clearInterval(sweepTimer);
     if (channelManager) {
