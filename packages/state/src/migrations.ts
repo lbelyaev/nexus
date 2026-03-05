@@ -85,6 +85,23 @@ export const initDatabase = (db: DatabaseAdapter): void => {
       completedAt TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS channel_bindings (
+      adapterId TEXT NOT NULL,
+      conversationId TEXT NOT NULL,
+      sessionId TEXT NOT NULL,
+      principalType TEXT NOT NULL DEFAULT 'user',
+      principalId TEXT NOT NULL DEFAULT 'user:local',
+      runtimeId TEXT,
+      model TEXT,
+      workspaceId TEXT,
+      typingIndicator INTEGER NOT NULL DEFAULT 1,
+      streamingMode TEXT NOT NULL DEFAULT 'off',
+      steeringMode TEXT NOT NULL DEFAULT 'off',
+      createdAt TEXT NOT NULL,
+      updatedAt TEXT NOT NULL,
+      PRIMARY KEY (adapterId, conversationId)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_memory_items_session_kind_createdAt
       ON memory_items(sessionId, kind, createdAt DESC);
     CREATE INDEX IF NOT EXISTS idx_memory_items_session_lastAccessedAt
@@ -97,6 +114,10 @@ export const initDatabase = (db: DatabaseAdapter): void => {
       ON executions(state, updatedAt DESC);
     CREATE INDEX IF NOT EXISTS idx_executions_session_idempotencyKey
       ON executions(sessionId, idempotencyKey);
+    CREATE INDEX IF NOT EXISTS idx_channel_bindings_sessionId
+      ON channel_bindings(sessionId);
+    CREATE INDEX IF NOT EXISTS idx_channel_bindings_principal
+      ON channel_bindings(principalType, principalId, updatedAt DESC);
   `);
 
   if (!hasColumn(db, "sessions", "workspaceId")) {
@@ -181,5 +202,9 @@ export const initDatabase = (db: DatabaseAdapter): void => {
       ON executions(state, updatedAt DESC);
     CREATE INDEX IF NOT EXISTS idx_executions_session_idempotencyKey
       ON executions(sessionId, idempotencyKey);
+    CREATE INDEX IF NOT EXISTS idx_channel_bindings_sessionId
+      ON channel_bindings(sessionId);
+    CREATE INDEX IF NOT EXISTS idx_channel_bindings_principal
+      ON channel_bindings(principalType, principalId, updatedAt DESC);
   `);
 };

@@ -25,7 +25,13 @@ const hasMissingSessionId = (input: unknown): boolean => {
   if (typeof input !== "object" || input === null) return false;
   const obj = input as Record<string, unknown>;
   const type = obj.type;
-  return (type === "prompt" || type === "cancel") && obj.sessionId === undefined;
+  return (
+    type === "prompt"
+    || type === "cancel"
+    || type === "session_close"
+    || type === "memory_query"
+    || type === "usage_query"
+  ) && obj.sessionId === undefined;
 };
 
 const run = async (): Promise<number> => {

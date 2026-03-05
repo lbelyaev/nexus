@@ -95,11 +95,35 @@ describe("isClientMessage", () => {
     })).toBe(true);
   });
 
+  it("validates a usage_query message", () => {
+    expect(isClientMessage({ type: "usage_query", sessionId: "s1" })).toBe(true);
+    expect(isClientMessage({
+      type: "usage_query",
+      sessionId: "s1",
+      action: "stats",
+      scope: "workspace",
+    })).toBe(true);
+    expect(isClientMessage({
+      type: "usage_query",
+      sessionId: "s1",
+      action: "search",
+      query: "deploy",
+      limit: 5,
+      scope: "session",
+    })).toBe(true);
+  });
+
   it("rejects invalid memory_query message", () => {
     expect(isClientMessage({ type: "memory_query", sessionId: "s1" })).toBe(false);
     expect(isClientMessage({ type: "memory_query", sessionId: "s1", action: "bogus" })).toBe(false);
     expect(isClientMessage({ type: "memory_query", sessionId: "s1", action: "recent", limit: 0 })).toBe(false);
     expect(isClientMessage({ type: "memory_query", sessionId: "s1", action: "recent", scope: "global" })).toBe(false);
+  });
+
+  it("rejects invalid usage_query message", () => {
+    expect(isClientMessage({ type: "usage_query", sessionId: "s1", action: "bogus" })).toBe(false);
+    expect(isClientMessage({ type: "usage_query", sessionId: "s1", action: "stats", limit: 0 })).toBe(false);
+    expect(isClientMessage({ type: "usage_query", sessionId: "s1", action: "search", scope: "global" })).toBe(false);
   });
 
   it("rejects session_replay with missing sessionId", () => {
@@ -326,6 +350,43 @@ describe("isGatewayEvent", () => {
         }],
         cold: [],
         rendered: "# Memory Context",
+      },
+    })).toBe(true);
+  });
+
+  it("validates usage_result summary", () => {
+    expect(isGatewayEvent({
+      type: "usage_result",
+      sessionId: "s1",
+      action: "summary",
+      summary: {
+        tokens: { input: 10, output: 5, total: 15 },
+        executions: {
+          total: 3,
+          queued: 0,
+          running: 1,
+          succeeded: 1,
+          failed: 1,
+          cancelled: 0,
+          timedOut: 0,
+        },
+      },
+    })).toBe(true);
+  });
+
+  it("validates usage_result stats", () => {
+    expect(isGatewayEvent({
+      type: "usage_result",
+      sessionId: "s1",
+      action: "stats",
+      scope: "workspace",
+      stats: {
+        facts: 1,
+        summaries: 2,
+        total: 3,
+        transcriptMessages: 4,
+        memoryTokens: 30,
+        transcriptTokens: 50,
       },
     })).toBe(true);
   });

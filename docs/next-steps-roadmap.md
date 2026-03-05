@@ -100,6 +100,7 @@ Bridge interactive sessions to future scheduler/hooks/orchestration without rede
    - durable client keypair (device identity)
    - nonce challenge + signature to bind WS connection to `principalId`
    - explicit session transfer primitives (request/accept) keyed by principal, not raw connection
+   - stage account-level identity linking so one user can operate multiple device principals with controlled pull/resume semantics
 
 ### Acceptance criteria
 

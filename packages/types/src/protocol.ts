@@ -23,6 +23,7 @@ export interface ApprovalOption {
 
 export type MemoryQueryAction = "stats" | "recent" | "search" | "context" | "clear";
 export type MemoryScope = "session" | "workspace" | "hybrid";
+export type UsageQueryAction = "summary" | "stats" | "recent" | "search" | "context" | "clear";
 export type RuntimeHealthStatus = "starting" | "healthy" | "degraded" | "unavailable";
 export type PrincipalType = "user" | "service_account";
 export type PromptSource = "interactive" | "schedule" | "hook" | "api";
@@ -99,6 +100,15 @@ export type ClientMessage =
       prompt?: string;
       limit?: number;
       scope?: MemoryScope;
+    }
+  | {
+      type: "usage_query";
+      sessionId: string;
+      action?: UsageQueryAction;
+      query?: string;
+      prompt?: string;
+      limit?: number;
+      scope?: MemoryScope;
     };
 
 export interface MemoryContextSnapshot {
@@ -108,6 +118,36 @@ export interface MemoryContextSnapshot {
   warm: MemoryItem[];
   cold: MemoryItem[];
   rendered: string;
+}
+
+export interface UsageMemoryStats {
+  facts: number;
+  summaries: number;
+  total: number;
+  transcriptMessages: number;
+  memoryTokens: number;
+  transcriptTokens: number;
+}
+
+export interface UsageSummary {
+  tokens: {
+    input: number;
+    output: number;
+    total: number;
+  };
+  executions: {
+    total: number;
+    queued: number;
+    running: number;
+    succeeded: number;
+    failed: number;
+    cancelled: number;
+    timedOut: number;
+  };
+  memory?: {
+    session: UsageMemoryStats;
+    workspace: UsageMemoryStats;
+  };
 }
 
 export type GatewayEvent =
@@ -221,6 +261,51 @@ export type GatewayEvent =
       action: "clear";
       scope: Exclude<MemoryScope, "hybrid">;
       deleted: number;
+    }
+  | {
+      type: "usage_result";
+      sessionId: string;
+      action: "summary";
+      summary: UsageSummary;
+    }
+  | {
+      type: "usage_result";
+      sessionId: string;
+      action: "stats";
+      scope: Exclude<MemoryScope, "hybrid">;
+      stats: UsageMemoryStats;
+    }
+  | {
+      type: "usage_result";
+      sessionId: string;
+      action: "recent";
+      scope: Exclude<MemoryScope, "hybrid">;
+      limit: number;
+      items: MemoryItem[];
+    }
+  | {
+      type: "usage_result";
+      sessionId: string;
+      action: "search";
+      scope: Exclude<MemoryScope, "hybrid">;
+      query: string;
+      limit: number;
+      items: MemoryItem[];
+    }
+  | {
+      type: "usage_result";
+      sessionId: string;
+      action: "context";
+      scope: MemoryScope;
+      prompt: string;
+      context: MemoryContextSnapshot;
+    }
+  | {
+      type: "usage_result";
+      sessionId: string;
+      action: "clear";
+      scope: Exclude<MemoryScope, "hybrid">;
+      deleted: number;
     };
 
 const CLIENT_MESSAGE_TYPES = new Set([
@@ -235,6 +320,7 @@ const CLIENT_MESSAGE_TYPES = new Set([
   "session_transfer_request",
   "session_transfer_accept",
   "memory_query",
+  "usage_query",
 ]);
 
 const GATEWAY_EVENT_TYPES = new Set([
@@ -255,6 +341,7 @@ const GATEWAY_EVENT_TYPES = new Set([
   "session_list",
   "transcript",
   "memory_result",
+  "usage_result",
 ]);
 
 const MEMORY_QUERY_ACTIONS = new Set<MemoryQueryAction>([
@@ -269,6 +356,15 @@ const MEMORY_SCOPES = new Set<MemoryScope>([
   "session",
   "workspace",
   "hybrid",
+]);
+
+const USAGE_QUERY_ACTIONS = new Set<UsageQueryAction>([
+  "summary",
+  "stats",
+  "recent",
+  "search",
+  "context",
+  "clear",
 ]);
 
 const PRINCIPAL_TYPES = new Set<PrincipalType>([
@@ -393,6 +489,21 @@ export const isClientMessage = (value: unknown): value is ClientMessage => {
         typeof obj.sessionId === "string"
         && typeof obj.action === "string"
         && MEMORY_QUERY_ACTIONS.has(obj.action as MemoryQueryAction)
+        && (obj.query === undefined || typeof obj.query === "string")
+        && (obj.prompt === undefined || typeof obj.prompt === "string")
+        && (
+          obj.limit === undefined
+          || (typeof obj.limit === "number" && Number.isFinite(obj.limit) && obj.limit > 0)
+        )
+        && (obj.scope === undefined || (typeof obj.scope === "string" && MEMORY_SCOPES.has(obj.scope as MemoryScope)))
+      );
+    case "usage_query":
+      return (
+        typeof obj.sessionId === "string"
+        && (
+          obj.action === undefined
+          || (typeof obj.action === "string" && USAGE_QUERY_ACTIONS.has(obj.action as UsageQueryAction))
+        )
         && (obj.query === undefined || typeof obj.query === "string")
         && (obj.prompt === undefined || typeof obj.prompt === "string")
         && (
@@ -551,6 +662,83 @@ export const isGatewayEvent = (value: unknown): value is GatewayEvent => {
     case "memory_result":
       if (typeof obj.sessionId !== "string" || typeof obj.action !== "string") return false;
       switch (obj.action) {
+        case "stats":
+          return (
+            typeof obj.scope === "string"
+            && (obj.scope === "session" || obj.scope === "workspace")
+            && typeof obj.stats === "object"
+            && obj.stats !== null
+            && typeof (obj.stats as Record<string, unknown>).facts === "number"
+            && typeof (obj.stats as Record<string, unknown>).summaries === "number"
+            && typeof (obj.stats as Record<string, unknown>).total === "number"
+            && typeof (obj.stats as Record<string, unknown>).transcriptMessages === "number"
+            && typeof (obj.stats as Record<string, unknown>).memoryTokens === "number"
+            && typeof (obj.stats as Record<string, unknown>).transcriptTokens === "number"
+          );
+        case "recent":
+          return (
+            typeof obj.scope === "string"
+            && (obj.scope === "session" || obj.scope === "workspace")
+            && typeof obj.limit === "number"
+            && Array.isArray(obj.items)
+            && obj.items.every((item) => isMemoryItem(item))
+          );
+        case "search":
+          return (
+            typeof obj.scope === "string"
+            && (obj.scope === "session" || obj.scope === "workspace")
+            && typeof obj.query === "string"
+            && typeof obj.limit === "number"
+            && Array.isArray(obj.items)
+            && obj.items.every((item) => isMemoryItem(item))
+          );
+        case "context":
+          return (
+            typeof obj.scope === "string"
+            && MEMORY_SCOPES.has(obj.scope as MemoryScope)
+            && typeof obj.prompt === "string"
+            && isMemoryContextSnapshot(obj.context)
+          );
+        case "clear":
+          return (
+            typeof obj.scope === "string"
+            && (obj.scope === "session" || obj.scope === "workspace")
+            && typeof obj.deleted === "number"
+          );
+        default:
+          return false;
+      }
+    case "usage_result":
+      if (typeof obj.sessionId !== "string" || typeof obj.action !== "string") return false;
+      switch (obj.action) {
+        case "summary":
+          return (
+            typeof obj.summary === "object"
+            && obj.summary !== null
+            && typeof (obj.summary as Record<string, unknown>).tokens === "object"
+            && (obj.summary as Record<string, unknown>).tokens !== null
+            && typeof ((obj.summary as Record<string, unknown>).tokens as Record<string, unknown>).input === "number"
+            && typeof ((obj.summary as Record<string, unknown>).tokens as Record<string, unknown>).output === "number"
+            && typeof ((obj.summary as Record<string, unknown>).tokens as Record<string, unknown>).total === "number"
+            && typeof (obj.summary as Record<string, unknown>).executions === "object"
+            && (obj.summary as Record<string, unknown>).executions !== null
+            && typeof ((obj.summary as Record<string, unknown>).executions as Record<string, unknown>).total === "number"
+            && typeof ((obj.summary as Record<string, unknown>).executions as Record<string, unknown>).queued === "number"
+            && typeof ((obj.summary as Record<string, unknown>).executions as Record<string, unknown>).running === "number"
+            && typeof ((obj.summary as Record<string, unknown>).executions as Record<string, unknown>).succeeded === "number"
+            && typeof ((obj.summary as Record<string, unknown>).executions as Record<string, unknown>).failed === "number"
+            && typeof ((obj.summary as Record<string, unknown>).executions as Record<string, unknown>).cancelled === "number"
+            && typeof ((obj.summary as Record<string, unknown>).executions as Record<string, unknown>).timedOut === "number"
+            && (
+              (obj.summary as Record<string, unknown>).memory === undefined
+              || (
+                typeof (obj.summary as Record<string, unknown>).memory === "object"
+                && (obj.summary as Record<string, unknown>).memory !== null
+                && typeof ((obj.summary as Record<string, unknown>).memory as Record<string, unknown>).session === "object"
+                && typeof ((obj.summary as Record<string, unknown>).memory as Record<string, unknown>).workspace === "object"
+              )
+            )
+          );
         case "stats":
           return (
             typeof obj.scope === "string"

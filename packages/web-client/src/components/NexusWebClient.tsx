@@ -5,7 +5,7 @@ import {
   useApproval,
   useConnection,
   useSession,
-  type MemoryResultEvent,
+  type UsageResultEvent,
   type UseApprovalResult,
   type UseSessionResult,
 } from "@nexus/client-core";
@@ -52,11 +52,37 @@ const normalizePrincipalIdInput = (
   return principalId;
 };
 
-const formatMemoryResult = (event: MemoryResultEvent): ChatMessage[] => {
-  const scopeLabel = `scope=${event.scope}`;
+const parseUsageScope = (
+  value: string | undefined,
+): "session" | "workspace" | "hybrid" | undefined => {
+  const normalized = value?.trim().toLowerCase();
+  if (!normalized) return undefined;
+  if (normalized === "session" || normalized === "workspace" || normalized === "hybrid") {
+    return normalized;
+  }
+  return undefined;
+};
 
+const formatUsageResult = (event: UsageResultEvent): ChatMessage[] => {
   switch (event.action) {
+    case "summary":
+      return [
+        {
+          id: makeId(),
+          role: "system",
+          text: `Usage summary: tokens(input=${event.summary.tokens.input}, output=${event.summary.tokens.output}, total=${event.summary.tokens.total}); executions(total=${event.summary.executions.total}, queued=${event.summary.executions.queued}, running=${event.summary.executions.running}, succeeded=${event.summary.executions.succeeded}, failed=${event.summary.executions.failed}, cancelled=${event.summary.executions.cancelled}, timedOut=${event.summary.executions.timedOut})`,
+        },
+        ...(event.summary.memory
+          ? [{
+              id: makeId(),
+              role: "system" as const,
+              text: `Memory totals: session(total=${event.summary.memory.session.total}, tokens=${event.summary.memory.session.memoryTokens}), workspace(total=${event.summary.memory.workspace.total}, tokens=${event.summary.memory.workspace.memoryTokens})`,
+            }]
+          : []),
+      ];
     case "stats":
+      {
+      const scopeLabel = `scope=${event.scope}`;
       return [
         {
           id: makeId(),
@@ -64,7 +90,10 @@ const formatMemoryResult = (event: MemoryResultEvent): ChatMessage[] => {
           text: `Memory stats (${scopeLabel}): facts=${event.stats.facts}, summaries=${event.stats.summaries}, total=${event.stats.total}, memoryTokens=${event.stats.memoryTokens}, transcriptMessages=${event.stats.transcriptMessages}, transcriptTokens=${event.stats.transcriptTokens}`,
         },
       ];
+      }
     case "recent":
+      {
+      const scopeLabel = `scope=${event.scope}`;
       if (event.items.length === 0) {
         return [{ id: makeId(), role: "system", text: `No recent memory items (${scopeLabel}).` }];
       }
@@ -80,7 +109,10 @@ const formatMemoryResult = (event: MemoryResultEvent): ChatMessage[] => {
           text: `- [${item.kind}] c=${item.confidence.toFixed(2)} ${compact(item.content)}`,
         })),
       ];
+      }
     case "search":
+      {
+      const scopeLabel = `scope=${event.scope}`;
       if (event.items.length === 0) {
         return [{ id: makeId(), role: "system", text: `No memory matches for \"${event.query}\" (${scopeLabel}).` }];
       }
@@ -96,7 +128,10 @@ const formatMemoryResult = (event: MemoryResultEvent): ChatMessage[] => {
           text: `- [${item.kind}] c=${item.confidence.toFixed(2)} ${compact(item.content)}`,
         })),
       ];
+      }
     case "context":
+      {
+      const scopeLabel = `scope=${event.scope}`;
       return [
         {
           id: makeId(),
@@ -104,7 +139,10 @@ const formatMemoryResult = (event: MemoryResultEvent): ChatMessage[] => {
           text: `Memory context (${scopeLabel}): tokens=${event.context.totalTokens}/${event.context.budgetTokens}, hot=${event.context.hot.length}, warm=${event.context.warm.length}, cold=${event.context.cold.length}`,
         },
       ];
+      }
     case "clear":
+      {
+      const scopeLabel = `scope=${event.scope}`;
       return [
         {
           id: makeId(),
@@ -112,7 +150,28 @@ const formatMemoryResult = (event: MemoryResultEvent): ChatMessage[] => {
           text: `Cleared ${event.deleted} memory item(s) (${scopeLabel}).`,
         },
       ];
+      }
   }
+};
+
+const formatSessionListResult = (
+  sessions: UseSessionResult["sessionList"],
+  limit: number,
+  activeSessionId: string | null,
+): ChatMessage[] => {
+  if (sessions.length === 0) {
+    return [{ id: makeId(), role: "system", text: "No sessions found." }];
+  }
+  const boundedLimit = Math.max(1, Math.min(limit, 100));
+  const shown = sessions.slice(0, boundedLimit);
+  return [
+    { id: makeId(), role: "system", text: `Sessions (${shown.length}/${sessions.length}):` },
+    ...shown.map((session) => ({
+      id: makeId(),
+      role: "system" as const,
+      text: `- ${session.id}${session.id === activeSessionId ? " (current)" : ""} status=${session.status} workspace=${session.workspaceId ?? "default"} model=${session.model} last=${session.lastActivityAt}`,
+    })),
+  ];
 };
 
 const MarkdownView = ({ text }: { text: string }) => (
@@ -171,12 +230,13 @@ const ConnectedClient = ({
   const [localAliases, setLocalAliases] = useState<Record<string, string>>({});
   const [aliasName, setAliasName] = useState("");
   const [aliasTarget, setAliasTarget] = useState("");
-  const [memorySearch, setMemorySearch] = useState("");
+  const [usageSearch, setUsageSearch] = useState("");
   const [initializingDotCount, setInitializingDotCount] = useState(1);
 
   const creatingSessionRef = useRef(false);
   const prevStreamingRef = useRef(false);
-  const processedMemoryResultsRef = useRef(0);
+  const processedUsageResultsRef = useRef(0);
+  const pendingSessionListLimitRef = useRef<number | null>(null);
   const lastErrorRef = useRef<string | null>(null);
   const chatViewportRef = useRef<HTMLDivElement | null>(null);
   const shouldAutoScrollRef = useRef(true);
@@ -258,6 +318,9 @@ const ConnectedClient = ({
       creatingSessionRef.current = false;
       return;
     }
+    if (session.authStatus === "unverified" || session.authStatus === "verifying") {
+      return;
+    }
     if (session.sessionId) {
       creatingSessionRef.current = false;
       return;
@@ -266,7 +329,15 @@ const ConnectedClient = ({
 
     creatingSessionRef.current = true;
     createSession(preferredRuntimeId, preferredModel, preferredWorkspaceId);
-  }, [createSession, preferredModel, preferredRuntimeId, preferredWorkspaceId, session.sessionId, status]);
+  }, [
+    createSession,
+    preferredModel,
+    preferredRuntimeId,
+    preferredWorkspaceId,
+    session.authStatus,
+    session.sessionId,
+    status,
+  ]);
 
   useEffect(() => {
     if (prevStreamingRef.current && !session.isStreaming) {
@@ -284,12 +355,19 @@ const ConnectedClient = ({
   }, [appendMessages, session.isStreaming, session.responseText, session.toolCalls]);
 
   useEffect(() => {
-    if (session.memoryResults.length <= processedMemoryResultsRef.current) return;
-    const freshEvents = session.memoryResults.slice(processedMemoryResultsRef.current);
-    processedMemoryResultsRef.current = session.memoryResults.length;
-    const rendered = freshEvents.flatMap((event) => formatMemoryResult(event));
+    if (session.usageResults.length <= processedUsageResultsRef.current) return;
+    const freshEvents = session.usageResults.slice(processedUsageResultsRef.current);
+    processedUsageResultsRef.current = session.usageResults.length;
+    const rendered = freshEvents.flatMap((event) => formatUsageResult(event));
     appendMessages(rendered);
-  }, [appendMessages, session.memoryResults]);
+  }, [appendMessages, session.usageResults]);
+
+  useEffect(() => {
+    const pendingLimit = pendingSessionListLimitRef.current;
+    if (pendingLimit === null) return;
+    pendingSessionListLimitRef.current = null;
+    appendMessages(formatSessionListResult(session.sessionList, pendingLimit, session.sessionId));
+  }, [appendMessages, session.sessionId, session.sessionList]);
 
   useEffect(() => {
     if (!session.error) return;
@@ -412,6 +490,84 @@ const ConnectedClient = ({
         const [command, ...restParts] = text.slice(1).trim().split(/\s+/);
         const arg = restParts.join(" ").trim();
         const normalized = command?.toLowerCase() ?? "";
+        const handleTransferSubcommand = (
+          transferParts: string[],
+          options?: { deprecatedAlias?: boolean },
+        ): boolean => {
+          if (options?.deprecatedAlias) {
+            appendSystem("Deprecated: use /session transfer ... (legacy /transfer still works for now).");
+          }
+
+          const sub = transferParts[0]?.toLowerCase();
+          const pendingTransfersForPrincipal = session.pendingSessionTransfers.filter((transfer) => {
+            if (!session.authPrincipalId) return true;
+            const authType = session.authPrincipalType ?? "user";
+            return transfer.targetPrincipalId === session.authPrincipalId
+              && transfer.targetPrincipalType === authType;
+          });
+          const currentTransferForPrincipal = pendingTransfersForPrincipal[0];
+
+          if (!sub || sub === "pending") {
+            if (pendingTransfersForPrincipal.length === 0) {
+              appendSystem("No pending transfer requests.");
+            } else {
+              appendSystem(`Pending transfers (${pendingTransfersForPrincipal.length}):`);
+              for (const transfer of pendingTransfersForPrincipal) {
+                appendSystem(`- session=${transfer.sessionId} from=${transfer.fromPrincipalType}:${transfer.fromPrincipalId} expires=${transfer.expiresAt}`);
+              }
+            }
+            return true;
+          }
+
+          if (sub === "request") {
+            const targetPrincipalRaw = transferParts[1];
+            const targetPrincipalTypeRaw = transferParts[2]?.toLowerCase();
+            const targetPrincipalType = targetPrincipalTypeRaw === "service_account" ? "service_account" : "user";
+            const expiresInMsRaw = transferParts[3];
+            let expiresInMs: number | undefined;
+            if (!targetPrincipalRaw) {
+              appendSystem("Usage: /session transfer request <targetPrincipalId> [user|service_account] [expiresMs]");
+              return true;
+            }
+            if (expiresInMsRaw) {
+              const parsedExpiresInMs = Number.parseInt(expiresInMsRaw, 10);
+              if (!Number.isFinite(parsedExpiresInMs) || parsedExpiresInMs <= 0) {
+                appendSystem("Usage: /session transfer request <targetPrincipalId> [user|service_account] [expiresMs]");
+                return true;
+              }
+              expiresInMs = parsedExpiresInMs;
+            }
+            const targetPrincipalId = normalizePrincipalIdInput(targetPrincipalRaw, targetPrincipalType);
+            session.requestSessionTransfer(targetPrincipalId, targetPrincipalType, expiresInMs);
+            appendSystem(`Transfer requested for current session -> ${targetPrincipalType}:${targetPrincipalId}${expiresInMs ? ` (ttl=${expiresInMs}ms)` : ""}`);
+            return true;
+          }
+
+          if (sub === "accept") {
+            const sid = transferParts[1] ?? currentTransferForPrincipal?.sessionId;
+            if (!sid) {
+              appendSystem("Usage: /session transfer accept [sessionId]");
+              return true;
+            }
+            session.acceptSessionTransfer(sid);
+            appendSystem(`Accepting transfer for session ${sid}...`);
+            return true;
+          }
+
+          if (sub === "dismiss" || sub === "ignore") {
+            const sid = transferParts[1] ?? currentTransferForPrincipal?.sessionId;
+            if (!sid) {
+              appendSystem("Usage: /session transfer dismiss [sessionId]");
+              return true;
+            }
+            session.dismissPendingSessionTransfer(sid);
+            appendSystem(`Dismissed transfer prompt for session ${sid}.`);
+            return true;
+          }
+
+          appendSystem("Usage: /session transfer pending | request <targetPrincipalId> [user|service_account] [expiresMs] | accept [sessionId] | dismiss [sessionId]");
+          return true;
+        };
 
         if (normalized === "status") {
           appendSystem(`connection=${status}`);
@@ -526,88 +682,174 @@ const ConnectedClient = ({
           return;
         }
 
-        if (normalized === "transfer") {
+        if (normalized === "usage") {
           const sub = restParts[0]?.toLowerCase();
-          const pendingTransfers = session.pendingSessionTransfers.filter((transfer) => {
-            if (!session.authPrincipalId) return true;
-            const authType = session.authPrincipalType ?? "user";
-            return transfer.targetPrincipalId === session.authPrincipalId
-              && transfer.targetPrincipalType === authType;
-          });
-          const currentTransfer = pendingTransfers[0];
-
-          if (!sub || sub === "pending") {
-            if (pendingTransfers.length === 0) {
-              appendSystem("No pending transfer requests.");
-            } else {
-              appendSystem(`Pending transfers (${pendingTransfers.length}):`);
-              for (const transfer of pendingTransfers) {
-                appendSystem(`- session=${transfer.sessionId} from=${transfer.fromPrincipalType}:${transfer.fromPrincipalId} expires=${transfer.expiresAt}`);
-              }
-            }
+          if (!sub) {
+            session.requestUsage({ action: "summary" });
             setPromptInput("");
             return;
           }
 
-          if (sub === "request") {
-            const targetPrincipalRaw = restParts[1];
-            const targetPrincipalTypeRaw = restParts[2]?.toLowerCase();
-            const targetPrincipalType = targetPrincipalTypeRaw === "service_account" ? "service_account" : "user";
-            const expiresInMsRaw = restParts[3];
-            let expiresInMs: number | undefined;
-            if (!targetPrincipalRaw) {
-              appendSystem("Usage: /transfer request <targetPrincipalId> [user|service_account] [expiresMs]");
+          if (sub === "summary") {
+            session.requestUsage({ action: "summary" });
+            setPromptInput("");
+            return;
+          }
+
+          if (sub === "stats") {
+            const scope = parseUsageScope(restParts[1]);
+            if (restParts[1] && (!scope || scope === "hybrid")) {
+              appendSystem("Usage: /usage stats [session|workspace]");
               setPromptInput("");
               return;
             }
-            if (expiresInMsRaw) {
-              const parsedExpiresInMs = Number.parseInt(expiresInMsRaw, 10);
-              if (!Number.isFinite(parsedExpiresInMs) || parsedExpiresInMs <= 0) {
-                appendSystem("Usage: /transfer request <targetPrincipalId> [user|service_account] [expiresMs]");
+            session.requestUsage({ action: "stats", scope });
+            setPromptInput("");
+            return;
+          }
+
+          if (sub === "recent") {
+            let parsedLimit: number | undefined;
+            let scopeRaw: string | undefined;
+            const firstArg = restParts[1];
+            const firstScope = parseUsageScope(firstArg);
+            if (firstArg && firstScope) {
+              scopeRaw = firstArg;
+            } else if (firstArg) {
+              parsedLimit = Number.parseInt(firstArg, 10);
+              if (!Number.isFinite(parsedLimit) || parsedLimit <= 0) {
+                appendSystem("Usage: /usage recent [n] [session|workspace]");
                 setPromptInput("");
                 return;
               }
-              expiresInMs = parsedExpiresInMs;
+              scopeRaw = restParts[2];
             }
-            const targetPrincipalId = normalizePrincipalIdInput(targetPrincipalRaw, targetPrincipalType);
-            session.requestSessionTransfer(targetPrincipalId, targetPrincipalType, expiresInMs);
-            appendSystem(`Transfer requested for current session -> ${targetPrincipalType}:${targetPrincipalId}${expiresInMs ? ` (ttl=${expiresInMs}ms)` : ""}`);
-            setPromptInput("");
-            return;
-          }
-
-          if (sub === "accept") {
-            const sid = restParts[1] ?? currentTransfer?.sessionId;
-            if (!sid) {
-              appendSystem("Usage: /transfer accept [sessionId]");
+            const scope = parseUsageScope(scopeRaw);
+            if (scopeRaw && (!scope || scope === "hybrid")) {
+              appendSystem("Usage: /usage recent [n] [session|workspace]");
               setPromptInput("");
               return;
             }
-            session.acceptSessionTransfer(sid);
-            appendSystem(`Accepting transfer for session ${sid}...`);
+            session.requestUsage({ action: "recent", limit: parsedLimit, scope });
             setPromptInput("");
             return;
           }
 
-          if (sub === "dismiss" || sub === "ignore") {
-            const sid = restParts[1] ?? currentTransfer?.sessionId;
-            if (!sid) {
-              appendSystem("Usage: /transfer dismiss [sessionId]");
+          if (sub === "search") {
+            const maybeScope = parseUsageScope(restParts.slice(-1)[0]);
+            if (maybeScope === "hybrid") {
+              appendSystem("Usage: /usage search <query> [session|workspace]");
               setPromptInput("");
               return;
             }
-            session.dismissPendingSessionTransfer(sid);
-            appendSystem(`Dismissed transfer prompt for session ${sid}.`);
+            const consumedScope = maybeScope ? restParts.slice(-1)[0] : undefined;
+            const queryParts = consumedScope ? restParts.slice(1, -1) : restParts.slice(1);
+            const query = queryParts.join(" ").trim();
+            if (!query) {
+              appendSystem("Usage: /usage search <query> [session|workspace]");
+              setPromptInput("");
+              return;
+            }
+            session.requestUsage({ action: "search", query, scope: maybeScope });
             setPromptInput("");
             return;
           }
 
-          appendSystem("Usage: /transfer pending | request <targetPrincipalId> [user|service_account] [expiresMs] | accept [sessionId] | dismiss [sessionId]");
+          if (sub === "context") {
+            const maybeScope = parseUsageScope(restParts.slice(-1)[0]);
+            const promptParts = maybeScope ? restParts.slice(1, -1) : restParts.slice(1);
+            const prompt = promptParts.join(" ").trim();
+            session.requestUsage({ action: "context", prompt: prompt || undefined, scope: maybeScope });
+            setPromptInput("");
+            return;
+          }
+
+          if (sub === "clear") {
+            const scope = parseUsageScope(restParts[1]);
+            if (restParts[1] && (!scope || scope === "hybrid")) {
+              appendSystem("Usage: /usage clear [session|workspace]");
+              setPromptInput("");
+              return;
+            }
+            session.requestUsage({ action: "clear", scope });
+            setPromptInput("");
+            return;
+          }
+
+          appendSystem("Usage: /usage [summary|stats|recent|search|context|clear] ...");
           setPromptInput("");
           return;
         }
 
-        appendSystem("Unknown local command. Use /status, /models, /runtime, /model, /workspace, /transfer, /cancel, /close.");
+        if (normalized === "session") {
+          const sub = restParts[0]?.toLowerCase();
+          if (!sub || sub === "help") {
+            appendSystem("Usage: /session <command>");
+            appendSystem("/session list [limit]");
+            appendSystem("/session resume <sessionId>");
+            appendSystem("/session takeover <sessionId>");
+            appendSystem("/session transfer pending|request|accept|dismiss");
+            appendSystem("/session close [sessionId]");
+            setPromptInput("");
+            return;
+          }
+          if (sub === "list") {
+            const requestedLimit = restParts[1] ? Number.parseInt(restParts[1], 10) : undefined;
+            if (restParts[1] && (!Number.isFinite(requestedLimit) || (requestedLimit ?? 0) <= 0)) {
+              appendSystem("Usage: /session list [limit]");
+              setPromptInput("");
+              return;
+            }
+            pendingSessionListLimitRef.current = requestedLimit ?? 10;
+            appendSystem("Fetching sessions...");
+            session.requestSessionList();
+            setPromptInput("");
+            return;
+          }
+          if (sub === "resume" || sub === "takeover") {
+            const sid = restParts[1];
+            if (!sid) {
+              appendSystem(`Usage: /session ${sub} <sessionId>`);
+              setPromptInput("");
+              return;
+            }
+            session.resumeSession(sid);
+            appendSystem(`${sub === "takeover" ? "Taking over" : "Resuming"} session ${sid}...`);
+            setPromptInput("");
+            return;
+          }
+          if (sub === "transfer") {
+            handleTransferSubcommand(restParts.slice(1));
+            setPromptInput("");
+            return;
+          }
+          if (sub === "close" || sub === "delete") {
+            const sid = restParts[1] ?? session.sessionId ?? undefined;
+            if (!sid) {
+              appendSystem(`Usage: /session ${sub} [sessionId]`);
+              setPromptInput("");
+              return;
+            }
+            if (sub === "delete") {
+              appendSystem("Hard delete is not supported yet; closing session instead.");
+            }
+            sendMessage({ type: "session_close", sessionId: sid });
+            appendSystem(`Closing session ${sid}...`);
+            setPromptInput("");
+            return;
+          }
+          appendSystem("Usage: /session [list|resume|takeover|transfer|close]");
+          setPromptInput("");
+          return;
+        }
+
+        if (normalized === "transfer") {
+          handleTransferSubcommand(restParts, { deprecatedAlias: true });
+          setPromptInput("");
+          return;
+        }
+
+        appendSystem("Unknown local command. Use /status, /usage, /models, /runtime, /model, /workspace, /session, /cancel, /close.");
         setPromptInput("");
         return;
       }
@@ -632,6 +874,7 @@ const ConnectedClient = ({
       preferredWorkspaceId,
       promptInput,
       requestAutoScroll,
+      sendMessage,
       session,
       status,
     ],
@@ -796,12 +1039,20 @@ const ConnectedClient = ({
 
         <Separator className="my-4" />
 
-        <h3 className="panel-subtitle">Memory</h3>
+        <h3 className="panel-subtitle">Usage</h3>
         <div className="flex flex-wrap gap-2">
           <button
             type="button"
             className="button-secondary"
-            onClick={() => session.requestMemory({ action: "stats", scope: "session" })}
+            onClick={() => session.requestUsage({ action: "summary" })}
+            disabled={!session.sessionId}
+          >
+            Summary
+          </button>
+          <button
+            type="button"
+            className="button-secondary"
+            onClick={() => session.requestUsage({ action: "stats", scope: "session" })}
             disabled={!session.sessionId}
           >
             Stats Session
@@ -809,34 +1060,26 @@ const ConnectedClient = ({
           <button
             type="button"
             className="button-secondary"
-            onClick={() => session.requestMemory({ action: "stats", scope: "workspace" })}
+            onClick={() => session.requestUsage({ action: "stats", scope: "workspace" })}
             disabled={!session.sessionId}
           >
             Stats Workspace
-          </button>
-          <button
-            type="button"
-            className="button-secondary"
-            onClick={() => session.requestMemory({ action: "clear", scope: "session" })}
-            disabled={!session.sessionId}
-          >
-            Clear Session
           </button>
         </div>
         <div className="mt-2 flex gap-2">
           <input
             className="input"
-            value={memorySearch}
-            onChange={(event) => setMemorySearch(event.target.value)}
-            placeholder="search memory"
+            value={usageSearch}
+            onChange={(event) => setUsageSearch(event.target.value)}
+            placeholder="search usage memory"
           />
           <button
             type="button"
             className="button-secondary"
             onClick={() => {
-              const query = memorySearch.trim();
+              const query = usageSearch.trim();
               if (!query) return;
-              session.requestMemory({ action: "search", query, scope: "workspace" });
+              session.requestUsage({ action: "search", query, scope: "workspace" });
             }}
             disabled={!session.sessionId}
           >

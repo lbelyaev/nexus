@@ -396,6 +396,7 @@ export const startGateway = async (configPath?: string) => {
       requestedModel: string | undefined,
       onEvent: EventEmitter,
       policyContext?: SessionPolicyContext,
+      options?: { gatewaySessionId?: string },
     ): Promise<ManagedAcpSession> => {
       const runtimeId = resolveRuntimeId(requestedRuntimeId, requestedModel);
       const runtime = runtimeAgents.get(runtimeId);
@@ -404,7 +405,8 @@ export const startGateway = async (configPath?: string) => {
         throw new Error(`Runtime not available: ${runtimeId}`);
       }
 
-      const gatewaySessionId = `gw-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const gatewaySessionId = options?.gatewaySessionId
+        ?? `gw-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const modelSelection = resolveSessionModel(runtimeId, requestedModel);
       const ambiguousModel = normalizeModelKey(modelSelection.requested);
       const hasExplicitAlias = ambiguousModel in runtimeRegistry.modelAliases;
@@ -533,6 +535,11 @@ export const startGateway = async (configPath?: string) => {
       gatewayUrl: gatewayWsUrl,
       token: config.auth.token,
       adapters: channelRegistrations,
+      bindingStore: {
+        getChannelBinding: (adapterId, conversationId) => stateStore.getChannelBinding(adapterId, conversationId),
+        upsertChannelBinding: (binding) => stateStore.upsertChannelBinding(binding),
+        deleteChannelBinding: (adapterId, conversationId) => stateStore.deleteChannelBinding(adapterId, conversationId),
+      },
       logger: {
         debug: (message, fields) => log.debug(message, fields),
         info: (message, fields) => log.info(message, fields),

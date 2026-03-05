@@ -36,7 +36,7 @@ describe("useSession", () => {
     expect(result.current.isStreaming).toBe(false);
     expect(result.current.activeTools).toEqual([]);
     expect(result.current.error).toBeNull();
-    expect(result.current.memoryResults).toEqual([]);
+    expect(result.current.usageResults).toEqual([]);
     expect(result.current.pendingSessionTransfers).toEqual([]);
   });
 
@@ -764,6 +764,85 @@ describe("useSession", () => {
     expect(result.current.pendingSessionTransfers[0].sessionId).toBe("sess-b");
   });
 
+  it("auth_result success rebinds local interactive session principal in client state", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_created",
+        sessionId: "sess-local",
+        model: "claude-4",
+        principalType: "user",
+        principalId: "user:local",
+        source: "interactive",
+      });
+    });
+    expect(result.current.sessionPrincipalId).toBe("user:local");
+
+    act(() => {
+      result.current.handleEvent({
+        type: "auth_result",
+        ok: true,
+        principalType: "user",
+        principalId: "user:web:abc",
+      });
+    });
+
+    expect(result.current.sessionPrincipalType).toBe("user");
+    expect(result.current.sessionPrincipalId).toBe("user:web:abc");
+  });
+
+  it("auth_result rebinds local interactive session principal when events arrive in one tick", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_created",
+        sessionId: "sess-race-local",
+        model: "claude-4",
+        principalType: "user",
+        principalId: "user:local",
+        source: "interactive",
+      });
+      result.current.handleEvent({
+        type: "auth_result",
+        ok: true,
+        principalType: "user",
+        principalId: "user:web:race",
+      });
+    });
+
+    expect(result.current.sessionPrincipalType).toBe("user");
+    expect(result.current.sessionPrincipalId).toBe("user:web:race");
+  });
+
+  it("session_created uses authenticated principal when local interactive session arrives after auth", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "auth_result",
+        ok: true,
+        principalType: "user",
+        principalId: "user:web:late",
+      });
+      result.current.handleEvent({
+        type: "session_created",
+        sessionId: "sess-race",
+        model: "claude-4",
+        principalType: "user",
+        principalId: "user:local",
+        source: "interactive",
+      });
+    });
+
+    expect(result.current.sessionPrincipalType).toBe("user");
+    expect(result.current.sessionPrincipalId).toBe("user:web:late");
+  });
+
   it("session_transferred to authenticated principal switches active session and requests replay", () => {
     const sendMessage = vi.fn();
     const { result } = renderHook(() => useSession(sendMessage));
@@ -802,7 +881,7 @@ describe("useSession", () => {
     });
   });
 
-  it("requestMemory sends memory_query for active session", () => {
+  it("requestUsage sends usage_query for active session", () => {
     const sendMessage = vi.fn();
     const { result } = renderHook(() => useSession(sendMessage));
 
@@ -815,11 +894,11 @@ describe("useSession", () => {
     });
 
     act(() => {
-      result.current.requestMemory({ action: "search", query: "telegram", limit: 3 });
+      result.current.requestUsage({ action: "search", query: "telegram", limit: 3 });
     });
 
     expect(sendMessage).toHaveBeenCalledWith({
-      type: "memory_query",
+      type: "usage_query",
       sessionId: "sess-42",
       action: "search",
       query: "telegram",
@@ -854,13 +933,13 @@ describe("useSession", () => {
     expect(result.current.transcript).toEqual([]);
   });
 
-  it("stores memory_result events", () => {
+  it("stores usage_result events", () => {
     const sendMessage = vi.fn();
     const { result } = renderHook(() => useSession(sendMessage));
 
     act(() => {
       result.current.handleEvent({
-        type: "memory_result",
+        type: "usage_result",
         sessionId: "sess-1",
         action: "stats",
         scope: "session",
@@ -875,8 +954,8 @@ describe("useSession", () => {
       });
     });
 
-    expect(result.current.memoryResults).toHaveLength(1);
-    expect(result.current.memoryResults[0].action).toBe("stats");
+    expect(result.current.usageResults).toHaveLength(1);
+    expect(result.current.usageResults[0].action).toBe("stats");
   });
 
   it("ignores stale cancelled turn_end after steer reprompt", () => {

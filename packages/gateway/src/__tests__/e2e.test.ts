@@ -84,18 +84,27 @@ const waitForEvent = <T extends GatewayEvent["type"]>(
   new Promise((resolve, reject) => {
     const start = Date.now();
     const check = () => {
+      const deferred: string[] = [];
       while (messages.length > 0) {
         const next = messages.shift()!;
         let parsed: GatewayEvent | null = null;
         try {
           parsed = JSON.parse(next) as GatewayEvent;
         } catch {
+          deferred.push(next);
           continue;
         }
         if (parsed.type === type) {
+          if (deferred.length > 0) {
+            messages.unshift(...deferred);
+          }
           resolve(parsed as Extract<GatewayEvent, { type: T }>);
           return;
         }
+        deferred.push(next);
+      }
+      if (deferred.length > 0) {
+        messages.unshift(...deferred);
       }
       if (Date.now() - start > timeout) {
         reject(new Error(`Timeout waiting for event: ${type}`));
@@ -113,7 +122,7 @@ const sendAuthProof = async (
 ): Promise<void> => {
   const challenge = await waitForEvent(messages, "auth_challenge");
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
-  const payload = `${challenge.nonce}:user:${principalId}`;
+  const payload = `${challenge.challengeId}:${challenge.nonce}:user:${principalId}`;
   const signature = sign(null, Buffer.from(payload, "utf8"), privateKey).toString("base64");
   const exportedPublicKey = publicKey.export({
     type: "spki",
@@ -125,6 +134,7 @@ const sendAuthProof = async (
     principalType: "user",
     principalId,
     publicKey: exportedPublicKey,
+    challengeId: challenge.challengeId,
     nonce: challenge.nonce,
     signature,
     algorithm: "ed25519",
@@ -333,6 +343,40 @@ describe("E2E: WS client -> Gateway -> mock ACP session -> events back", () => {
   });
 
   describe("authenticated session transfer", () => {
+    it("allows transfer after authenticating a session that was created pre-auth", async () => {
+      const owner = await connectWs(port, TEST_TOKEN);
+      const target = await connectWs(port, TEST_TOKEN);
+
+      owner.ws.send(JSON.stringify({ type: "session_new" }));
+      const created = await waitForEvent(owner.messages, "session_created");
+      expect(created.principalId).toBe("user:local");
+
+      await sendAuthProof(owner.ws, owner.messages, "user:owner:e2e");
+      await sendAuthProof(target.ws, target.messages, "user:target:e2e");
+
+      owner.ws.send(JSON.stringify({
+        type: "session_transfer_request",
+        sessionId: created.sessionId,
+        targetPrincipalId: "user:target:e2e",
+      }));
+
+      const requestedForTarget = await waitForEvent(target.messages, "session_transfer_requested");
+      expect(requestedForTarget.sessionId).toBe(created.sessionId);
+
+      target.ws.send(JSON.stringify({
+        type: "session_transfer_accept",
+        sessionId: created.sessionId,
+      }));
+
+      const transferredTarget = await waitForEvent(target.messages, "session_transferred");
+      expect(transferredTarget.sessionId).toBe(created.sessionId);
+
+      owner.ws.close();
+      target.ws.close();
+      await waitForClose(owner.ws);
+      await waitForClose(target.ws);
+    });
+
     it("transfers ownership to target principal and enforces new owner", async () => {
       const owner = await connectWs(port, TEST_TOKEN);
       const target = await connectWs(port, TEST_TOKEN);
@@ -392,7 +436,7 @@ describe("E2E: WS client -> Gateway -> mock ACP session -> events back", () => {
       const challenge = await waitForEvent(conn.messages, "auth_challenge");
       const { privateKey, publicKey } = generateKeyPairSync("ed25519");
       const principalId = "user:replay:e2e";
-      const payload = `${challenge.nonce}:user:${principalId}`;
+      const payload = `${challenge.challengeId}:${challenge.nonce}:user:${principalId}`;
       const signature = sign(null, Buffer.from(payload, "utf8"), privateKey).toString("base64");
       const exportedPublicKey = publicKey.export({
         type: "spki",
@@ -404,6 +448,7 @@ describe("E2E: WS client -> Gateway -> mock ACP session -> events back", () => {
         principalType: "user",
         principalId,
         publicKey: exportedPublicKey,
+        challengeId: challenge.challengeId,
         nonce: challenge.nonce,
         signature,
         algorithm: "ed25519",
@@ -416,6 +461,7 @@ describe("E2E: WS client -> Gateway -> mock ACP session -> events back", () => {
         principalType: "user",
         principalId,
         publicKey: exportedPublicKey,
+        challengeId: challenge.challengeId,
         nonce: challenge.nonce,
         signature,
         algorithm: "ed25519",

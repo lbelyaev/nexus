@@ -14,16 +14,17 @@ export interface ToolCall {
   status: "running" | "completed" | "failed";
 }
 
-export interface MemoryQueryInput {
-  action: "stats" | "recent" | "search" | "context" | "clear";
+export interface UsageQueryInput {
+  action?: "summary" | "stats" | "recent" | "search" | "context" | "clear";
   scope?: "session" | "workspace" | "hybrid";
   query?: string;
   prompt?: string;
   limit?: number;
 }
 
-export type MemoryResultEvent = Extract<GatewayEvent, { type: "memory_result" }>;
+export type UsageResultEvent = Extract<GatewayEvent, { type: "usage_result" }>;
 export type SessionTransferRequestedEvent = Extract<GatewayEvent, { type: "session_transfer_requested" }>;
+export type SessionListEvent = Extract<GatewayEvent, { type: "session_list" }>;
 
 const createToolMatcher = (
   event: Extract<GatewayEvent, { type: "tool_end" }>,
@@ -66,19 +67,22 @@ export interface UseSessionResult {
   authPrincipalType: "user" | "service_account" | null;
   authPrincipalId: string | null;
   pendingSessionTransfers: SessionTransferRequestedEvent[];
+  sessionList: SessionListEvent["sessions"];
   responseText: string;
   thinkingText: string;
   isStreaming: boolean;
   activeTools: ActiveTool[];
   toolCalls: ToolCall[];
   transcript: TranscriptMessage[];
-  memoryResults: MemoryResultEvent[];
+  usageResults: UsageResultEvent[];
   error: string | null;
   sendPrompt: (text: string, images?: PromptImageInput[]) => void;
   steer: (text: string) => void;
   cancel: () => void;
   closeSession: () => void;
   requestReplay: (sessionId: string) => void;
+  requestSessionList: () => void;
+  resumeSession: (sessionId: string) => void;
   requestSessionTransfer: (
     targetPrincipalId: string,
     targetPrincipalType?: "user" | "service_account",
@@ -87,7 +91,7 @@ export interface UseSessionResult {
   ) => void;
   acceptSessionTransfer: (sessionId?: string) => void;
   dismissPendingSessionTransfer: (sessionId?: string) => void;
-  requestMemory: (query: MemoryQueryInput) => void;
+  requestUsage: (query: UsageQueryInput) => void;
   handleEvent: (event: GatewayEvent) => void;
 }
 
@@ -101,6 +105,9 @@ export const useSession = (
   const [sessionPrincipalType, setSessionPrincipalType] = useState<"user" | "service_account" | null>(null);
   const [sessionPrincipalId, setSessionPrincipalId] = useState<string | null>(null);
   const [sessionSource, setSessionSource] = useState<"interactive" | "schedule" | "hook" | "api" | null>(null);
+  const sessionPrincipalTypeRef = useRef(sessionPrincipalType);
+  const sessionPrincipalIdRef = useRef(sessionPrincipalId);
+  const sessionSourceRef = useRef(sessionSource);
   const [modelRouting, setModelRouting] = useState<Record<string, string>>({});
   const [modelAliases, setModelAliases] = useState<Record<string, string>>({});
   const [modelCatalog, setModelCatalog] = useState<Record<string, string[]>>({});
@@ -113,13 +120,15 @@ export const useSession = (
   const authPrincipalTypeRef = useRef(authPrincipalType);
   const authPrincipalIdRef = useRef(authPrincipalId);
   const [pendingSessionTransfers, setPendingSessionTransfers] = useState<SessionTransferRequestedEvent[]>([]);
+  const [sessionList, setSessionList] = useState<SessionListEvent["sessions"]>([]);
+  const sessionListRef = useRef<SessionListEvent["sessions"]>([]);
   const [responseText, setResponseText] = useState("");
   const [thinkingText, setThinkingText] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
   const [activeTools, setActiveTools] = useState<ActiveTool[]>([]);
   const [toolCalls, setToolCalls] = useState<ToolCall[]>([]);
   const [transcript, setTranscript] = useState<TranscriptMessage[]>([]);
-  const [memoryResults, setMemoryResults] = useState<MemoryResultEvent[]>([]);
+  const [usageResults, setUsageResults] = useState<UsageResultEvent[]>([]);
   const [error, setError] = useState<string | null>(null);
   const queuedSteerRef = useRef<string | null>(null);
   const ignoreCancelledTurnEndRef = useRef(false);
@@ -161,6 +170,16 @@ export const useSession = (
     authPrincipalTypeRef.current = authPrincipalType;
     authPrincipalIdRef.current = authPrincipalId;
   }, [authPrincipalId, authPrincipalType, authStatus]);
+
+  useEffect(() => {
+    sessionPrincipalTypeRef.current = sessionPrincipalType;
+    sessionPrincipalIdRef.current = sessionPrincipalId;
+    sessionSourceRef.current = sessionSource;
+  }, [sessionPrincipalId, sessionPrincipalType, sessionSource]);
+
+  useEffect(() => {
+    sessionListRef.current = sessionList;
+  }, [sessionList]);
 
   const sendPromptInternal = useCallback(
     (text: string, images?: PromptImageInput[]) => {
@@ -209,8 +228,29 @@ export const useSession = (
         setSessionModel(event.model);
         setSessionRuntimeId(event.runtimeId ?? null);
         setSessionWorkspaceId(event.workspaceId ?? "default");
-        setSessionPrincipalType(event.principalType ?? "user");
-        setSessionPrincipalId(event.principalId ?? "user:local");
+        {
+          const createdPrincipalType = event.principalType ?? "user";
+          const createdPrincipalId = event.principalId ?? "user:local";
+          const shouldUseAuthenticatedPrincipal =
+            authStatusRef.current === "verified"
+            && authPrincipalIdRef.current !== null
+            && authPrincipalTypeRef.current !== null
+            && createdPrincipalType === "user"
+            && createdPrincipalId === "user:local"
+            && (event.source === undefined || event.source === "interactive");
+          if (shouldUseAuthenticatedPrincipal) {
+            sessionPrincipalTypeRef.current = authPrincipalTypeRef.current;
+            sessionPrincipalIdRef.current = authPrincipalIdRef.current;
+            setSessionPrincipalType(authPrincipalTypeRef.current);
+            setSessionPrincipalId(authPrincipalIdRef.current);
+          } else {
+            sessionPrincipalTypeRef.current = createdPrincipalType;
+            sessionPrincipalIdRef.current = createdPrincipalId;
+            setSessionPrincipalType(createdPrincipalType);
+            setSessionPrincipalId(createdPrincipalId);
+          }
+        }
+        sessionSourceRef.current = event.source ?? "interactive";
         setSessionSource(event.source ?? "interactive");
         setModelRouting(event.modelRouting ?? {});
         setModelAliases(event.modelAliases ?? {});
@@ -232,6 +272,9 @@ export const useSession = (
           setSessionModel(null);
           setSessionRuntimeId(null);
           setSessionWorkspaceId(null);
+          sessionPrincipalTypeRef.current = null;
+          sessionPrincipalIdRef.current = null;
+          sessionSourceRef.current = null;
           setSessionPrincipalType(null);
           setSessionPrincipalId(null);
           setSessionSource(null);
@@ -268,6 +311,17 @@ export const useSession = (
           authPrincipalIdRef.current = nextId;
           setAuthPrincipalType(nextType);
           setAuthPrincipalId(nextId);
+          if (
+            nextId
+            && sessionPrincipalTypeRef.current === "user"
+            && sessionPrincipalIdRef.current === "user:local"
+            && (sessionSourceRef.current === null || sessionSourceRef.current === "interactive")
+          ) {
+            sessionPrincipalTypeRef.current = nextType;
+            sessionPrincipalIdRef.current = nextId;
+            setSessionPrincipalType(nextType);
+            setSessionPrincipalId(nextId);
+          }
           if (nextId) {
             setPendingSessionTransfers((prev) => prev.filter((transfer) => (
               transfer.targetPrincipalType === nextType
@@ -328,6 +382,9 @@ export const useSession = (
           setToolCalls([]);
           setError(null);
           setSessionId(event.sessionId);
+          sessionPrincipalTypeRef.current = event.targetPrincipalType;
+          sessionPrincipalIdRef.current = event.targetPrincipalId;
+          sessionSourceRef.current = "interactive";
           setSessionPrincipalType(event.targetPrincipalType);
           setSessionPrincipalId(event.targetPrincipalId);
           setSessionSource("interactive");
@@ -403,9 +460,35 @@ export const useSession = (
       }
       case "transcript":
         setTranscript(event.messages);
+        setSessionId(event.sessionId);
+        {
+          const match = sessionListRef.current.find((session) => session.id === event.sessionId);
+          if (match) {
+            setSessionModel(match.model);
+            setSessionWorkspaceId(match.workspaceId ?? "default");
+            if (match.principalType) {
+              sessionPrincipalTypeRef.current = match.principalType;
+              setSessionPrincipalType(match.principalType);
+            }
+            if (match.principalId) {
+              sessionPrincipalIdRef.current = match.principalId;
+              setSessionPrincipalId(match.principalId);
+            }
+            if (match.source) {
+              sessionSourceRef.current = match.source;
+              setSessionSource(match.source);
+            }
+          }
+        }
+        break;
+      case "session_list":
+        setSessionList(event.sessions);
+        break;
+      case "usage_result":
+        setUsageResults((prev) => [...prev, event]);
         break;
       case "memory_result":
-        setMemoryResults((prev) => [...prev, event]);
+        setUsageResults((prev) => [...prev, { ...event, type: "usage_result" }]);
         break;
       case "error":
         ignoreCancelledTurnEndRef.current = false;
@@ -467,6 +550,22 @@ export const useSession = (
     [sendMessage],
   );
 
+  const requestSessionList = useCallback(
+    () => {
+      sendMessage({ type: "session_list" });
+    },
+    [sendMessage],
+  );
+
+  const resumeSession = useCallback(
+    (sid: string) => {
+      const normalized = sid.trim();
+      if (!normalized) return;
+      sendMessage({ type: "session_replay", sessionId: normalized });
+    },
+    [sendMessage],
+  );
+
   const requestSessionTransfer = useCallback(
     (
       targetPrincipalId: string,
@@ -509,10 +608,10 @@ export const useSession = (
     [pendingSessionTransfers],
   );
 
-  const requestMemory = useCallback(
-    (query: MemoryQueryInput) => {
+  const requestUsage = useCallback(
+    (query: UsageQueryInput) => {
       if (!sessionId) return;
-      sendMessage({ type: "memory_query", sessionId, ...query });
+      sendMessage({ type: "usage_query", sessionId, ...query });
     },
     [sendMessage, sessionId],
   );
@@ -550,23 +649,26 @@ export const useSession = (
     authPrincipalType,
     authPrincipalId,
     pendingSessionTransfers,
+    sessionList,
     responseText,
     thinkingText,
     isStreaming,
     activeTools,
     toolCalls,
     transcript,
-    memoryResults,
+    usageResults,
     error,
     sendPrompt,
     steer,
     cancel,
     closeSession,
     requestReplay,
+    requestSessionList,
+    resumeSession,
     requestSessionTransfer,
     acceptSessionTransfer,
     dismissPendingSessionTransfer,
-    requestMemory,
+    requestUsage,
     handleEvent,
   };
 };

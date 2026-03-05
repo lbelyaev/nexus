@@ -276,4 +276,45 @@ describe("createTelegramAdapter", () => {
     expect(methods.filter((m) => m === "sendMessage")).toHaveLength(1);
     expect(methods.filter((m) => m === "editMessageText")).toHaveLength(1);
   });
+
+  it("registers slash commands on startup", async () => {
+    const onMessage = vi.fn().mockResolvedValue(undefined);
+    const fetchMock = vi.fn(async (url: string, _init?: RequestInit) => {
+      const method = String(url).split("/").at(-1);
+      if (method === "setMyCommands") return jsonResponse(true);
+      if (method === "getUpdates") return jsonResponse([]);
+      return jsonResponse(true);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const adapter = createTelegramAdapter({
+      botToken: "token",
+      pollTimeoutSeconds: 1,
+      pollIntervalMs: 10,
+    });
+    await adapter.start({
+      onMessage,
+      log: {
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+      },
+    });
+
+    await vi.waitFor(() => {
+      const call = fetchMock.mock.calls.find((entry) => String(entry[0]).includes("/setMyCommands"));
+      expect(call).toBeDefined();
+      const init = call?.[1];
+      const rawBody = init && typeof init.body === "string" ? init.body : "{}";
+      const payload = JSON.parse(rawBody) as {
+        commands?: Array<{ command: string; description: string }>;
+      };
+      expect(payload.commands?.some((entry) => entry.command === "usage")).toBe(true);
+      expect(payload.commands?.some((entry) => entry.command === "commands")).toBe(true);
+      expect(payload.commands?.some((entry) => entry.command === "session")).toBe(true);
+    });
+
+    await adapter.stop();
+  });
 });

@@ -196,6 +196,109 @@ describe("createRouter", () => {
     });
   });
 
+  it("rehydrates persisted sessions on prompt after runtime cache reset", async () => {
+    stateStore.createSession({
+      id: "gw-persisted-1",
+      workspaceId: "default",
+      principalType: "user",
+      principalId: "user:local",
+      source: "interactive",
+      runtimeId: "codex",
+      acpSessionId: "acp-stale",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00Z",
+      lastActivityAt: "2026-01-01T00:01:00Z",
+      tokenUsage: { input: 0, output: 0 },
+      model: "gpt-5",
+    });
+    const promptSpy = vi.fn().mockResolvedValue({ stopReason: "end_turn" });
+    acpSession = {
+      ...acpSession,
+      runtimeId: "codex",
+      model: "gpt-5",
+      prompt: promptSpy,
+    };
+    createAcpSessionMock = vi.fn(async () => acpSession);
+    router = createRouter({
+      createAcpSession: createAcpSessionMock,
+      stateStore,
+      policyConfig,
+      memoryProvider,
+      defaultWorkspaceId: "default",
+    });
+
+    const { emit, events } = collectEvents();
+    router.handleMessage({ type: "prompt", sessionId: "gw-persisted-1", text: "resume turn" }, emit);
+
+    await vi.waitFor(() => {
+      expect(createAcpSessionMock).toHaveBeenCalledWith(
+        "codex",
+        "gpt-5",
+        emit,
+        {
+          principalType: "user",
+          principalId: "user:local",
+          source: "interactive",
+          workspaceId: "default",
+        },
+        { gatewaySessionId: "gw-persisted-1" },
+      );
+    });
+    await vi.waitFor(() => {
+      expect(promptSpy).toHaveBeenCalledWith("resume turn", []);
+    });
+    await vi.waitFor(() => {
+      expect(events.some((event) => event.type === "turn_end" && event.sessionId === "gw-persisted-1")).toBe(true);
+    });
+  });
+
+  it("rehydrates persisted sessions for usage queries", async () => {
+    stateStore.createSession({
+      id: "gw-persisted-usage",
+      workspaceId: "default",
+      principalType: "user",
+      principalId: "user:local",
+      source: "interactive",
+      runtimeId: "claude",
+      acpSessionId: "acp-stale",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00Z",
+      lastActivityAt: "2026-01-01T00:01:00Z",
+      tokenUsage: { input: 7, output: 3 },
+      model: "sonnet",
+    });
+
+    const { emit, events } = collectEvents();
+    router.handleMessage({
+      type: "usage_query",
+      sessionId: "gw-persisted-usage",
+      action: "summary",
+    }, emit);
+
+    await vi.waitFor(() => {
+      expect(createAcpSessionMock).toHaveBeenCalledWith(
+        "claude",
+        "sonnet",
+        emit,
+        {
+          principalType: "user",
+          principalId: "user:local",
+          source: "interactive",
+          workspaceId: "default",
+        },
+        { gatewaySessionId: "gw-persisted-usage" },
+      );
+    });
+    await vi.waitFor(() => {
+      const usageEvent = events.find(
+        (event): event is Extract<GatewayEvent, { type: "usage_result"; action: "summary" }> =>
+          event.type === "usage_result" && event.action === "summary",
+      );
+      expect(usageEvent).toBeDefined();
+      expect(usageEvent?.summary.tokens.total).toBe(10);
+    });
+  });
+
   it("auth_proof binds a verified principal that session_new reuses", async () => {
     const { emit, events } = collectEvents();
     router.registerConnection("conn-1", emit);
@@ -226,6 +329,39 @@ describe("createRouter", () => {
     if (!created || created.type !== "session_created") throw new Error("expected session_created");
     expect(created.principalId).toBe("user:alice");
     expect(created.principalType).toBe("user");
+  });
+
+  it("auth_proof rebinds pre-auth local sessions owned by the same connection", async () => {
+    const { emit, events } = collectEvents();
+    router.registerConnection("conn-1", emit);
+    const challenge = events.find((event) => event.type === "auth_challenge");
+    if (!challenge || challenge.type !== "auth_challenge") {
+      throw new Error("auth_challenge missing");
+    }
+
+    events.length = 0;
+    router.handleMessage({ type: "session_new" }, emit, { connectionId: "conn-1" });
+    await vi.waitFor(() => {
+      expect(events.some((event) => event.type === "session_created")).toBe(true);
+    });
+    const created = events.find((event) => event.type === "session_created");
+    if (!created || created.type !== "session_created") throw new Error("expected session_created");
+    expect(created.principalId).toBe("user:local");
+
+    events.length = 0;
+    router.handleMessage(createAuthProof({
+      challengeId: challenge.challengeId,
+      nonce: challenge.nonce,
+      principalId: "user:web:abc123",
+    }), emit, { connectionId: "conn-1" });
+
+    const authResult = events.find((event) => event.type === "auth_result");
+    if (!authResult || authResult.type !== "auth_result") throw new Error("expected auth_result");
+    expect(authResult.ok).toBe(true);
+
+    const sessionRecord = stateStore.getSession(created.sessionId);
+    expect(sessionRecord?.principalType).toBe("user");
+    expect(sessionRecord?.principalId).toBe("user:web:abc123");
   });
 
   it("auth_proof rejects nonce replay", () => {
@@ -274,6 +410,36 @@ describe("createRouter", () => {
     if (!result || result.type !== "auth_result") throw new Error("expected auth_result");
     expect(result.ok).toBe(false);
     expect(result.message).toMatch(/challenge ID does not match/i);
+  });
+
+  it("auth_proof probe resends active challenge without emitting auth_result", () => {
+    const { emit, events } = collectEvents();
+    router.registerConnection("conn-1", emit);
+    const initialChallenge = events.find((event) => event.type === "auth_challenge");
+    if (!initialChallenge || initialChallenge.type !== "auth_challenge") {
+      throw new Error("auth_challenge missing");
+    }
+
+    events.length = 0;
+    router.handleMessage({
+      type: "auth_proof",
+      principalType: "user",
+      principalId: "user:alice",
+      publicKey: "probe",
+      challengeId: "",
+      nonce: "",
+      signature: "",
+      algorithm: "ed25519",
+    }, emit, { connectionId: "conn-1" });
+
+    const resentChallenge = events.find((event) => event.type === "auth_challenge");
+    if (!resentChallenge || resentChallenge.type !== "auth_challenge") {
+      throw new Error("expected resent auth_challenge");
+    }
+    expect(resentChallenge.challengeId).toBe(initialChallenge.challengeId);
+
+    const result = events.find((event) => event.type === "auth_result");
+    expect(result).toBeUndefined();
   });
 
   it("prompt emits error event if sessionId not found", () => {
@@ -536,6 +702,83 @@ describe("createRouter", () => {
     }
   });
 
+  it("session_list returns only authenticated principal sessions", async () => {
+    stateStore.createSession({
+      id: "sess-owned",
+      workspaceId: "default",
+      principalType: "user",
+      principalId: "user:web:user-1",
+      source: "interactive",
+      runtimeId: "claude",
+      acpSessionId: "acp-owned",
+      status: "active",
+      createdAt: "2026-03-01T00:00:00.000Z",
+      lastActivityAt: "2026-03-01T00:01:00.000Z",
+      tokenUsage: { input: 1, output: 2 },
+      model: "claude",
+    });
+    stateStore.createSession({
+      id: "sess-other",
+      workspaceId: "default",
+      principalType: "user",
+      principalId: "user:web:user-2",
+      source: "interactive",
+      runtimeId: "claude",
+      acpSessionId: "acp-other",
+      status: "active",
+      createdAt: "2026-03-01T00:00:00.000Z",
+      lastActivityAt: "2026-03-01T00:01:00.000Z",
+      tokenUsage: { input: 1, output: 2 },
+      model: "claude",
+    });
+    stateStore.createSession({
+      id: "sess-local",
+      workspaceId: "default",
+      principalType: "user",
+      principalId: "user:local",
+      source: "interactive",
+      runtimeId: "claude",
+      acpSessionId: "acp-local",
+      status: "active",
+      createdAt: "2026-03-01T00:00:00.000Z",
+      lastActivityAt: "2026-03-01T00:01:00.000Z",
+      tokenUsage: { input: 1, output: 2 },
+      model: "claude",
+    });
+
+    const { emit, events } = collectEvents();
+    router.registerConnection("conn-list", emit);
+    router.handleMessage({
+      type: "auth_proof",
+      principalId: "user:web:user-1",
+      publicKey: "",
+      challengeId: "",
+      nonce: "",
+      signature: "",
+      algorithm: "ed25519",
+    }, emit, { connectionId: "conn-list" });
+
+    const challenge = events.find((event): event is Extract<GatewayEvent, { type: "auth_challenge" }> => event.type === "auth_challenge");
+    if (!challenge) throw new Error("expected auth_challenge");
+    events.length = 0;
+    router.handleMessage(createAuthProof({
+      challengeId: challenge.challengeId,
+      nonce: challenge.nonce,
+      principalId: "user:web:user-1",
+    }), emit, { connectionId: "conn-list" });
+    await vi.waitFor(() => {
+      expect(events.some((event) => event.type === "auth_result" && event.ok)).toBe(true);
+    });
+
+    events.length = 0;
+    router.handleMessage({ type: "session_list" }, emit, { connectionId: "conn-list" });
+
+    expect(events).toHaveLength(1);
+    expect(events[0].type).toBe("session_list");
+    if (events[0].type !== "session_list") throw new Error("expected session_list");
+    expect(events[0].sessions.map((session) => session.id)).toEqual(["sess-owned"]);
+  });
+
   it("cancel calls acpSession.cancel()", async () => {
     const { emit, events } = collectEvents();
     router.handleMessage({ type: "session_new" }, emit);
@@ -641,10 +884,33 @@ describe("createRouter", () => {
 
   it("session_transfer_request rejects requester principal that does not own session", async () => {
     const owner = collectEvents();
+    const requester = collectEvents();
     router.registerConnection("conn-owner", owner.emit);
+    router.registerConnection("conn-requester", requester.emit);
     const challenge = owner.events.find((event) => event.type === "auth_challenge");
+    const requesterChallenge = requester.events.find((event) => event.type === "auth_challenge");
     if (!challenge || challenge.type !== "auth_challenge") throw new Error("auth_challenge missing");
+    if (!requesterChallenge || requesterChallenge.type !== "auth_challenge") {
+      throw new Error("requester auth_challenge missing");
+    }
 
+    owner.events.length = 0;
+    requester.events.length = 0;
+    router.handleMessage(createAuthProof({
+      challengeId: challenge.challengeId,
+      nonce: challenge.nonce,
+      principalId: "user:alice",
+    }), owner.emit, { connectionId: "conn-owner" });
+    router.handleMessage(createAuthProof({
+      challengeId: requesterChallenge.challengeId,
+      nonce: requesterChallenge.nonce,
+      principalId: "user:mallory",
+    }), requester.emit, { connectionId: "conn-requester" });
+    expect(owner.events.some((event) => event.type === "auth_result")).toBe(true);
+    expect(requester.events.some((event) => event.type === "auth_result")).toBe(true);
+
+    owner.events.length = 0;
+    requester.events.length = 0;
     router.handleMessage({ type: "session_new" }, owner.emit, { connectionId: "conn-owner" });
     await vi.waitFor(() => {
       expect(owner.events.some((e) => e.type === "session_created")).toBe(true);
@@ -652,12 +918,44 @@ describe("createRouter", () => {
     const created = owner.events.find((e) => e.type === "session_created");
     if (!created || created.type !== "session_created") throw new Error("expected session_created");
 
+    requester.events.length = 0;
+    router.handleMessage({
+      type: "session_transfer_request",
+      sessionId: created.sessionId,
+      targetPrincipalId: "user:bob",
+      targetPrincipalType: "user",
+    }, requester.emit, { connectionId: "conn-requester" });
+
+    expect(requester.events).toHaveLength(1);
+    expect(requester.events[0].type).toBe("error");
+    if (requester.events[0].type === "error") {
+      expect(requester.events[0].message).toMatch(/owned by another connection|does not own this session/i);
+    }
+  });
+
+  it("session_transfer_request rebinds local principal after reconnect ownership takeover", async () => {
+    const owner = collectEvents();
+    router.registerConnection("conn-owner-old", owner.emit);
+    router.handleMessage({ type: "session_new" }, owner.emit, { connectionId: "conn-owner-old" });
+    await vi.waitFor(() => {
+      expect(owner.events.some((e) => e.type === "session_created")).toBe(true);
+    });
+    const created = owner.events.find((e) => e.type === "session_created");
+    if (!created || created.type !== "session_created") throw new Error("expected session_created");
+
+    router.unregisterConnection("conn-owner-old", owner.emit);
+    owner.events.length = 0;
+
+    router.registerConnection("conn-owner-new", owner.emit);
+    const challenge = owner.events.find((event) => event.type === "auth_challenge");
+    if (!challenge || challenge.type !== "auth_challenge") throw new Error("auth_challenge missing");
+
     owner.events.length = 0;
     router.handleMessage(createAuthProof({
       challengeId: challenge.challengeId,
       nonce: challenge.nonce,
       principalId: "user:alice",
-    }), owner.emit, { connectionId: "conn-owner" });
+    }), owner.emit, { connectionId: "conn-owner-new" });
     expect(owner.events.some((event) => event.type === "auth_result")).toBe(true);
 
     owner.events.length = 0;
@@ -666,13 +964,14 @@ describe("createRouter", () => {
       sessionId: created.sessionId,
       targetPrincipalId: "user:bob",
       targetPrincipalType: "user",
-    }, owner.emit, { connectionId: "conn-owner" });
+    }, owner.emit, { connectionId: "conn-owner-new" });
 
-    expect(owner.events).toHaveLength(1);
-    expect(owner.events[0].type).toBe("error");
-    if (owner.events[0].type === "error") {
-      expect(owner.events[0].message).toMatch(/does not own this session/i);
-    }
+    const requested = owner.events.find((event) => event.type === "session_transfer_requested");
+    expect(requested?.type).toBe("session_transfer_requested");
+
+    const persisted = stateStore.getSession(created.sessionId);
+    expect(persisted?.principalType).toBe("user");
+    expect(persisted?.principalId).toBe("user:alice");
   });
 
   it("supports explicit session transfer between authenticated principals", async () => {
@@ -747,6 +1046,65 @@ describe("createRouter", () => {
 
     router.handleMessage({ type: "session_replay", sessionId: created.sessionId }, target.emit, { connectionId: "conn-target" });
     expect(target.events.some((event) => event.type === "transcript")).toBe(true);
+  });
+
+  it("broadcasts session_transfer_requested to unverified channel multiplexer with matching owned principal session", async () => {
+    let sessionCounter = 0;
+    createAcpSessionMock.mockImplementation(async () => {
+      sessionCounter += 1;
+      return {
+        ...mockAcpSession(),
+        id: `gw-session-${sessionCounter}`,
+        acpSessionId: `acp-session-${sessionCounter}`,
+      };
+    });
+
+    const owner = collectEvents();
+    const channel = collectEvents();
+    router.registerConnection("conn-owner", owner.emit);
+    router.registerConnection("conn-channel", channel.emit);
+
+    const ownerChallenge = owner.events.find((event) => event.type === "auth_challenge");
+    if (!ownerChallenge || ownerChallenge.type !== "auth_challenge") throw new Error("owner auth_challenge missing");
+
+    owner.events.length = 0;
+    channel.events.length = 0;
+    router.handleMessage(createAuthProof({
+      challengeId: ownerChallenge.challengeId,
+      nonce: ownerChallenge.nonce,
+      principalId: "user:alice",
+    }), owner.emit, { connectionId: "conn-owner" });
+
+    router.handleMessage({
+      type: "session_new",
+      principalType: "user",
+      principalId: "user:bob",
+      source: "api",
+    }, channel.emit, { connectionId: "conn-channel" });
+    await vi.waitFor(() => {
+      expect(channel.events.some((event) => event.type === "session_created")).toBe(true);
+    });
+
+    owner.events.length = 0;
+    channel.events.length = 0;
+    router.handleMessage({ type: "session_new" }, owner.emit, { connectionId: "conn-owner" });
+    await vi.waitFor(() => {
+      expect(owner.events.some((event) => event.type === "session_created")).toBe(true);
+    });
+    const created = owner.events.find((event) => event.type === "session_created");
+    if (!created || created.type !== "session_created") throw new Error("expected session_created");
+
+    owner.events.length = 0;
+    channel.events.length = 0;
+    router.handleMessage({
+      type: "session_transfer_request",
+      sessionId: created.sessionId,
+      targetPrincipalId: "user:bob",
+      targetPrincipalType: "user",
+    }, owner.emit, { connectionId: "conn-owner" });
+
+    expect(owner.events.some((event) => event.type === "session_transfer_requested")).toBe(true);
+    expect(channel.events.some((event) => event.type === "session_transfer_requested")).toBe(true);
   });
 
   it("sweepIdleSessions closes stale sessions", async () => {
@@ -1157,6 +1515,101 @@ describe("createRouter", () => {
     }
   });
 
+  it("usage_query summary returns token, execution, and memory aggregates", async () => {
+    const { emit, events } = collectEvents();
+    router.handleMessage({ type: "session_new" }, emit);
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === "session_created")).toBe(true);
+    });
+
+    const sessionId = (events[0] as Extract<GatewayEvent, { type: "session_created" }>).sessionId;
+    const sessionRecord = stateStore.getSession(sessionId);
+    if (!sessionRecord) throw new Error("expected session record");
+    stateStore.updateSession(sessionId, { tokenUsage: { input: 11, output: 5 } });
+    const now = new Date().toISOString();
+    stateStore.createExecution({
+      id: "exec-usage-1",
+      sessionId,
+      turnId: "turn-1",
+      workspaceId: sessionRecord.workspaceId,
+      principalType: sessionRecord.principalType,
+      principalId: sessionRecord.principalId,
+      source: sessionRecord.source,
+      runtimeId: sessionRecord.runtimeId,
+      model: sessionRecord.model,
+      policySnapshotId: "ps-1",
+      state: "queued",
+      createdAt: now,
+      updatedAt: now,
+    });
+    stateStore.createExecution({
+      id: "exec-usage-2",
+      sessionId,
+      turnId: "turn-2",
+      workspaceId: sessionRecord.workspaceId,
+      principalType: sessionRecord.principalType,
+      principalId: sessionRecord.principalId,
+      source: sessionRecord.source,
+      runtimeId: sessionRecord.runtimeId,
+      model: sessionRecord.model,
+      policySnapshotId: "ps-2",
+      state: "running",
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    events.length = 0;
+    router.handleMessage({ type: "usage_query", sessionId, action: "summary" }, emit);
+
+    expect(events).toHaveLength(1);
+    const summaryEvent = events[0];
+    if (summaryEvent.type !== "usage_result" || summaryEvent.action !== "summary") {
+      throw new Error("expected usage_result summary");
+    }
+    expect(summaryEvent.summary.tokens).toEqual({ input: 11, output: 5, total: 16 });
+    expect(summaryEvent.summary.executions.total).toBe(2);
+    expect(summaryEvent.summary.executions.queued).toBe(1);
+    expect(summaryEvent.summary.executions.running).toBe(1);
+    expect(summaryEvent.summary.memory?.session.total).toBe(3);
+    expect(summaryEvent.summary.memory?.workspace.total).toBe(3);
+    expect(memoryProvider.getStats).toHaveBeenCalledWith({
+      workspaceId: "default",
+      sessionId,
+      scope: "session",
+    });
+    expect(memoryProvider.getStats).toHaveBeenCalledWith({
+      workspaceId: "default",
+      sessionId,
+      scope: "workspace",
+    });
+  });
+
+  it("usage_query stats returns usage_result", async () => {
+    const { emit, events } = collectEvents();
+    router.handleMessage({ type: "session_new" }, emit);
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === "session_created")).toBe(true);
+    });
+
+    const sessionId = (events[0] as Extract<GatewayEvent, { type: "session_created" }>).sessionId;
+    events.length = 0;
+    router.handleMessage({ type: "usage_query", sessionId, action: "stats", scope: "workspace" }, emit);
+
+    expect(memoryProvider.getStats).toHaveBeenCalledWith({
+      workspaceId: "default",
+      sessionId,
+      scope: "workspace",
+    });
+    expect(events).toHaveLength(1);
+    const statsEvent = events[0];
+    if (statsEvent.type !== "usage_result" || statsEvent.action !== "stats") {
+      throw new Error("expected usage_result stats");
+    }
+    expect(statsEvent.scope).toBe("workspace");
+  });
+
   it("memory_query search validates query text", async () => {
     const { emit, events } = collectEvents();
     router.handleMessage({ type: "session_new" }, emit);
@@ -1174,5 +1627,63 @@ describe("createRouter", () => {
     if (events[0].type === "error") {
       expect(events[0].message).toMatch(/query is required/i);
     }
+  });
+
+  it("usage_query search validates query text", async () => {
+    const { emit, events } = collectEvents();
+    router.handleMessage({ type: "session_new" }, emit);
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === "session_created")).toBe(true);
+    });
+
+    const sessionId = (events[0] as Extract<GatewayEvent, { type: "session_created" }>).sessionId;
+    events.length = 0;
+    router.handleMessage({ type: "usage_query", sessionId, action: "search", query: " " }, emit);
+
+    expect(events).toHaveLength(1);
+    expect(events[0].type).toBe("error");
+    if (events[0].type === "error") {
+      expect(events[0].message).toMatch(/query is required/i);
+    }
+  });
+
+  it("usage_query summary reflects prompt token usage deltas", async () => {
+    const promptMock = acpSession.prompt as ReturnType<typeof vi.fn>;
+    promptMock.mockResolvedValueOnce({
+      stopReason: "end_turn",
+      content: { type: "text", text: "assistant token payload" },
+    });
+
+    const { emit, events } = collectEvents();
+    router.handleMessage({ type: "session_new" }, emit);
+
+    await vi.waitFor(() => {
+      expect(events.some((event) => event.type === "session_created")).toBe(true);
+    });
+
+    const created = events.find((event) => event.type === "session_created");
+    if (!created || created.type !== "session_created") throw new Error("expected session_created");
+    const sessionId = created.sessionId;
+
+    events.length = 0;
+    router.handleMessage({ type: "prompt", sessionId, text: "count these tokens please" }, emit);
+
+    await vi.waitFor(() => {
+      expect(events.some((event) => event.type === "turn_end")).toBe(true);
+    });
+
+    events.length = 0;
+    router.handleMessage({ type: "usage_query", sessionId, action: "summary" }, emit);
+    const usageSummary = events.find((event) => event.type === "usage_result");
+    if (!usageSummary || usageSummary.type !== "usage_result" || usageSummary.action !== "summary") {
+      throw new Error("expected usage summary");
+    }
+
+    expect(usageSummary.summary.tokens.input).toBeGreaterThan(0);
+    expect(usageSummary.summary.tokens.output).toBeGreaterThan(0);
+    expect(usageSummary.summary.tokens.total).toBe(
+      usageSummary.summary.tokens.input + usageSummary.summary.tokens.output,
+    );
   });
 });

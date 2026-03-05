@@ -9,6 +9,7 @@ import type {
   PromptSource,
   RuntimeHealthInfo,
   RuntimeHealthStatus,
+  UsageSummary,
 } from "@nexus/types";
 import { estimateTokens } from "@nexus/types";
 import { createHash, createPublicKey, randomBytes, verify } from "node:crypto";
@@ -41,6 +42,9 @@ export interface RouterDeps {
     model: string | undefined,
     onEvent: EventEmitter,
     policyContext?: SessionPolicyContext,
+    options?: {
+      gatewaySessionId?: string;
+    },
   ) => Promise<ManagedAcpSession>;
   stateStore: StateStore;
   policyConfig: PolicyConfig;
@@ -309,6 +313,7 @@ export const createRouter = (deps: RouterDeps): Router => {
     parentExecutionId?: string;
     completedAtMs?: number;
   }>>();
+  const pendingSessionHydrations = new Map<string, Promise<boolean>>();
   const sessionToPendingRequests = new Map<string, Set<string>>();
   const activeConnections = new Map<string, EventEmitter>();
   const emitterConnectionIds = new WeakMap<EventEmitter, string>();
@@ -338,6 +343,102 @@ export const createRouter = (deps: RouterDeps): Router => {
   const resolvePrincipal = (connectionId?: string): ConnectionPrincipal | undefined => (
     connectionId ? connectionPrincipals.get(connectionId) : undefined
   );
+
+  const rebindLocalOwnedSessionsToPrincipal = (
+    connectionId: string,
+    principalType: PrincipalType,
+    principalId: string,
+  ): void => {
+    const ownerEmit = activeConnections.get(connectionId);
+    if (!ownerEmit) return;
+
+    let reboundCount = 0;
+    for (const [sessionId, owner] of sessionOwners.entries()) {
+      if (owner !== ownerEmit) continue;
+      const currentPrincipal = sessionPrincipals.get(sessionId);
+      if (!currentPrincipal) continue;
+      if (
+        currentPrincipal.principalType !== "user"
+        || currentPrincipal.principalId !== "user:local"
+        || currentPrincipal.source !== "interactive"
+      ) {
+        continue;
+      }
+
+      sessionPrincipals.set(sessionId, {
+        principalType,
+        principalId,
+        source: currentPrincipal.source,
+      });
+      const policyContext = sessionPolicyContexts.get(sessionId);
+      if (policyContext) {
+        sessionPolicyContexts.set(sessionId, {
+          ...policyContext,
+          principalType,
+          principalId,
+        });
+      }
+      try {
+        stateStore.updateSession(sessionId, {
+          principalType,
+          principalId,
+        });
+      } catch {
+        // Ignore state races for sessions that may have just been closed.
+      }
+      reboundCount += 1;
+    }
+
+    if (reboundCount > 0) {
+      log.info("connection_sessions_rebound_to_authenticated_principal", {
+        connectionId,
+        principalType,
+        principalId,
+        sessionCount: reboundCount,
+      });
+    }
+  };
+
+  const rebindOwnedSessionPrincipalIfLocal = (
+    sessionId: string,
+    ownerEmit: EventEmitter,
+    principalType: PrincipalType,
+    principalId: string,
+  ): boolean => {
+    if (sessionOwners.get(sessionId) !== ownerEmit) return false;
+    const currentPrincipal = sessionPrincipals.get(sessionId);
+    if (!currentPrincipal) return false;
+    if (
+      currentPrincipal.principalType !== "user"
+      || currentPrincipal.principalId !== "user:local"
+      || currentPrincipal.source !== "interactive"
+    ) {
+      return false;
+    }
+
+    sessionPrincipals.set(sessionId, {
+      principalType,
+      principalId,
+      source: currentPrincipal.source,
+    });
+    const policyContext = sessionPolicyContexts.get(sessionId);
+    if (policyContext) {
+      sessionPolicyContexts.set(sessionId, {
+        ...policyContext,
+        principalType,
+        principalId,
+      });
+    }
+    try {
+      stateStore.updateSession(sessionId, {
+        principalType,
+        principalId,
+      });
+    } catch {
+      // Ignore state races for sessions that may have just been closed.
+    }
+    return true;
+  };
 
   const pruneConsumedAuthChallenges = (): void => {
     const nowMs = Date.now();
@@ -369,6 +470,17 @@ export const createRouter = (deps: RouterDeps): Router => {
     return challenge;
   };
 
+  const emitAuthChallenge = (challenge: AuthChallenge, emit: EventEmitter): void => {
+    emit({
+      type: "auth_challenge",
+      algorithm: challenge.algorithm,
+      challengeId: challenge.id,
+      nonce: challenge.nonce,
+      issuedAt: new Date(challenge.issuedAtMs).toISOString(),
+      expiresAt: new Date(challenge.expiresAtMs).toISOString(),
+    });
+  };
+
   const touchSession = (sessionId: string, timestamp = Date.now()): void => {
     sessionLastActivityMs.set(sessionId, timestamp);
     try {
@@ -378,6 +490,146 @@ export const createRouter = (deps: RouterDeps): Router => {
     } catch {
       // Ignore sessions that were already cleaned up from state.
     }
+  };
+
+  const incrementSessionTokenUsage = (
+    sessionId: string,
+    inputDelta: number,
+    outputDelta: number,
+  ): void => {
+    const normalizedInput = Math.max(0, Math.floor(inputDelta));
+    const normalizedOutput = Math.max(0, Math.floor(outputDelta));
+    if (normalizedInput === 0 && normalizedOutput === 0) return;
+
+    const sessionRecord = stateStore.getSession(sessionId);
+    if (!sessionRecord) return;
+
+    stateStore.updateSession(sessionId, {
+      tokenUsage: {
+        input: sessionRecord.tokenUsage.input + normalizedInput,
+        output: sessionRecord.tokenUsage.output + normalizedOutput,
+      },
+    });
+  };
+
+  const hydrateSessionIfPersisted = (
+    sessionId: string,
+    emit: EventEmitter,
+    context?: RouterMessageContext,
+  ): Promise<boolean> => {
+    if (sessions.has(sessionId)) return Promise.resolve(true);
+    const pending = pendingSessionHydrations.get(sessionId);
+    if (pending) return pending;
+
+    const hydration = (async (): Promise<boolean> => {
+      const sessionRecord = stateStore.getSession(sessionId);
+      if (!sessionRecord) {
+        emit({
+          type: "error",
+          sessionId,
+          message: `Session not found: ${sessionId}`,
+        });
+        return false;
+      }
+
+      const connectionId = context?.connectionId ?? emitterConnectionIds.get(emit);
+      const connectionPrincipal = resolvePrincipal(connectionId);
+      let principalType = sessionRecord.principalType;
+      let principalId = sessionRecord.principalId;
+      const source = sessionRecord.source;
+      if (connectionPrincipal?.verified) {
+        const isLocalInteractiveSession =
+          sessionRecord.principalType === "user"
+          && sessionRecord.principalId === "user:local"
+          && sessionRecord.source === "interactive";
+        if (isLocalInteractiveSession) {
+          principalType = connectionPrincipal.principalType;
+          principalId = connectionPrincipal.principalId;
+        } else if (
+          connectionPrincipal.principalType !== sessionRecord.principalType
+          || connectionPrincipal.principalId !== sessionRecord.principalId
+        ) {
+          emit({
+            type: "error",
+            sessionId,
+            message: "Authenticated principal does not own this session.",
+          });
+          return false;
+        }
+      }
+
+      const workspaceId = sessionRecord.workspaceId || defaultWorkspaceId;
+      const policyContext: SessionPolicyContext = {
+        principalType,
+        principalId,
+        source,
+        workspaceId,
+      };
+
+      try {
+        const restored = await createAcpSession(
+          sessionRecord.runtimeId,
+          sessionRecord.model,
+          emit,
+          policyContext,
+          { gatewaySessionId: sessionId },
+        );
+        sessions.set(sessionId, restored);
+        sessionWorkspaces.set(sessionId, workspaceId);
+        sessionPrincipals.set(sessionId, {
+          principalType,
+          principalId,
+          source,
+        });
+        sessionPolicyContexts.set(sessionId, policyContext);
+        sessionLastActivityMs.set(sessionId, Date.now());
+        stateStore.updateSession(sessionId, {
+          runtimeId: restored.runtimeId,
+          acpSessionId: restored.acpSessionId,
+          status: "active",
+          model: restored.model,
+          principalType,
+          principalId,
+          source,
+          workspaceId,
+          lastActivityAt: new Date().toISOString(),
+        });
+        log.info("session_rehydrated", {
+          connectionId: connectionId ?? null,
+          sessionId,
+          runtimeId: restored.runtimeId,
+          model: restored.model,
+          workspaceId,
+          principalType,
+          principalId,
+          source,
+        });
+        return true;
+      } catch (error) {
+        log.error("session_rehydrate_failed", {
+          connectionId: connectionId ?? null,
+          sessionId,
+          runtimeId: sessionRecord.runtimeId,
+          model: sessionRecord.model,
+          workspaceId,
+          principalType,
+          principalId,
+          source,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        emit({
+          type: "error",
+          sessionId,
+          message: `Failed to restore session: ${error instanceof Error ? error.message : "Unknown error"}`,
+        });
+        return false;
+      }
+    })().finally(() => {
+      pendingSessionHydrations.delete(sessionId);
+    });
+
+    pendingSessionHydrations.set(sessionId, hydration);
+    return hydration;
   };
 
   const trackPendingApproval = (
@@ -661,6 +913,18 @@ export const createRouter = (deps: RouterDeps): Router => {
       return;
     }
 
+    const isChallengeProbe = msg.challengeId === "" && msg.nonce === "" && msg.signature === "";
+    if (isChallengeProbe) {
+      const nowMs = Date.now();
+      const currentChallenge = authChallenges.get(connectionId);
+      if (currentChallenge && nowMs <= currentChallenge.expiresAtMs) {
+        emitAuthChallenge(currentChallenge, emit);
+        return;
+      }
+      issueAuthChallenge(connectionId, emit);
+      return;
+    }
+
     pruneConsumedAuthChallenges();
     const challengeReplayKey = `${connectionId}:${msg.challengeId}`;
     if (consumedAuthChallenges.has(challengeReplayKey)) {
@@ -750,6 +1014,7 @@ export const createRouter = (deps: RouterDeps): Router => {
       publicKey: normalizePublicKey(msg.publicKey),
       verifiedAt: new Date(nowMs).toISOString(),
     });
+    rebindLocalOwnedSessionsToPrincipal(connectionId, principalType, principalId);
 
     emit({
       type: "auth_result",
@@ -772,10 +1037,9 @@ export const createRouter = (deps: RouterDeps): Router => {
   ): void => {
     const session = sessions.get(msg.sessionId);
     if (!session) {
-      emit({
-        type: "error",
-        sessionId: msg.sessionId,
-        message: `Session not found: ${msg.sessionId}`,
+      void hydrateSessionIfPersisted(msg.sessionId, emit, context).then((hydrated) => {
+        if (!hydrated) return;
+        handleSessionTransferRequest(msg, emit, context);
       });
       return;
     }
@@ -813,11 +1077,31 @@ export const createRouter = (deps: RouterDeps): Router => {
       return;
     }
     const targetPrincipalType: PrincipalType = msg.targetPrincipalType ?? "user";
-    const sessionPrincipal = sessionPrincipals.get(msg.sessionId) ?? {
+    let sessionPrincipal = sessionPrincipals.get(msg.sessionId) ?? {
       principalType: "user" as const,
       principalId: "user:local",
       source: "interactive" as const,
     };
+    if (
+      requesterPrincipal.principalType !== sessionPrincipal.principalType
+      || requesterPrincipal.principalId !== sessionPrincipal.principalId
+    ) {
+      const rebound = rebindOwnedSessionPrincipalIfLocal(
+        msg.sessionId,
+        emit,
+        requesterPrincipal.principalType,
+        requesterPrincipal.principalId,
+      );
+      if (rebound) {
+        sessionPrincipal = sessionPrincipals.get(msg.sessionId) ?? sessionPrincipal;
+        log.info("session_rebound_to_authenticated_principal_on_transfer", {
+          connectionId,
+          sessionId: msg.sessionId,
+          principalType: requesterPrincipal.principalType,
+          principalId: requesterPrincipal.principalId,
+        });
+      }
+    }
     if (
       requesterPrincipal.principalType !== sessionPrincipal.principalType
       || requesterPrincipal.principalId !== sessionPrincipal.principalId
@@ -860,8 +1144,25 @@ export const createRouter = (deps: RouterDeps): Router => {
     for (const [activeConnectionId, activeEmit] of activeConnections) {
       if (activeEmit === emit) continue;
       const principal = resolvePrincipal(activeConnectionId);
-      if (!principal?.verified) continue;
-      if (principal.principalType !== targetPrincipalType || principal.principalId !== targetPrincipalId) continue;
+      if (principal?.verified) {
+        if (principal.principalType !== targetPrincipalType || principal.principalId !== targetPrincipalId) continue;
+        activeEmit(requestedEvent);
+        continue;
+      }
+
+      // Channel multiplexers can proxy multiple principals over one connection.
+      // If this unverified connection already owns any session with the target principal,
+      // surface the transfer request so the channel can present accept/dismiss UX.
+      const hasMatchingOwnedSession = Array.from(sessionOwners.entries()).some(([sessionId, ownerEmit]) => {
+        if (ownerEmit !== activeEmit) return false;
+        const ownedPrincipal = sessionPrincipals.get(sessionId);
+        if (!ownedPrincipal) return false;
+        return (
+          ownedPrincipal.principalType === targetPrincipalType
+          && ownedPrincipal.principalId === targetPrincipalId
+        );
+      });
+      if (!hasMatchingOwnedSession) continue;
       activeEmit(requestedEvent);
     }
 
@@ -1016,10 +1317,9 @@ export const createRouter = (deps: RouterDeps): Router => {
   ): void => {
     const session = sessions.get(msg.sessionId);
     if (!session) {
-      emit({
-        type: "error",
-        sessionId: msg.sessionId,
-        message: `Session not found: ${msg.sessionId}`,
+      void hydrateSessionIfPersisted(msg.sessionId, emit, context).then((hydrated) => {
+        if (!hydrated) return;
+        handlePrompt(msg, emit, context);
       });
       return;
     }
@@ -1282,6 +1582,21 @@ export const createRouter = (deps: RouterDeps): Router => {
       }
     }
 
+    try {
+      // Count model input payload (including any injected memory context).
+      incrementSessionTokenUsage(msg.sessionId, estimateTokens(promptText), 0);
+    } catch (error) {
+      log.warn("session_token_usage_input_update_failed", {
+        connectionId,
+        sessionId: msg.sessionId,
+        runtimeId: session.runtimeId,
+        executionId,
+        turnId,
+        policySnapshotId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
     // Always bind prompt-time emitter so streaming events (approval/tool/text)
     // are delivered to the same client that initiated this prompt.
     session.onEvent(recordingEmitWithHooks);
@@ -1370,6 +1685,23 @@ export const createRouter = (deps: RouterDeps): Router => {
             });
           }
         }
+        try {
+          incrementSessionTokenUsage(
+            msg.sessionId,
+            0,
+            estimateTokens(assistantMessageForTurn),
+          );
+        } catch (error) {
+          log.warn("session_token_usage_output_update_failed", {
+            connectionId,
+            sessionId: msg.sessionId,
+            runtimeId: session.runtimeId,
+            executionId,
+            turnId,
+            policySnapshotId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
       },
       (err: unknown) => {
         if (idempotencyKey) {
@@ -1417,10 +1749,35 @@ export const createRouter = (deps: RouterDeps): Router => {
     );
   };
 
-  const handleSessionList = (emit: EventEmitter): void => {
+  const handleSessionList = (
+    emit: EventEmitter,
+    context?: RouterMessageContext,
+  ): void => {
+    const sessionsList = stateStore.listSessions();
+    const connectionId = context?.connectionId ?? emitterConnectionIds.get(emit);
+    const connectionPrincipal = resolvePrincipal(connectionId);
+    const sessions = connectionPrincipal?.verified
+      ? sessionsList.filter((session) => {
+          const principalType = session.principalType ?? "user";
+          const principalId = session.principalId ?? "user:local";
+          const source = session.source ?? "interactive";
+          if (
+            principalType === "user"
+            && principalId === "user:local"
+            && source === "interactive"
+          ) {
+            return sessionOwners.get(session.id) === emit;
+          }
+          return (
+            principalType === connectionPrincipal.principalType
+            && principalId === connectionPrincipal.principalId
+          );
+        })
+      : sessionsList.filter((session) => sessionOwners.get(session.id) === emit);
+
     emit({
       type: "session_list",
-      sessions: stateStore.listSessions(),
+      sessions,
     });
   };
 
@@ -1431,10 +1788,9 @@ export const createRouter = (deps: RouterDeps): Router => {
   ): void => {
     const session = sessions.get(msg.sessionId);
     if (!session) {
-      emit({
-        type: "error",
-        sessionId: msg.sessionId,
-        message: `Session not found: ${msg.sessionId}`,
+      void hydrateSessionIfPersisted(msg.sessionId, emit, context).then((hydrated) => {
+        if (!hydrated) return;
+        handleCancel(msg, emit, context);
       });
       return;
     }
@@ -1458,6 +1814,14 @@ export const createRouter = (deps: RouterDeps): Router => {
     emit: EventEmitter,
     context?: RouterMessageContext,
   ): void => {
+    const session = sessions.get(msg.sessionId);
+    if (!session) {
+      void hydrateSessionIfPersisted(msg.sessionId, emit, context).then((hydrated) => {
+        if (!hydrated) return;
+        handleSessionClose(msg, emit, context);
+      });
+      return;
+    }
     if (!ensureSessionOwner(sessionOwners, msg.sessionId, emit)) {
       emitSessionOwnershipError(emit, msg.sessionId);
       return;
@@ -1567,6 +1931,22 @@ export const createRouter = (deps: RouterDeps): Router => {
     emit: EventEmitter,
     context?: RouterMessageContext,
   ): void => {
+    const session = sessions.get(msg.sessionId);
+    if (!session) {
+      if (!stateStore.getSession(msg.sessionId)) {
+        emit({
+          type: "transcript",
+          sessionId: msg.sessionId,
+          messages: [],
+        });
+        return;
+      }
+      void hydrateSessionIfPersisted(msg.sessionId, emit, context).then((hydrated) => {
+        if (!hydrated) return;
+        handleSessionReplay(msg, emit, context);
+      });
+      return;
+    }
     if (!ensureSessionOwner(sessionOwners, msg.sessionId, emit)) {
       emitSessionOwnershipError(emit, msg.sessionId);
       return;
@@ -1585,10 +1965,79 @@ export const createRouter = (deps: RouterDeps): Router => {
     });
   };
 
-  const handleMemoryQuery = (
-    msg: Extract<ClientMessage, { type: "memory_query" }>,
+  const buildUsageSummary = (
+    sessionId: string,
+    workspaceId: string,
+  ): UsageSummary => {
+    const sessionRecord = stateStore.getSession(sessionId);
+    const tokensInput = sessionRecord?.tokenUsage.input ?? 0;
+    const tokensOutput = sessionRecord?.tokenUsage.output ?? 0;
+    const executions = stateStore.listExecutions(sessionId, 5_000);
+    const executionCounts: UsageSummary["executions"] = {
+      total: executions.length,
+      queued: 0,
+      running: 0,
+      succeeded: 0,
+      failed: 0,
+      cancelled: 0,
+      timedOut: 0,
+    };
+
+    for (const execution of executions) {
+      switch (execution.state) {
+        case "queued":
+          executionCounts.queued += 1;
+          break;
+        case "running":
+          executionCounts.running += 1;
+          break;
+        case "succeeded":
+          executionCounts.succeeded += 1;
+          break;
+        case "failed":
+          executionCounts.failed += 1;
+          break;
+        case "cancelled":
+          executionCounts.cancelled += 1;
+          break;
+        case "timed_out":
+          executionCounts.timedOut += 1;
+          break;
+      }
+    }
+
+    const summary: UsageSummary = {
+      tokens: {
+        input: tokensInput,
+        output: tokensOutput,
+        total: tokensInput + tokensOutput,
+      },
+      executions: executionCounts,
+    };
+
+    if (memoryProvider) {
+      summary.memory = {
+        session: memoryProvider.getStats({ workspaceId, sessionId, scope: "session" }),
+        workspace: memoryProvider.getStats({ workspaceId, sessionId, scope: "workspace" }),
+      };
+    }
+
+    return summary;
+  };
+
+  const handleMemoryBackedUsageAction = (
+    queryType: "memory_query" | "usage_query",
+    msg: {
+      sessionId: string;
+      action: "stats" | "recent" | "search" | "context" | "clear";
+      query?: string;
+      prompt?: string;
+      limit?: number;
+      scope?: "session" | "workspace" | "hybrid";
+    },
     emit: EventEmitter,
-    context?: RouterMessageContext,
+    workspaceId: string,
+    connectionId: string | null,
   ): void => {
     if (!memoryProvider) {
       emit({
@@ -1599,37 +2048,25 @@ export const createRouter = (deps: RouterDeps): Router => {
       return;
     }
 
-    const session = sessions.get(msg.sessionId);
-    if (!session) {
-      emit({
-        type: "error",
-        sessionId: msg.sessionId,
-        message: `Session not found: ${msg.sessionId}`,
-      });
-      return;
-    }
-    if (!ensureSessionOwner(sessionOwners, msg.sessionId, emit)) {
-      emitSessionOwnershipError(emit, msg.sessionId);
-      return;
-    }
-    touchSession(msg.sessionId);
-    const workspaceId = sessionWorkspaces.get(msg.sessionId) ?? defaultWorkspaceId;
-    const connectionId = context?.connectionId ?? emitterConnectionIds.get(emit) ?? null;
-
     const limit = Math.max(1, Math.min(50, Math.floor(msg.limit ?? 10)));
     const scope = msg.scope ?? "session";
+    const resultType = queryType === "usage_query" ? "usage_result" : "memory_result";
 
     switch (msg.action) {
       case "stats": {
-        const stats = memoryProvider.getStats({ workspaceId, sessionId: msg.sessionId, scope: scope === "workspace" ? "workspace" : "session" });
+        const stats = memoryProvider.getStats({
+          workspaceId,
+          sessionId: msg.sessionId,
+          scope: scope === "workspace" ? "workspace" : "session",
+        });
         emit({
-          type: "memory_result",
+          type: resultType,
           sessionId: msg.sessionId,
           action: "stats",
           scope: scope === "workspace" ? "workspace" : "session",
           stats,
         });
-        log.debug("memory_query_stats", {
+        log.debug(`${queryType}_stats`, {
           connectionId,
           sessionId: msg.sessionId,
           scope: scope === "workspace" ? "workspace" : "session",
@@ -1644,14 +2081,14 @@ export const createRouter = (deps: RouterDeps): Router => {
           limit,
         });
         emit({
-          type: "memory_result",
+          type: resultType,
           sessionId: msg.sessionId,
           action: "recent",
           scope: scope === "workspace" ? "workspace" : "session",
           limit,
           items,
         });
-        log.debug("memory_query_recent", {
+        log.debug(`${queryType}_recent`, {
           connectionId,
           sessionId: msg.sessionId,
           scope: scope === "workspace" ? "workspace" : "session",
@@ -1677,7 +2114,7 @@ export const createRouter = (deps: RouterDeps): Router => {
           limit,
         });
         emit({
-          type: "memory_result",
+          type: resultType,
           sessionId: msg.sessionId,
           action: "search",
           scope: scope === "workspace" ? "workspace" : "session",
@@ -1685,7 +2122,7 @@ export const createRouter = (deps: RouterDeps): Router => {
           limit,
           items,
         });
-        log.debug("memory_query_search", {
+        log.debug(`${queryType}_search`, {
           connectionId,
           sessionId: msg.sessionId,
           scope: scope === "workspace" ? "workspace" : "session",
@@ -1712,7 +2149,7 @@ export const createRouter = (deps: RouterDeps): Router => {
             : "hybrid",
         });
         emit({
-          type: "memory_result",
+          type: resultType,
           sessionId: msg.sessionId,
           action: "context",
           scope: contextScope === "workspace" || contextScope === "session" || contextScope === "hybrid"
@@ -1721,7 +2158,7 @@ export const createRouter = (deps: RouterDeps): Router => {
           prompt,
           context,
         });
-        log.debug("memory_query_context", {
+        log.debug(`${queryType}_context`, {
           connectionId,
           sessionId: msg.sessionId,
           scope: contextScope === "workspace" || contextScope === "session" || contextScope === "hybrid"
@@ -1732,23 +2169,111 @@ export const createRouter = (deps: RouterDeps): Router => {
       }
       case "clear": {
         const effectiveScope = scope === "workspace" ? "workspace" : "session";
-        const deleted = memoryProvider.clear({ workspaceId, sessionId: msg.sessionId, scope: effectiveScope });
+        const deleted = memoryProvider.clear({
+          workspaceId,
+          sessionId: msg.sessionId,
+          scope: effectiveScope,
+        });
         emit({
-          type: "memory_result",
+          type: resultType,
           sessionId: msg.sessionId,
           action: "clear",
           scope: effectiveScope,
           deleted,
         });
-        log.info("memory_query_clear", {
+        log.info(`${queryType}_clear`, {
           connectionId,
           sessionId: msg.sessionId,
           scope: effectiveScope,
           deleted,
         });
-        return;
       }
     }
+  };
+
+  const validateSessionForRead = (
+    sessionId: string,
+    emit: EventEmitter,
+    context?: RouterMessageContext,
+  ): { workspaceId: string; connectionId: string | null } | null => {
+    const session = sessions.get(sessionId);
+    if (!session) {
+      emit({
+        type: "error",
+        sessionId,
+        message: `Session not found: ${sessionId}`,
+      });
+      return null;
+    }
+    if (!ensureSessionOwner(sessionOwners, sessionId, emit)) {
+      emitSessionOwnershipError(emit, sessionId);
+      return null;
+    }
+    touchSession(sessionId);
+    return {
+      workspaceId: sessionWorkspaces.get(sessionId) ?? defaultWorkspaceId,
+      connectionId: context?.connectionId ?? emitterConnectionIds.get(emit) ?? null,
+    };
+  };
+
+  const handleMemoryQuery = (
+    msg: Extract<ClientMessage, { type: "memory_query" }>,
+    emit: EventEmitter,
+    context?: RouterMessageContext,
+  ): void => {
+    const session = sessions.get(msg.sessionId);
+    if (!session) {
+      void hydrateSessionIfPersisted(msg.sessionId, emit, context).then((hydrated) => {
+        if (!hydrated) return;
+        handleMemoryQuery(msg, emit, context);
+      });
+      return;
+    }
+    const sessionContext = validateSessionForRead(msg.sessionId, emit, context);
+    if (!sessionContext) return;
+    handleMemoryBackedUsageAction("memory_query", msg, emit, sessionContext.workspaceId, sessionContext.connectionId);
+  };
+
+  const handleUsageQuery = (
+    msg: Extract<ClientMessage, { type: "usage_query" }>,
+    emit: EventEmitter,
+    context?: RouterMessageContext,
+  ): void => {
+    const session = sessions.get(msg.sessionId);
+    if (!session) {
+      void hydrateSessionIfPersisted(msg.sessionId, emit, context).then((hydrated) => {
+        if (!hydrated) return;
+        handleUsageQuery(msg, emit, context);
+      });
+      return;
+    }
+    const sessionContext = validateSessionForRead(msg.sessionId, emit, context);
+    if (!sessionContext) return;
+
+    const action = msg.action ?? "summary";
+    if (action === "summary") {
+      const summary = buildUsageSummary(msg.sessionId, sessionContext.workspaceId);
+      emit({
+        type: "usage_result",
+        sessionId: msg.sessionId,
+        action: "summary",
+        summary,
+      });
+      log.debug("usage_query_summary", {
+        connectionId: sessionContext.connectionId,
+        sessionId: msg.sessionId,
+        hasMemory: Boolean(memoryProvider),
+      });
+      return;
+    }
+
+    handleMemoryBackedUsageAction(
+      "usage_query",
+      { ...msg, action },
+      emit,
+      sessionContext.workspaceId,
+      sessionContext.connectionId,
+    );
   };
 
   const registerConnection = (connectionId: string, emit: EventEmitter): void => {
@@ -1891,7 +2416,7 @@ export const createRouter = (deps: RouterDeps): Router => {
       case "prompt":
         return handlePrompt(msg, emit, context);
       case "session_list":
-        return handleSessionList(emit);
+        return handleSessionList(emit, context);
       case "cancel":
         return handleCancel(msg, emit, context);
       case "session_close":
@@ -1906,6 +2431,8 @@ export const createRouter = (deps: RouterDeps): Router => {
         return handleSessionTransferAccept(msg, emit, context);
       case "memory_query":
         return handleMemoryQuery(msg, emit, context);
+      case "usage_query":
+        return handleUsageQuery(msg, emit, context);
     }
   };
 

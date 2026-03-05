@@ -56,6 +56,22 @@ export interface ExecutionRecord {
   completedAt?: string;
 }
 
+export interface ChannelBindingRecord {
+  adapterId: string;
+  conversationId: string;
+  sessionId: string;
+  principalType: PrincipalType;
+  principalId: string;
+  runtimeId?: string;
+  model?: string;
+  workspaceId?: string;
+  typingIndicator: boolean;
+  streamingMode: "off" | "edit";
+  steeringMode: "off" | "on";
+  createdAt: string;
+  updatedAt: string;
+}
+
 const SESSION_STATUSES = new Set(["active", "idle"]);
 const AUDIT_TYPES = new Set(["tool_call", "approval", "deny", "error"]);
 const EXECUTION_STATES = new Set<ExecutionState>([
@@ -66,6 +82,8 @@ const EXECUTION_STATES = new Set<ExecutionState>([
   "cancelled",
   "timed_out",
 ]);
+const CHANNEL_STREAMING_MODES = new Set<ChannelBindingRecord["streamingMode"]>(["off", "edit"]);
+const CHANNEL_STEERING_MODES = new Set<ChannelBindingRecord["steeringMode"]>(["off", "on"]);
 
 export const isSessionRecord = (value: unknown): value is SessionRecord => {
   if (typeof value !== "object" || value === null) return false;
@@ -126,5 +144,27 @@ export const isExecutionRecord = (value: unknown): value is ExecutionRecord => {
     typeof obj.updatedAt === "string" &&
     (obj.startedAt === undefined || typeof obj.startedAt === "string") &&
     (obj.completedAt === undefined || typeof obj.completedAt === "string")
+  );
+};
+
+export const isChannelBindingRecord = (value: unknown): value is ChannelBindingRecord => {
+  if (typeof value !== "object" || value === null) return false;
+  const obj = value as Record<string, unknown>;
+  return (
+    typeof obj.adapterId === "string"
+    && typeof obj.conversationId === "string"
+    && typeof obj.sessionId === "string"
+    && (obj.principalType === "user" || obj.principalType === "service_account")
+    && typeof obj.principalId === "string"
+    && (obj.runtimeId === undefined || typeof obj.runtimeId === "string")
+    && (obj.model === undefined || typeof obj.model === "string")
+    && (obj.workspaceId === undefined || typeof obj.workspaceId === "string")
+    && typeof obj.typingIndicator === "boolean"
+    && typeof obj.streamingMode === "string"
+    && CHANNEL_STREAMING_MODES.has(obj.streamingMode as ChannelBindingRecord["streamingMode"])
+    && typeof obj.steeringMode === "string"
+    && CHANNEL_STEERING_MODES.has(obj.steeringMode as ChannelBindingRecord["steeringMode"])
+    && typeof obj.createdAt === "string"
+    && typeof obj.updatedAt === "string"
   );
 };

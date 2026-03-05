@@ -116,6 +116,29 @@ describe("initDatabase", () => {
     expect(columnNames).toContain("completedAt");
   });
 
+  it("creates channel_bindings table with correct columns", () => {
+    initDatabase(db);
+
+    const columns = db
+      .prepare("PRAGMA table_info(channel_bindings)")
+      .all() as Array<{ name: string; type: string }>;
+    const columnNames = columns.map((c) => c.name);
+
+    expect(columnNames).toContain("adapterId");
+    expect(columnNames).toContain("conversationId");
+    expect(columnNames).toContain("sessionId");
+    expect(columnNames).toContain("principalType");
+    expect(columnNames).toContain("principalId");
+    expect(columnNames).toContain("runtimeId");
+    expect(columnNames).toContain("model");
+    expect(columnNames).toContain("workspaceId");
+    expect(columnNames).toContain("typingIndicator");
+    expect(columnNames).toContain("streamingMode");
+    expect(columnNames).toContain("steeringMode");
+    expect(columnNames).toContain("createdAt");
+    expect(columnNames).toContain("updatedAt");
+  });
+
   it("is idempotent (calling twice does not error)", () => {
     initDatabase(db);
     expect(() => initDatabase(db)).not.toThrow();
@@ -144,5 +167,7 @@ describe("initDatabase", () => {
     expect(indexNames).toContain("idx_executions_parentExecutionId");
     expect(indexNames).toContain("idx_executions_state_updatedAt");
     expect(indexNames).toContain("idx_executions_session_idempotencyKey");
+    expect(indexNames).toContain("idx_channel_bindings_sessionId");
+    expect(indexNames).toContain("idx_channel_bindings_principal");
   });
 });

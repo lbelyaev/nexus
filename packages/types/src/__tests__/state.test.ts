@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { isSessionRecord, isAuditEvent, isExecutionRecord } from "../state.js";
+import { isSessionRecord, isAuditEvent, isExecutionRecord, isChannelBindingRecord } from "../state.js";
 
 describe("isSessionRecord", () => {
   const validSession = {
@@ -126,5 +126,38 @@ describe("isExecutionRecord", () => {
     expect(isExecutionRecord({ ...validExecution, principalType: "admin" })).toBe(false);
     const { id, ...missingId } = validExecution;
     expect(isExecutionRecord(missingId)).toBe(false);
+  });
+});
+
+describe("isChannelBindingRecord", () => {
+  const validBinding = {
+    adapterId: "telegram",
+    conversationId: "chat-1",
+    sessionId: "gw-session-1",
+    principalType: "user",
+    principalId: "user:telegram:42",
+    runtimeId: "claude",
+    model: "sonnet",
+    workspaceId: "default",
+    typingIndicator: true,
+    streamingMode: "off",
+    steeringMode: "on",
+    createdAt: "2026-01-01T00:00:00Z",
+    updatedAt: "2026-01-01T00:00:00Z",
+  };
+
+  it("validates well-formed records", () => {
+    expect(isChannelBindingRecord(validBinding)).toBe(true);
+  });
+
+  it("accepts optional metadata fields", () => {
+    const { runtimeId, model, workspaceId, ...withoutOptional } = validBinding;
+    expect(isChannelBindingRecord(withoutOptional)).toBe(true);
+  });
+
+  it("rejects malformed channel binding records", () => {
+    expect(isChannelBindingRecord({ ...validBinding, streamingMode: "realtime" })).toBe(false);
+    expect(isChannelBindingRecord({ ...validBinding, steeringMode: "queue" })).toBe(false);
+    expect(isChannelBindingRecord({ ...validBinding, typingIndicator: "yes" })).toBe(false);
   });
 });

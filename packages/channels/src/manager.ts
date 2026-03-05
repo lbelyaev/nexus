@@ -1,4 +1,5 @@
-import type { ClientMessage, GatewayEvent, PrincipalType, PromptSource } from "@nexus/types";
+import type { ChannelBindingRecord, GatewayEvent, PrincipalType, PromptSource, SessionInfo } from "@nexus/types";
+import { generateKeyPairSync, sign, type KeyObject } from "node:crypto";
 import { createGatewayClient, type GatewayClient } from "./gatewayClient.js";
 import type {
   ChannelAdapter,
@@ -17,6 +18,11 @@ export interface ChannelManagerOptions {
   adapters: ChannelAdapterRegistration[];
   reconnectDelayMs?: number;
   logger?: LoggerLike;
+  bindingStore?: {
+    getChannelBinding: (adapterId: string, conversationId: string) => ChannelBindingRecord | null;
+    upsertChannelBinding: (binding: ChannelBindingRecord) => void;
+    deleteChannelBinding: (adapterId: string, conversationId: string) => void;
+  };
 }
 
 export interface ChannelManager {
@@ -37,6 +43,7 @@ interface ConversationBinding {
   streamingMode: ChannelStreamingMode;
   steeringMode: ChannelSteeringMode;
   createdAt: string;
+  updatedAt: string;
 }
 
 interface PendingSessionCreate {
@@ -65,6 +72,46 @@ interface SessionMetadata {
   runtimeId?: string;
   model?: string;
   workspaceId?: string;
+}
+
+interface PendingSessionListRequest {
+  adapterId: string;
+  conversationId: string;
+  principalType: PrincipalType;
+  principalId: string;
+  limit: number;
+  activeSessionId?: string;
+}
+
+interface PendingSessionResume {
+  adapterId: string;
+  conversationId: string;
+  principalType: PrincipalType;
+  principalId: string;
+}
+
+type PendingTransfer = Extract<GatewayEvent, { type: "session_transfer_requested" }>;
+type AuthChallengeEvent = Extract<GatewayEvent, { type: "auth_challenge" }>;
+type AuthResultEvent = Extract<GatewayEvent, { type: "auth_result" }>;
+type UsageResultEvent = Extract<GatewayEvent, { type: "usage_result" }>;
+type MemoryResultEvent = Extract<GatewayEvent, { type: "memory_result" }>;
+type SessionListEvent = Extract<GatewayEvent, { type: "session_list" }>;
+
+interface AuthKeyPair {
+  publicKey: string;
+  privateKey: KeyObject;
+}
+
+interface AuthChallengeWaiter {
+  resolve: (challenge: AuthChallengeEvent) => void;
+  reject: (error: Error) => void;
+  timeout: ReturnType<typeof setTimeout>;
+}
+
+interface AuthResultWaiter {
+  resolve: (result: AuthResultEvent) => void;
+  reject: (error: Error) => void;
+  timeout: ReturnType<typeof setTimeout>;
 }
 
 const createFallbackLogger = (): LoggerLike => ({
@@ -109,6 +156,15 @@ const normalizePrincipalIdInput = (
   return principalId;
 };
 
+const formatPrincipalDisplay = (
+  principalType: PrincipalType,
+  principalId: string,
+): string => (
+  principalId.startsWith(`${principalType}:`)
+    ? principalId
+    : `${principalType}:${principalId}`
+);
+
 const formatChannelError = (error: unknown): string => {
   if (error instanceof Error) return error.message;
   return String(error);
@@ -125,11 +181,84 @@ const formatUserFacingError = (message: string): string => {
   return `Error: ${message}`;
 };
 
+const parseUsageScope = (
+  value: string | undefined,
+): "session" | "workspace" | "hybrid" | undefined => {
+  const normalized = value?.trim().toLowerCase();
+  if (!normalized) return undefined;
+  if (normalized === "session" || normalized === "workspace" || normalized === "hybrid") {
+    return normalized;
+  }
+  return undefined;
+};
+
+const formatUsageStatsLine = (
+  scope: "session" | "workspace",
+  stats: {
+    facts: number;
+    summaries: number;
+    total: number;
+    transcriptMessages: number;
+    memoryTokens: number;
+    transcriptTokens: number;
+  },
+): string => [
+  `Usage stats (${scope}):`,
+  `memory=facts:${stats.facts}, summaries:${stats.summaries}, total:${stats.total}, tokens:${stats.memoryTokens}`,
+  `transcript=messages:${stats.transcriptMessages}, tokens:${stats.transcriptTokens}`,
+].join("\n");
+
+const formatUsageResult = (
+  event: UsageResultEvent | MemoryResultEvent,
+): string => {
+  switch (event.action) {
+    case "summary":
+      return [
+        "Usage summary:",
+        `tokens=input:${event.summary.tokens.input}, output:${event.summary.tokens.output}, total:${event.summary.tokens.total}`,
+        `executions=total:${event.summary.executions.total}, queued:${event.summary.executions.queued}, running:${event.summary.executions.running}, succeeded:${event.summary.executions.succeeded}, failed:${event.summary.executions.failed}, cancelled:${event.summary.executions.cancelled}, timed_out:${event.summary.executions.timedOut}`,
+        ...(event.summary.memory
+          ? [
+              `memory.session=total:${event.summary.memory.session.total}, tokens:${event.summary.memory.session.memoryTokens}`,
+              `memory.workspace=total:${event.summary.memory.workspace.total}, tokens:${event.summary.memory.workspace.memoryTokens}`,
+            ]
+          : []),
+      ].join("\n");
+    case "stats":
+      return formatUsageStatsLine(event.scope, event.stats);
+    case "recent":
+      if (event.items.length === 0) {
+        return `No recent memory items (scope=${event.scope}, limit=${event.limit}).`;
+      }
+      return [
+        `Recent memory (${event.items.length}/${event.limit}, scope=${event.scope}):`,
+        ...event.items.map((item) => `- [${item.kind}] c=${item.confidence.toFixed(2)} ${item.content}`),
+      ].join("\n");
+    case "search":
+      if (event.items.length === 0) {
+        return `No memory matches for "${event.query}" (scope=${event.scope}).`;
+      }
+      return [
+        `Memory search "${event.query}" (${event.items.length}/${event.limit}, scope=${event.scope}):`,
+        ...event.items.map((item) => `- [${item.kind}] c=${item.confidence.toFixed(2)} ${item.content}`),
+      ].join("\n");
+    case "context":
+      return [
+        `Memory context (scope=${event.scope}) for "${event.prompt}":`,
+        `tokens=${event.context.totalTokens}/${event.context.budgetTokens}, hot=${event.context.hot.length}, warm=${event.context.warm.length}, cold=${event.context.cold.length}`,
+      ].join("\n");
+    case "clear":
+      return `Cleared ${event.deleted} memory item(s) from ${event.scope}.`;
+  }
+};
+
 const DEFAULT_TYPING_INDICATOR = true;
 const DEFAULT_STREAMING_MODE: ChannelStreamingMode = "off";
 const DEFAULT_STEERING_MODE: ChannelSteeringMode = "off";
 const STREAM_EDIT_FLUSH_MS = 350;
 const TYPING_PULSE_MS = 4_000;
+const AUTH_WAIT_TIMEOUT_MS = 10_000;
+const DEFAULT_SESSION_LIST_LIMIT = 10;
 
 const compactApprovalTool = (tool: string): string => {
   const cleaned = tool.replace(/\s+/g, " ").trim();
@@ -148,6 +277,32 @@ const compactApprovalTool = (tool: string): string => {
   return cleaned.length > 120 ? `${cleaned.slice(0, 117)}...` : cleaned;
 };
 
+const parsePositiveInteger = (value: string | undefined): number | undefined => {
+  if (!value) return undefined;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
+  return parsed;
+};
+
+const formatSessionList = (
+  sessions: SessionInfo[],
+  limit: number,
+  activeSessionId?: string,
+): string => {
+  if (sessions.length === 0) {
+    return "No sessions found for this principal.";
+  }
+  const boundedLimit = Math.max(1, Math.min(limit, 100));
+  const shown = sessions.slice(0, boundedLimit);
+  return [
+    `Sessions (${shown.length}/${sessions.length}):`,
+    ...shown.map((session) => (
+      `- ${session.id}${session.id === activeSessionId ? " (current)" : ""} status=${session.status} workspace=${session.workspaceId ?? "default"} model=${session.model} last=${session.lastActivityAt}`
+    )),
+    "Use /session resume <sessionId> to attach this conversation.",
+  ].join("\n");
+};
+
 export const createChannelManager = (options: ChannelManagerOptions): ChannelManager => {
   const {
     gatewayUrl,
@@ -155,6 +310,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     adapters,
     reconnectDelayMs = 1_500,
     logger = createFallbackLogger(),
+    bindingStore,
   } = options;
 
   const adapterById = new Map<string, ChannelAdapter>();
@@ -173,19 +329,386 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
   const typingTimers = new Map<string, ReturnType<typeof setInterval>>();
   const pendingPrompts = new Map<string, PendingPrompt>();
   const pendingApprovalsById = new Map<string, PendingApproval>();
+  const pendingTransfersBySession = new Map<string, PendingTransfer>();
+  const transferCommandRoutes = new Map<string, { adapterId: string; conversationId: string }>();
+  const pendingSessionListRequests: PendingSessionListRequest[] = [];
+  const pendingSessionResumeBySession = new Map<string, PendingSessionResume>();
+  const sessionInfoById = new Map<string, SessionInfo>();
   const runningTurns = new Set<string>();
   const cancelRequested = new Set<string>();
   const queuedSteers = new Map<string, ChannelInboundMessage>();
+  const authKeyPairs = new Map<string, AuthKeyPair>();
+  const authResultQueue: AuthResultEvent[] = [];
+  const authChallengeWaiters = new Set<AuthChallengeWaiter>();
+  const authResultWaiters = new Set<AuthResultWaiter>();
 
   let running = false;
   let startedAdapters = false;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let pendingSessionCreate: PendingSessionCreate | null = null;
   let creationLock: Promise<void> = Promise.resolve();
+  let authLock: Promise<void> = Promise.resolve();
+  let latestAuthChallenge: AuthChallengeEvent | null = null;
+  let activeAuthPrincipal: { principalType: PrincipalType; principalId: string } | null = null;
 
   const gatewayClient: GatewayClient = createGatewayClient(gatewayUrl, token);
 
   const conversationKeyOf = (adapterId: string, conversationId: string): string => `${adapterId}:${conversationId}`;
+
+  const persistConversationBinding = (binding: ConversationBinding): void => {
+    if (!bindingStore) return;
+    const updatedAt = new Date().toISOString();
+    binding.updatedAt = updatedAt;
+    try {
+      bindingStore.upsertChannelBinding({
+        adapterId: binding.adapterId,
+        conversationId: binding.conversationId,
+        sessionId: binding.sessionId,
+        principalType: binding.principalType,
+        principalId: binding.principalId,
+        ...(binding.runtimeId ? { runtimeId: binding.runtimeId } : {}),
+        ...(binding.model ? { model: binding.model } : {}),
+        ...(binding.workspaceId ? { workspaceId: binding.workspaceId } : {}),
+        typingIndicator: binding.typingIndicator,
+        streamingMode: binding.streamingMode,
+        steeringMode: binding.steeringMode,
+        createdAt: binding.createdAt,
+        updatedAt: binding.updatedAt,
+      });
+    } catch (error) {
+      logger.warn("channel_binding_persist_failed", {
+        adapterId: binding.adapterId,
+        conversationId: binding.conversationId,
+        sessionId: binding.sessionId,
+        error: formatChannelError(error),
+      });
+    }
+  };
+
+  const loadPersistedBinding = (message: ChannelInboundMessage): ConversationBinding | null => {
+    if (!bindingStore) return null;
+    try {
+      const persisted = bindingStore.getChannelBinding(message.adapterId, message.conversationId);
+      if (!persisted) return null;
+      const binding: ConversationBinding = {
+        sessionId: persisted.sessionId,
+        adapterId: persisted.adapterId,
+        conversationId: persisted.conversationId,
+        principalType: persisted.principalType,
+        principalId: persisted.principalId,
+        runtimeId: persisted.runtimeId,
+        model: persisted.model,
+        workspaceId: persisted.workspaceId,
+        typingIndicator: persisted.typingIndicator,
+        streamingMode: persisted.streamingMode,
+        steeringMode: persisted.steeringMode,
+        createdAt: persisted.createdAt,
+        updatedAt: persisted.updatedAt,
+      };
+      const key = conversationKeyOf(message.adapterId, message.conversationId);
+      conversationBindings.set(key, binding);
+      sessionToConversation.set(binding.sessionId, key);
+      if (binding.runtimeId || binding.model || binding.workspaceId) {
+        sessionMetadataById.set(binding.sessionId, {
+          runtimeId: binding.runtimeId,
+          model: binding.model,
+          workspaceId: binding.workspaceId,
+        });
+      }
+      logger.info("channel_session_binding_restored", {
+        adapterId: binding.adapterId,
+        conversationId: binding.conversationId,
+        sessionId: binding.sessionId,
+      });
+      return binding;
+    } catch (error) {
+      logger.warn("channel_binding_restore_failed", {
+        adapterId: message.adapterId,
+        conversationId: message.conversationId,
+        error: formatChannelError(error),
+      });
+      return null;
+    }
+  };
+
+  const enqueueAuth = async (task: () => Promise<void>): Promise<void> => {
+    const prior = authLock;
+    let release: () => void = () => {};
+    authLock = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await prior;
+    try {
+      await task();
+    } finally {
+      release();
+    }
+  };
+
+  const resolveInboundPrincipal = (
+    message: ChannelInboundMessage,
+  ): {
+    route: ChannelRouteConfig;
+    principalType: PrincipalType;
+    principalId: string;
+    source: PromptSource;
+  } => {
+    const route = routeByAdapter.get(message.adapterId) ?? {};
+    const principalType: PrincipalType = route.principalType ?? "user";
+    const senderId = message.senderId.trim();
+    if (!senderId) {
+      throw new Error("senderId is required for channel messages.");
+    }
+    const rawPrincipalId = `${principalType}:${message.adapterId}:${senderId}`;
+    const principalId = normalizePrincipalIdInput(rawPrincipalId, principalType);
+    const source: PromptSource = route.source ?? "api";
+    return {
+      route,
+      principalType,
+      principalId,
+      source,
+    };
+  };
+
+  const resolveAuthKeyPair = (principalType: PrincipalType, principalId: string): AuthKeyPair => {
+    const key = `${principalType}:${principalId}`;
+    const existing = authKeyPairs.get(key);
+    if (existing) return existing;
+    const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+    const generated: AuthKeyPair = {
+      publicKey: publicKey.export({ type: "spki", format: "pem" }).toString(),
+      privateKey,
+    };
+    authKeyPairs.set(key, generated);
+    return generated;
+  };
+
+  const resolveAuthChallengeWaiters = (challenge: AuthChallengeEvent): void => {
+    for (const waiter of authChallengeWaiters) {
+      clearTimeout(waiter.timeout);
+      waiter.resolve(challenge);
+      authChallengeWaiters.delete(waiter);
+    }
+  };
+
+  const rejectAuthChallengeWaiters = (error: Error): void => {
+    for (const waiter of authChallengeWaiters) {
+      clearTimeout(waiter.timeout);
+      waiter.reject(error);
+      authChallengeWaiters.delete(waiter);
+    }
+  };
+
+  const pushAuthResult = (result: AuthResultEvent): void => {
+    const waiter = authResultWaiters.values().next().value as AuthResultWaiter | undefined;
+    if (waiter) {
+      clearTimeout(waiter.timeout);
+      authResultWaiters.delete(waiter);
+      waiter.resolve(result);
+      return;
+    }
+    authResultQueue.push(result);
+  };
+
+  const rejectAuthResultWaiters = (error: Error): void => {
+    for (const waiter of authResultWaiters) {
+      clearTimeout(waiter.timeout);
+      waiter.reject(error);
+      authResultWaiters.delete(waiter);
+    }
+    authResultQueue.length = 0;
+  };
+
+  const waitForAuthChallenge = (timeoutMs = AUTH_WAIT_TIMEOUT_MS): Promise<AuthChallengeEvent> => {
+    if (latestAuthChallenge) {
+      const expiresAtMs = Date.parse(latestAuthChallenge.expiresAt);
+      if (!Number.isNaN(expiresAtMs) && expiresAtMs > Date.now()) {
+        return Promise.resolve(latestAuthChallenge);
+      }
+      latestAuthChallenge = null;
+    }
+
+    return new Promise<AuthChallengeEvent>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        authChallengeWaiters.delete(waiter);
+        reject(new Error("Timed out waiting for auth challenge."));
+      }, timeoutMs);
+      const waiter: AuthChallengeWaiter = { resolve, reject, timeout };
+      authChallengeWaiters.add(waiter);
+    });
+  };
+
+  const waitForAuthResult = (timeoutMs = AUTH_WAIT_TIMEOUT_MS): Promise<AuthResultEvent> => {
+    const queued = authResultQueue.shift();
+    if (queued) return Promise.resolve(queued);
+
+    return new Promise<AuthResultEvent>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        authResultWaiters.delete(waiter);
+        reject(new Error("Timed out waiting for auth result."));
+      }, timeoutMs);
+      const waiter: AuthResultWaiter = { resolve, reject, timeout };
+      authResultWaiters.add(waiter);
+    });
+  };
+
+  const getLatestAuthChallenge = (): AuthChallengeEvent | null => latestAuthChallenge;
+
+  const ensureConnectionPrincipal = async (
+    principalType: PrincipalType,
+    principalId: string,
+  ): Promise<void> => {
+    await enqueueAuth(async () => {
+      if (
+        activeAuthPrincipal
+        && activeAuthPrincipal.principalType === principalType
+        && activeAuthPrincipal.principalId === principalId
+      ) {
+        return;
+      }
+
+      const keyPair = resolveAuthKeyPair(principalType, principalId);
+
+      const sendChallengeProbe = (): void => {
+        gatewayClient.send({
+          type: "auth_proof",
+          principalType,
+          principalId,
+          publicKey: keyPair.publicKey,
+          challengeId: "",
+          nonce: "",
+          signature: "",
+          algorithm: "ed25519",
+        });
+      };
+
+      const clearQueuedAuthResults = (): void => {
+        authResultQueue.length = 0;
+      };
+
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const challengeForAttempt = getLatestAuthChallenge();
+        const latestChallengeExpiresAt = challengeForAttempt?.expiresAt;
+        const hasValidChallenge = latestChallengeExpiresAt !== undefined
+          && Date.parse(latestChallengeExpiresAt) > Date.now();
+        if (!hasValidChallenge) {
+          sendChallengeProbe();
+        }
+
+        let challenge: AuthChallengeEvent;
+        try {
+          challenge = await waitForAuthChallenge();
+        } catch (error) {
+          if (attempt >= 2) {
+            throw error;
+          }
+          logger.warn("channel_auth_challenge_wait_retry", {
+            principalType,
+            principalId,
+            attempt: attempt + 1,
+            error: formatChannelError(error),
+          });
+          continue;
+        }
+
+        const payload = `${challenge.challengeId}:${challenge.nonce}:${principalType}:${principalId}`;
+        const signature = sign(null, Buffer.from(payload, "utf8"), keyPair.privateKey).toString("base64");
+        // Drop stale auth_result events (typically probe-side failures) before sending signed proof.
+        clearQueuedAuthResults();
+        gatewayClient.send({
+          type: "auth_proof",
+          principalType,
+          principalId,
+          publicKey: keyPair.publicKey,
+          challengeId: challenge.challengeId,
+          nonce: challenge.nonce,
+          signature,
+          algorithm: "ed25519",
+        });
+        latestAuthChallenge = null;
+        const authAttemptDeadline = Date.now() + AUTH_WAIT_TIMEOUT_MS;
+        let shouldRetryChallenge = false;
+        while (Date.now() < authAttemptDeadline) {
+          const remaining = Math.max(100, authAttemptDeadline - Date.now());
+          let result: AuthResultEvent;
+          try {
+            result = await waitForAuthResult(remaining);
+          } catch {
+            shouldRetryChallenge = true;
+            break;
+          }
+          if (
+            result.principalType !== undefined
+            && result.principalType !== principalType
+          ) {
+            continue;
+          }
+          if (
+            result.principalId !== undefined
+            && result.principalId !== principalId
+          ) {
+            continue;
+          }
+          if (result.ok) {
+            activeAuthPrincipal = { principalType, principalId };
+            return;
+          }
+          const reason = result.message ?? "Unknown authentication failure.";
+          if (reason.includes("Auth challenge is missing or expired")) {
+            // Retry this attempt; challenge may have rotated.
+            const freshChallenge = getLatestAuthChallenge();
+            const freshChallengeExpiresAt = freshChallenge?.expiresAt;
+            const hasFreshChallenge = freshChallengeExpiresAt !== undefined
+              && Date.parse(freshChallengeExpiresAt) > Date.now();
+            if (
+              hasFreshChallenge
+              && (
+                freshChallenge.challengeId !== challenge.challengeId
+                || freshChallenge.nonce !== challenge.nonce
+              )
+            ) {
+              shouldRetryChallenge = true;
+              break;
+            }
+            shouldRetryChallenge = true;
+            break;
+          }
+          if (reason.includes("Auth challenge required; resent active challenge")) {
+            const freshChallenge = getLatestAuthChallenge();
+            const freshChallengeExpiresAt = freshChallenge?.expiresAt;
+            const hasFreshChallenge = freshChallengeExpiresAt !== undefined
+              && Date.parse(freshChallengeExpiresAt) > Date.now();
+            if (
+              hasFreshChallenge
+              && (
+                freshChallenge.challengeId !== challenge.challengeId
+                || freshChallenge.nonce !== challenge.nonce
+              )
+            ) {
+              shouldRetryChallenge = true;
+              break;
+            }
+            shouldRetryChallenge = true;
+            break;
+          }
+          if (
+            reason.includes("does not match active challenge")
+            || reason.includes("Auth challenge expired")
+            || reason.includes("Auth nonce does not match active challenge")
+          ) {
+            shouldRetryChallenge = true;
+            break;
+          }
+          throw new Error(`Auth failed for ${principalType}:${principalId}: ${reason}`);
+        }
+        if (shouldRetryChallenge) {
+          continue;
+        }
+      }
+
+      throw new Error(`Auth failed for ${principalType}:${principalId}: retry budget exhausted.`);
+    });
+  };
 
   const sendToConversation = async (
     adapterId: string,
@@ -205,6 +728,57 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     const conversationKey = sessionToConversation.get(sessionId);
     if (!conversationKey) return undefined;
     return conversationBindings.get(conversationKey);
+  };
+
+  const rebindConversationToSession = (
+    adapterId: string,
+    conversationId: string,
+    sessionId: string,
+    principalType: PrincipalType,
+    principalId: string,
+    metadata?: SessionMetadata,
+  ): ConversationBinding => {
+    const route = routeByAdapter.get(adapterId) ?? {};
+    const key = conversationKeyOf(adapterId, conversationId);
+    const existing = conversationBindings.get(key);
+
+    const replacedSessionId = existing?.sessionId;
+    if (
+      replacedSessionId
+      && replacedSessionId !== sessionId
+      && sessionToConversation.get(replacedSessionId) === key
+    ) {
+      sessionToConversation.delete(replacedSessionId);
+    }
+
+    const previousConversationKey = sessionToConversation.get(sessionId);
+    if (previousConversationKey && previousConversationKey !== key) {
+      const previousBinding = conversationBindings.get(previousConversationKey);
+      if (previousBinding?.sessionId === sessionId) {
+        conversationBindings.delete(previousConversationKey);
+      }
+    }
+
+    const binding: ConversationBinding = {
+      sessionId,
+      adapterId,
+      conversationId,
+      principalType,
+      principalId,
+      runtimeId: metadata?.runtimeId ?? existing?.runtimeId ?? route.runtimeId ?? "default",
+      model: metadata?.model ?? existing?.model ?? route.model,
+      workspaceId: metadata?.workspaceId ?? existing?.workspaceId ?? route.workspaceId ?? "default",
+      typingIndicator: existing?.typingIndicator ?? route.typingIndicator ?? DEFAULT_TYPING_INDICATOR,
+      streamingMode: existing?.streamingMode ?? route.streamingMode ?? DEFAULT_STREAMING_MODE,
+      steeringMode: existing?.steeringMode ?? route.steeringMode ?? DEFAULT_STEERING_MODE,
+      createdAt: existing?.createdAt ?? new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    conversationBindings.set(key, binding);
+    sessionToConversation.set(sessionId, key);
+    persistConversationBinding(binding);
+    return binding;
   };
 
   const sendTypingState = async (sessionId: string, active: boolean): Promise<void> => {
@@ -263,6 +837,10 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
 
   const clearSessionState = (sessionId: string): void => {
     sessionMetadataById.delete(sessionId);
+    sessionInfoById.delete(sessionId);
+    pendingSessionResumeBySession.delete(sessionId);
+    pendingTransfersBySession.delete(sessionId);
+    transferCommandRoutes.delete(sessionId);
     streamBuffers.delete(sessionId);
     clearStreamFlushTimer(sessionId);
     streamFlushInFlight.delete(sessionId);
@@ -280,6 +858,16 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     const binding = conversationBindings.get(conversationKey);
     if (binding?.sessionId === sessionId) {
       conversationBindings.delete(conversationKey);
+      try {
+        bindingStore?.deleteChannelBinding(binding.adapterId, binding.conversationId);
+      } catch (error) {
+        logger.warn("channel_binding_delete_failed", {
+          adapterId: binding.adapterId,
+          conversationId: binding.conversationId,
+          sessionId,
+          error: formatChannelError(error),
+        });
+      }
     }
   };
 
@@ -332,18 +920,19 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     }
   };
 
-  const ensureSession = async (message: ChannelInboundMessage): Promise<string> => {
+  const ensureSession = async (
+    message: ChannelInboundMessage,
+    resolvedPrincipal = resolveInboundPrincipal(message),
+  ): Promise<string> => {
     const key = conversationKeyOf(message.adapterId, message.conversationId);
     const existing = conversationBindings.get(key);
     if (existing) return existing.sessionId;
+    const persisted = loadPersistedBinding(message);
+    if (persisted) return persisted.sessionId;
 
     let createdSessionId = "";
     await enqueueSessionCreation(async () => {
-      const route = routeByAdapter.get(message.adapterId) ?? {};
-      const principalType: PrincipalType = route.principalType ?? "user";
-      const rawPrincipalId = `${principalType}:${message.adapterId}:${message.senderId}`;
-      const principalId = normalizePrincipalIdInput(rawPrincipalId, principalType);
-      const source: PromptSource = route.source ?? "api";
+      const { route, principalType, principalId, source } = resolvedPrincipal;
       const typingIndicator = route.typingIndicator ?? DEFAULT_TYPING_INDICATOR;
       const streamingMode = route.streamingMode ?? DEFAULT_STREAMING_MODE;
       const steeringMode = route.steeringMode ?? DEFAULT_STEERING_MODE;
@@ -371,23 +960,14 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
 
       createdSessionId = await awaiting;
       const sessionMetadata = sessionMetadataById.get(createdSessionId);
-
-      const binding: ConversationBinding = {
-        sessionId: createdSessionId,
-        adapterId: message.adapterId,
-        conversationId: message.conversationId,
+      const binding = rebindConversationToSession(
+        message.adapterId,
+        message.conversationId,
+        createdSessionId,
         principalType,
         principalId,
-        runtimeId: sessionMetadata?.runtimeId ?? route.runtimeId ?? "default",
-        model: sessionMetadata?.model ?? route.model,
-        workspaceId: sessionMetadata?.workspaceId ?? route.workspaceId ?? "default",
-        typingIndicator,
-        streamingMode,
-        steeringMode,
-        createdAt: new Date().toISOString(),
-      };
-      conversationBindings.set(key, binding);
-      sessionToConversation.set(createdSessionId, key);
+        sessionMetadata,
+      );
 
       logger.info("channel_session_bound", {
         adapterId: message.adapterId,
@@ -479,6 +1059,8 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         "Nexus channel commands:",
         "/help",
         "/status",
+        "/session [list|resume|transfer|close]",
+        "/usage [summary|stats|recent|search|context|clear]",
         "/new",
         "/cancel",
         "/approve <requestId|all>",
@@ -487,7 +1069,167 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     );
   };
 
-  const handleCommand = async (message: ChannelInboundMessage): Promise<boolean> => {
+  const handleSessionTransferCommand = async (
+    message: ChannelInboundMessage,
+    binding: ConversationBinding | undefined,
+    resolvedPrincipal: ReturnType<typeof resolveInboundPrincipal>,
+    transferParts: string[],
+    options?: {
+      deprecatedAlias?: boolean;
+    },
+  ): Promise<boolean> => {
+    const sub = transferParts[0]?.trim().toLowerCase();
+    const pendingTransfers = Array.from(pendingTransfersBySession.values()).filter((transfer) => (
+      transfer.targetPrincipalType === resolvedPrincipal.principalType
+      && transfer.targetPrincipalId === resolvedPrincipal.principalId
+    ));
+    const currentTransfer = pendingTransfers[0];
+    const usagePrefix = "/session transfer";
+
+    if (options?.deprecatedAlias) {
+      await sendToConversation(
+        message.adapterId,
+        message.conversationId,
+        "Deprecated: use /session transfer ... (legacy /transfer still works for now).",
+      );
+    }
+
+    if (!sub || sub === "pending") {
+      if (pendingTransfers.length === 0) {
+        await sendToConversation(message.adapterId, message.conversationId, "No pending transfer requests.");
+        return true;
+      }
+      await sendToConversation(
+        message.adapterId,
+        message.conversationId,
+        [
+          `Pending transfers (${pendingTransfers.length}):`,
+          ...pendingTransfers.map((transfer) => (
+            `- session=${transfer.sessionId} from=${formatPrincipalDisplay(transfer.fromPrincipalType, transfer.fromPrincipalId)} expires=${transfer.expiresAt}`
+          )),
+        ].join("\n"),
+      );
+      return true;
+    }
+
+    if (sub === "request") {
+      if (!binding) {
+        await sendToConversation(message.adapterId, message.conversationId, "No active session.");
+        return true;
+      }
+      const targetPrincipalRaw = transferParts[1]?.trim();
+      const targetPrincipalTypeRaw = transferParts[2]?.trim().toLowerCase();
+      const targetPrincipalType: PrincipalType = targetPrincipalTypeRaw === "service_account" ? "service_account" : "user";
+      const expiresInMsRaw = transferParts[3]?.trim();
+      let expiresInMs: number | undefined;
+      if (!targetPrincipalRaw) {
+        await sendToConversation(
+          message.adapterId,
+          message.conversationId,
+          `Usage: ${usagePrefix} request <targetPrincipalId> [user|service_account] [expiresMs]`,
+        );
+        return true;
+      }
+      if (expiresInMsRaw) {
+        const parsed = Number.parseInt(expiresInMsRaw, 10);
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+          await sendToConversation(
+            message.adapterId,
+            message.conversationId,
+            `Usage: ${usagePrefix} request <targetPrincipalId> [user|service_account] [expiresMs]`,
+          );
+          return true;
+        }
+        expiresInMs = parsed;
+      }
+
+      const targetPrincipalId = normalizePrincipalIdInput(targetPrincipalRaw, targetPrincipalType);
+      await ensureConnectionPrincipal(resolvedPrincipal.principalType, resolvedPrincipal.principalId);
+      gatewayClient.send({
+        type: "session_transfer_request",
+        sessionId: binding.sessionId,
+        targetPrincipalType,
+        targetPrincipalId,
+        ...(expiresInMs !== undefined ? { expiresInMs } : {}),
+      });
+      transferCommandRoutes.set(binding.sessionId, {
+        adapterId: message.adapterId,
+        conversationId: message.conversationId,
+      });
+      await sendToConversation(
+        message.adapterId,
+        message.conversationId,
+        `Transfer requested for session ${binding.sessionId} -> ${formatPrincipalDisplay(targetPrincipalType, targetPrincipalId)}${expiresInMs !== undefined ? ` (ttl=${expiresInMs}ms)` : ""}`,
+      );
+      return true;
+    }
+
+    if (sub === "accept") {
+      const sessionId = transferParts[1]?.trim() || currentTransfer?.sessionId;
+      if (!sessionId) {
+        await sendToConversation(message.adapterId, message.conversationId, `Usage: ${usagePrefix} accept [sessionId]`);
+        return true;
+      }
+      const pending = pendingTransfersBySession.get(sessionId);
+      if (
+        pending
+        && (
+          pending.targetPrincipalType !== resolvedPrincipal.principalType
+          || pending.targetPrincipalId !== resolvedPrincipal.principalId
+        )
+      ) {
+        await sendToConversation(
+          message.adapterId,
+          message.conversationId,
+          `Transfer ${sessionId} is targeted to ${formatPrincipalDisplay(pending.targetPrincipalType, pending.targetPrincipalId)}.`,
+        );
+        return true;
+      }
+
+      await ensureConnectionPrincipal(resolvedPrincipal.principalType, resolvedPrincipal.principalId);
+      gatewayClient.send({
+        type: "session_transfer_accept",
+        sessionId,
+      });
+      transferCommandRoutes.set(sessionId, {
+        adapterId: message.adapterId,
+        conversationId: message.conversationId,
+      });
+      await sendToConversation(
+        message.adapterId,
+        message.conversationId,
+        `Accepting transfer for session ${sessionId}...`,
+      );
+      return true;
+    }
+
+    if (sub === "dismiss" || sub === "ignore") {
+      const sessionId = transferParts[1]?.trim() || currentTransfer?.sessionId;
+      if (!sessionId) {
+        await sendToConversation(message.adapterId, message.conversationId, `Usage: ${usagePrefix} dismiss [sessionId]`);
+        return true;
+      }
+      pendingTransfersBySession.delete(sessionId);
+      await sendToConversation(
+        message.adapterId,
+        message.conversationId,
+        `Dismissed transfer prompt for session ${sessionId}.`,
+      );
+      return true;
+    }
+
+    await sendToConversation(
+      message.adapterId,
+      message.conversationId,
+      `Usage: ${usagePrefix} pending | request <targetPrincipalId> [user|service_account] [expiresMs] | accept [sessionId] | dismiss [sessionId]`,
+    );
+    return true;
+  };
+
+  const handleCommand = async (
+    message: ChannelInboundMessage,
+    resolvedPrincipal = resolveInboundPrincipal(message),
+  ): Promise<boolean> => {
     const text = message.text.trim();
     if (!text.startsWith("/")) return false;
 
@@ -496,7 +1238,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     const key = conversationKeyOf(message.adapterId, message.conversationId);
     const binding = conversationBindings.get(key);
 
-    if (command === "help") {
+    if (command === "help" || command === "commands") {
       await sendHelp(message.adapterId, message.conversationId);
       return true;
     }
@@ -523,8 +1265,228 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
               `Workspace: ${binding.workspaceId ?? "default"}`,
               `Steering: ${binding.steeringMode}`,
               `Running: ${runningTurns.has(binding.sessionId) ? "yes" : "no"}`,
+              `Pending transfers: ${Array.from(pendingTransfersBySession.values()).filter((transfer) => (
+                transfer.targetPrincipalType === resolvedPrincipal.principalType
+                && transfer.targetPrincipalId === resolvedPrincipal.principalId
+              )).length}`,
             ].join("\n")
           : "No active session for this conversation. Send any prompt to create one.",
+      );
+      return true;
+    }
+
+    if (command === "session") {
+      const sub = parts[0]?.trim().toLowerCase();
+      if (!sub || sub === "help") {
+        await sendToConversation(
+          message.adapterId,
+          message.conversationId,
+          [
+            "Usage: /session <command>",
+            "/session list [limit]",
+            "/session resume <sessionId>",
+            "/session takeover <sessionId>",
+            "/session transfer pending|request|accept|dismiss",
+            "/session close [sessionId]",
+          ].join("\n"),
+        );
+        return true;
+      }
+
+      if (sub === "list") {
+        const requestedLimit = parsePositiveInteger(parts[1]);
+        if (parts[1] && requestedLimit === undefined) {
+          await sendToConversation(message.adapterId, message.conversationId, "Usage: /session list [limit]");
+          return true;
+        }
+        await ensureConnectionPrincipal(resolvedPrincipal.principalType, resolvedPrincipal.principalId);
+        pendingSessionListRequests.push({
+          adapterId: message.adapterId,
+          conversationId: message.conversationId,
+          principalType: resolvedPrincipal.principalType,
+          principalId: resolvedPrincipal.principalId,
+          limit: requestedLimit ?? DEFAULT_SESSION_LIST_LIMIT,
+          activeSessionId: binding?.sessionId,
+        });
+        gatewayClient.send({ type: "session_list" });
+        await sendToConversation(message.adapterId, message.conversationId, "Fetching sessions...");
+        return true;
+      }
+
+      if (sub === "resume" || sub === "takeover") {
+        const sessionId = parts[1]?.trim();
+        if (!sessionId) {
+          await sendToConversation(
+            message.adapterId,
+            message.conversationId,
+            `Usage: /session ${sub} <sessionId>`,
+          );
+          return true;
+        }
+        await ensureConnectionPrincipal(resolvedPrincipal.principalType, resolvedPrincipal.principalId);
+        pendingSessionResumeBySession.set(sessionId, {
+          adapterId: message.adapterId,
+          conversationId: message.conversationId,
+          principalType: resolvedPrincipal.principalType,
+          principalId: resolvedPrincipal.principalId,
+        });
+        gatewayClient.send({ type: "session_replay", sessionId });
+        await sendToConversation(
+          message.adapterId,
+          message.conversationId,
+          `${sub === "takeover" ? "Taking over" : "Resuming"} session ${sessionId}...`,
+        );
+        return true;
+      }
+
+      if (sub === "transfer") {
+        return handleSessionTransferCommand(message, binding, resolvedPrincipal, parts.slice(1));
+      }
+
+      if (sub === "close" || sub === "delete") {
+        const sessionId = parts[1]?.trim() || binding?.sessionId;
+        if (!sessionId) {
+          await sendToConversation(message.adapterId, message.conversationId, `Usage: /session ${sub} [sessionId]`);
+          return true;
+        }
+        if (sub === "delete") {
+          await sendToConversation(
+            message.adapterId,
+            message.conversationId,
+            "Hard delete is not supported yet; closing session instead.",
+          );
+        }
+        gatewayClient.send({ type: "session_close", sessionId });
+        await sendToConversation(message.adapterId, message.conversationId, `Closing session ${sessionId}...`);
+        return true;
+      }
+
+      await sendToConversation(
+        message.adapterId,
+        message.conversationId,
+        "Usage: /session [list|resume|takeover|transfer|close]",
+      );
+      return true;
+    }
+
+    if (command === "transfer") {
+      return handleSessionTransferCommand(message, binding, resolvedPrincipal, parts, {
+        deprecatedAlias: true,
+      });
+    }
+
+    if (command === "usage") {
+      if (!binding) {
+        await sendToConversation(message.adapterId, message.conversationId, "No active session for usage commands.");
+        return true;
+      }
+      const sub = parts[0]?.trim().toLowerCase();
+      if (!sub || sub === "summary") {
+        gatewayClient.send({ type: "usage_query", sessionId: binding.sessionId, action: "summary" });
+        return true;
+      }
+
+      if (sub === "stats") {
+        const scope = parseUsageScope(parts[1]);
+        if (parts[1] && (!scope || scope === "hybrid")) {
+          await sendToConversation(message.adapterId, message.conversationId, "Usage: /usage stats [session|workspace]");
+          return true;
+        }
+        gatewayClient.send({
+          type: "usage_query",
+          sessionId: binding.sessionId,
+          action: "stats",
+          ...(scope ? { scope } : {}),
+        });
+        return true;
+      }
+
+      if (sub === "recent") {
+        let parsedLimit: number | undefined;
+        let scopeRaw: string | undefined;
+        const firstArg = parts[1];
+        const firstScope = parseUsageScope(firstArg);
+        if (firstArg && firstScope) {
+          scopeRaw = firstArg;
+        } else if (firstArg) {
+          parsedLimit = Number.parseInt(firstArg, 10);
+          if (!Number.isFinite(parsedLimit) || parsedLimit <= 0) {
+            await sendToConversation(message.adapterId, message.conversationId, "Usage: /usage recent [n] [session|workspace]");
+            return true;
+          }
+          scopeRaw = parts[2];
+        }
+        const scope = parseUsageScope(scopeRaw);
+        if (scopeRaw && (!scope || scope === "hybrid")) {
+          await sendToConversation(message.adapterId, message.conversationId, "Usage: /usage recent [n] [session|workspace]");
+          return true;
+        }
+        gatewayClient.send({
+          type: "usage_query",
+          sessionId: binding.sessionId,
+          action: "recent",
+          ...(parsedLimit !== undefined ? { limit: parsedLimit } : {}),
+          ...(scope ? { scope } : {}),
+        });
+        return true;
+      }
+
+      if (sub === "search") {
+        const maybeScope = parseUsageScope(parts.slice(-1)[0]);
+        if (maybeScope === "hybrid") {
+          await sendToConversation(message.adapterId, message.conversationId, "Usage: /usage search <query> [session|workspace]");
+          return true;
+        }
+        const consumedScope = maybeScope ? parts.slice(-1)[0] : undefined;
+        const queryParts = consumedScope ? parts.slice(1, -1) : parts.slice(1);
+        const query = queryParts.join(" ").trim();
+        if (!query) {
+          await sendToConversation(message.adapterId, message.conversationId, "Usage: /usage search <query> [session|workspace]");
+          return true;
+        }
+        gatewayClient.send({
+          type: "usage_query",
+          sessionId: binding.sessionId,
+          action: "search",
+          query,
+          ...(maybeScope ? { scope: maybeScope } : {}),
+        });
+        return true;
+      }
+
+      if (sub === "context") {
+        const maybeScope = parseUsageScope(parts.slice(-1)[0]);
+        const promptParts = maybeScope ? parts.slice(1, -1) : parts.slice(1);
+        const prompt = promptParts.join(" ").trim();
+        gatewayClient.send({
+          type: "usage_query",
+          sessionId: binding.sessionId,
+          action: "context",
+          ...(prompt ? { prompt } : {}),
+          ...(maybeScope ? { scope: maybeScope } : {}),
+        });
+        return true;
+      }
+
+      if (sub === "clear") {
+        const scope = parseUsageScope(parts[1]);
+        if (parts[1] && (!scope || scope === "hybrid")) {
+          await sendToConversation(message.adapterId, message.conversationId, "Usage: /usage clear [session|workspace]");
+          return true;
+        }
+        gatewayClient.send({
+          type: "usage_query",
+          sessionId: binding.sessionId,
+          action: "clear",
+          ...(scope ? { scope } : {}),
+        });
+        return true;
+      }
+
+      await sendToConversation(
+        message.adapterId,
+        message.conversationId,
+        "Usage: /usage [summary|stats|recent|search|context|clear] ...",
       );
       return true;
     }
@@ -715,6 +1677,21 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
 
   const handleGatewayEvent = async (event: GatewayEvent): Promise<void> => {
     switch (event.type) {
+      case "auth_challenge": {
+        latestAuthChallenge = event;
+        resolveAuthChallengeWaiters(event);
+        break;
+      }
+      case "auth_result": {
+        if (event.ok && event.principalType && event.principalId) {
+          activeAuthPrincipal = {
+            principalType: event.principalType,
+            principalId: event.principalId,
+          };
+        }
+        pushAuthResult(event);
+        break;
+      }
       case "session_created": {
         sessionMetadataById.set(event.sessionId, {
           runtimeId: event.runtimeId ?? "default",
@@ -729,6 +1706,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
             binding.model = event.model ?? binding.model;
             binding.workspaceId = event.workspaceId ?? binding.workspaceId ?? "default";
             conversationBindings.set(conversationKey, binding);
+            persistConversationBinding(binding);
           }
         }
         if (pendingSessionCreate) {
@@ -798,12 +1776,185 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         stopTyping(event.sessionId);
         break;
       }
+      case "session_transfer_requested": {
+        pendingTransfersBySession.set(event.sessionId, event);
+        const bindings = Array.from(conversationBindings.values()).filter((binding) => (
+          binding.principalType === event.targetPrincipalType
+          && binding.principalId === event.targetPrincipalId
+        ));
+        for (const binding of bindings) {
+          const adapter = adapterById.get(binding.adapterId);
+          const supportsQuickActions = adapter?.supportsQuickActions === true;
+          const quickActions: ChannelQuickAction[] | undefined = supportsQuickActions
+            ? [
+                { label: "Accept", command: `/session transfer accept ${event.sessionId}` },
+                { label: "Dismiss", command: `/session transfer dismiss ${event.sessionId}` },
+              ]
+            : undefined;
+          const text = supportsQuickActions
+            ? [
+                "Session transfer request received.",
+                `session=${event.sessionId}`,
+                `from=${formatPrincipalDisplay(event.fromPrincipalType, event.fromPrincipalId)}`,
+              ].join("\n")
+            : [
+                "Session transfer request received.",
+                `session=${event.sessionId}`,
+                `from=${formatPrincipalDisplay(event.fromPrincipalType, event.fromPrincipalId)}`,
+                `Use /session transfer accept ${event.sessionId} or /session transfer dismiss ${event.sessionId}`,
+              ].join("\n");
+          await sendToConversation(binding.adapterId, binding.conversationId, text, quickActions);
+        }
+        break;
+      }
+      case "session_transferred": {
+        pendingTransfersBySession.delete(event.sessionId);
+        transferCommandRoutes.delete(event.sessionId);
+
+        const fromBindings = Array.from(conversationBindings.values()).filter((binding) => (
+          binding.principalType === event.fromPrincipalType
+          && binding.principalId === event.fromPrincipalId
+        ));
+        const targetBindings = Array.from(conversationBindings.values()).filter((binding) => (
+          binding.principalType === event.targetPrincipalType
+          && binding.principalId === event.targetPrincipalId
+        ));
+
+        for (const binding of fromBindings) {
+          await sendToConversation(
+            binding.adapterId,
+            binding.conversationId,
+            `Session ${event.sessionId} transferred to ${formatPrincipalDisplay(event.targetPrincipalType, event.targetPrincipalId)}.`,
+          );
+        }
+
+        if (targetBindings.length > 0) {
+          const targetBinding = targetBindings[0];
+          const targetKey = conversationKeyOf(targetBinding.adapterId, targetBinding.conversationId);
+          const replacedSessionId = targetBinding.sessionId;
+          if (
+            replacedSessionId
+            && replacedSessionId !== event.sessionId
+            && sessionToConversation.get(replacedSessionId) === targetKey
+          ) {
+            sessionToConversation.delete(replacedSessionId);
+          }
+          const previousConversationKey = sessionToConversation.get(event.sessionId);
+          if (previousConversationKey && previousConversationKey !== targetKey) {
+            const previousBinding = conversationBindings.get(previousConversationKey);
+            if (previousBinding?.sessionId === event.sessionId) {
+              conversationBindings.delete(previousConversationKey);
+            }
+          }
+          targetBinding.sessionId = event.sessionId;
+          const metadata = sessionMetadataById.get(event.sessionId);
+          if (metadata) {
+            targetBinding.runtimeId = metadata.runtimeId ?? targetBinding.runtimeId;
+            targetBinding.model = metadata.model ?? targetBinding.model;
+            targetBinding.workspaceId = metadata.workspaceId ?? targetBinding.workspaceId;
+          }
+          conversationBindings.set(targetKey, targetBinding);
+          sessionToConversation.set(event.sessionId, targetKey);
+          persistConversationBinding(targetBinding);
+        }
+
+        for (const binding of targetBindings) {
+          await sendToConversation(
+            binding.adapterId,
+            binding.conversationId,
+            `Session ${event.sessionId} is now attached to this conversation.`,
+          );
+        }
+        break;
+      }
+      case "session_list": {
+        for (const session of event.sessions) {
+          sessionInfoById.set(session.id, session);
+        }
+        const pending = pendingSessionListRequests.shift();
+        if (!pending) break;
+        const visibleSessions = event.sessions.filter((session) => (
+          (session.principalType ?? "user") === pending.principalType
+          && (session.principalId ?? "user:local") === pending.principalId
+        ));
+        await sendToConversation(
+          pending.adapterId,
+          pending.conversationId,
+          formatSessionList(visibleSessions, pending.limit, pending.activeSessionId),
+        );
+        break;
+      }
+      case "transcript": {
+        const pending = pendingSessionResumeBySession.get(event.sessionId);
+        if (!pending) break;
+        pendingSessionResumeBySession.delete(event.sessionId);
+        const info = sessionInfoById.get(event.sessionId);
+        if (info) {
+          const previous = sessionMetadataById.get(event.sessionId);
+          sessionMetadataById.set(event.sessionId, {
+            runtimeId: previous?.runtimeId,
+            model: info.model,
+            workspaceId: info.workspaceId,
+          });
+        }
+        const rebound = rebindConversationToSession(
+          pending.adapterId,
+          pending.conversationId,
+          event.sessionId,
+          pending.principalType,
+          pending.principalId,
+          sessionMetadataById.get(event.sessionId),
+        );
+        await sendToConversation(
+          pending.adapterId,
+          pending.conversationId,
+          [
+            `Session ${event.sessionId} resumed for this conversation.`,
+            `Runtime: ${rebound.runtimeId ?? "default"}`,
+            `Model: ${rebound.model ?? "runtime-default"}`,
+            `Workspace: ${rebound.workspaceId ?? "default"}`,
+            `Transcript messages: ${event.messages.length}`,
+          ].join("\n"),
+        );
+        break;
+      }
+      case "usage_result":
+      case "memory_result": {
+        const binding = resolveBindingBySession(event.sessionId);
+        if (!binding) return;
+        await sendToConversation(
+          binding.adapterId,
+          binding.conversationId,
+          formatUsageResult(event),
+        );
+        break;
+      }
       case "error": {
         if (!event.sessionId) return;
         const conversationKey = sessionToConversation.get(event.sessionId);
-        if (!conversationKey) return;
-        const binding = conversationBindings.get(conversationKey);
-        if (!binding) return;
+        let binding = conversationKey ? conversationBindings.get(conversationKey) : undefined;
+        if (!binding) {
+          const pendingResume = pendingSessionResumeBySession.get(event.sessionId);
+          if (pendingResume) {
+            await sendToConversation(
+              pendingResume.adapterId,
+              pendingResume.conversationId,
+              formatUserFacingError(event.message),
+            );
+            pendingSessionResumeBySession.delete(event.sessionId);
+            return;
+          }
+          const fallback = transferCommandRoutes.get(event.sessionId);
+          if (fallback) {
+            await sendToConversation(
+              fallback.adapterId,
+              fallback.conversationId,
+              formatUserFacingError(event.message),
+            );
+            transferCommandRoutes.delete(event.sessionId);
+          }
+          return;
+        }
         if (isSessionNotFoundMessage(event.message)) {
           const pending = pendingPrompts.get(event.sessionId);
           const sourceConversationId = binding.conversationId;
@@ -870,7 +2021,8 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     }
 
     try {
-      const handled = await handleCommand(message);
+      const resolvedPrincipal = resolveInboundPrincipal(message);
+      const handled = await handleCommand(message, resolvedPrincipal);
       if (!handled) {
         await sendPromptOrSteer(message);
       }
@@ -931,6 +2083,12 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
 
   gatewayClient.onClose(() => {
     logger.warn("channel_gateway_closed");
+    pendingSessionListRequests.length = 0;
+    pendingSessionResumeBySession.clear();
+    latestAuthChallenge = null;
+    activeAuthPrincipal = null;
+    rejectAuthChallengeWaiters(new Error("Gateway connection closed before auth challenge."));
+    rejectAuthResultWaiters(new Error("Gateway connection closed before auth result."));
     if (pendingSessionCreate) {
       pendingSessionCreate.reject(new Error("Gateway connection closed while creating session"));
       clearTimeout(pendingSessionCreate.timeout);
@@ -957,10 +2115,16 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     },
     stop: async () => {
       running = false;
+      pendingSessionListRequests.length = 0;
+      pendingSessionResumeBySession.clear();
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
       }
+      latestAuthChallenge = null;
+      activeAuthPrincipal = null;
+      rejectAuthChallengeWaiters(new Error("Channel manager stopped."));
+      rejectAuthResultWaiters(new Error("Channel manager stopped."));
       if (pendingSessionCreate) {
         pendingSessionCreate.reject(new Error("Channel manager stopped"));
         clearTimeout(pendingSessionCreate.timeout);

@@ -24,7 +24,14 @@ export const normalizeClientMessage = (
   const type = typeof obj.type === "string" ? obj.type : "";
 
   const maybeWithSession = { ...obj };
-  if ((type === "prompt" || type === "cancel" || type === "session_close") && maybeWithSession.sessionId === undefined) {
+  if (
+    (type === "prompt"
+      || type === "cancel"
+      || type === "session_close"
+      || type === "memory_query"
+      || type === "usage_query")
+    && maybeWithSession.sessionId === undefined
+  ) {
     if (!activeSessionId) {
       throw new Error(`${type} message requires sessionId before session is created`);
     }
@@ -84,6 +91,21 @@ const serializePrettyEvent = (event: GatewayEvent): string => {
           return `[memory] context scope=${event.scope} tokens=${event.context.totalTokens}/${event.context.budgetTokens} hot=${event.context.hot.length} warm=${event.context.warm.length} cold=${event.context.cold.length}`;
         case "clear":
           return `[memory] clear scope=${event.scope} deleted=${event.deleted}`;
+      }
+    case "usage_result":
+      switch (event.action) {
+        case "summary":
+          return `[usage] summary tokens=${event.summary.tokens.total} (in=${event.summary.tokens.input}, out=${event.summary.tokens.output}) executions=total:${event.summary.executions.total},queued:${event.summary.executions.queued},running:${event.summary.executions.running},succeeded:${event.summary.executions.succeeded},failed:${event.summary.executions.failed},cancelled:${event.summary.executions.cancelled},timed_out:${event.summary.executions.timedOut}`;
+        case "stats":
+          return `[usage] stats scope=${event.scope} facts=${event.stats.facts} summaries=${event.stats.summaries} total=${event.stats.total}`;
+        case "recent":
+          return `[usage] recent scope=${event.scope} count=${event.items.length} limit=${event.limit}`;
+        case "search":
+          return `[usage] search scope=${event.scope} query="${event.query}" count=${event.items.length} limit=${event.limit}`;
+        case "context":
+          return `[usage] context scope=${event.scope} tokens=${event.context.totalTokens}/${event.context.budgetTokens} hot=${event.context.hot.length} warm=${event.context.warm.length} cold=${event.context.cold.length}`;
+        case "clear":
+          return `[usage] clear scope=${event.scope} deleted=${event.deleted}`;
       }
     default: {
       const _exhaustive: never = event;

@@ -29,6 +29,9 @@ describe("createStateStore", () => {
     expect(typeof store.getExecution).toBe("function");
     expect(typeof store.listExecutions).toBe("function");
     expect(typeof store.transitionExecutionState).toBe("function");
+    expect(typeof store.upsertChannelBinding).toBe("function");
+    expect(typeof store.getChannelBinding).toBe("function");
+    expect(typeof store.deleteChannelBinding).toBe("function");
     expect(typeof store.close).toBe("function");
 
     store.close();

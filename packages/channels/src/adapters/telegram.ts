@@ -14,6 +14,7 @@ export interface TelegramAdapterOptions {
   pollTimeoutSeconds?: number;
   pollIntervalMs?: number;
   allowedChatIds?: string[];
+  commands?: Array<{ command: string; description: string }>;
 }
 
 interface TelegramUpdate {
@@ -90,6 +91,17 @@ interface TelegramFileResponse {
 }
 
 const TELEGRAM_CALLBACK_PREFIX = "nx:";
+const DEFAULT_TELEGRAM_COMMANDS: Array<{ command: string; description: string }> = [
+  { command: "help", description: "Show available Nexus commands." },
+  { command: "commands", description: "List slash commands." },
+  { command: "status", description: "Show current session status." },
+  { command: "usage", description: "Show usage metrics and memory stats." },
+  { command: "session", description: "List/resume/transfer/close sessions." },
+  { command: "new", description: "Start a new session for this chat." },
+  { command: "cancel", description: "Cancel the current turn." },
+  { command: "approve", description: "Approve pending tool requests." },
+  { command: "deny", description: "Deny pending tool requests." },
+];
 
 const escapeHtml = (text: string): string => text
   .replaceAll("&", "&amp;")
@@ -208,6 +220,7 @@ export const createTelegramAdapter = (options: TelegramAdapterOptions): ChannelA
     pollTimeoutSeconds = 25,
     pollIntervalMs = 500,
     allowedChatIds,
+    commands = DEFAULT_TELEGRAM_COMMANDS,
   } = options;
 
   let ctx: ChannelAdapterContext | null = null;
@@ -501,6 +514,25 @@ export const createTelegramAdapter = (options: TelegramAdapterOptions): ChannelA
         pollIntervalMs,
         filteredChatCount: allowed?.size ?? 0,
       });
+      if (commands.length > 0) {
+        try {
+          await apiCall("setMyCommands", {
+            commands: commands.map((entry) => ({
+              command: entry.command,
+              description: entry.description,
+            })),
+          });
+          context.log.info("telegram_commands_registered", {
+            adapterId: id,
+            commandCount: commands.length,
+          });
+        } catch (error) {
+          context.log.warn("telegram_commands_register_failed", {
+            adapterId: id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
       void pollLoop();
     },
     stop: async () => {

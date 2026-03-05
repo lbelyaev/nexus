@@ -49,6 +49,12 @@ This document captures the working entity model discussed during implementation.
 - Session -> one active owning Principal (transferable)
 - Session <-> many Connections over time (reconnect/handoff)
 
+## Planned identity linking
+
+- Today, principals are device/channel-scoped (`user:web:*`, `user:telegram-main:*`, etc.) and treated as distinct identities.
+- Planned: introduce an account-level user identity that can link multiple device principals.
+- With linked principals, a user can "pull" or resume sessions across their own devices with policy checks, while preserving audit attribution per concrete device principal.
+
 ## Practical interpretation of workspace
 
 Treat workspace as the unit for "what context and permissions this session can use".
