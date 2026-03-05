@@ -89,4 +89,41 @@ describe("ExecutionStore", () => {
       /Invalid execution state transition/i,
     );
   });
+
+  it("getExecutionStateCounts returns grouped totals", () => {
+    store.createExecution(makeExecution({
+      id: "exec-queued",
+      state: "queued",
+      createdAt: "2026-01-01T00:00:01Z",
+      updatedAt: "2026-01-01T00:00:01Z",
+    }));
+    store.createExecution(makeExecution({
+      id: "exec-running",
+      state: "running",
+      createdAt: "2026-01-01T00:00:02Z",
+      updatedAt: "2026-01-01T00:00:02Z",
+    }));
+    store.createExecution(makeExecution({
+      id: "exec-success",
+      state: "succeeded",
+      createdAt: "2026-01-01T00:00:03Z",
+      updatedAt: "2026-01-01T00:00:03Z",
+    }));
+    store.createExecution(makeExecution({
+      id: "exec-timeout",
+      state: "timed_out",
+      createdAt: "2026-01-01T00:00:04Z",
+      updatedAt: "2026-01-01T00:00:04Z",
+    }));
+
+    expect(store.getExecutionStateCounts("sess-1")).toEqual({
+      total: 4,
+      queued: 1,
+      running: 1,
+      succeeded: 1,
+      failed: 0,
+      cancelled: 0,
+      timedOut: 1,
+    });
+  });
 });

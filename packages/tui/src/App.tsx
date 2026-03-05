@@ -152,6 +152,7 @@ const formatSessionListResult = (
   sessions: ReturnType<typeof useSession>["sessionList"],
   limit: number,
   activeSessionId: string | null,
+  hasMore: boolean,
 ): ChatMessage[] => {
   if (sessions.length === 0) {
     return [{ role: "system", text: "  No sessions found." }];
@@ -164,6 +165,7 @@ const formatSessionListResult = (
       role: "system" as const,
       text: `    - ${session.id}${session.id === activeSessionId ? " (current)" : ""} status=${session.status} workspace=${session.workspaceId ?? "default"} model=${session.model} last=${session.lastActivityAt}`,
     })),
+    ...(hasMore ? [{ role: "system" as const, text: "  More sessions available. Use /session list next." }] : []),
   ];
 };
 
@@ -225,6 +227,7 @@ export const App = ({ url, token }: AppProps) => {
   const processedUsageResultsRef = useRef(0);
   const lastErrorRef = useRef<string | null>(null);
   const pendingSessionListLimitRef = useRef<number | null>(null);
+  const sessionListLimitRef = useRef(10);
   useEffect(() => {
     if (prevStreamingRef.current && !session.isStreaming) {
       setMessages((prev) => {
@@ -307,9 +310,14 @@ export const App = ({ url, token }: AppProps) => {
     const pendingLimit = pendingSessionListLimitRef.current;
     if (pendingLimit === null) return;
     pendingSessionListLimitRef.current = null;
-    const rendered = formatSessionListResult(session.sessionList, pendingLimit, session.sessionId);
+    const rendered = formatSessionListResult(
+      session.sessionList,
+      pendingLimit,
+      session.sessionId,
+      session.sessionListHasMore,
+    );
     setMessages((prev) => [...prev, ...rendered]);
-  }, [session.sessionId, session.sessionList]);
+  }, [session.sessionId, session.sessionList, session.sessionListHasMore]);
 
   const createSession = useCallback(
     (runtimeId?: string, model?: string, workspaceId?: string) => {
@@ -610,7 +618,7 @@ export const App = ({ url, token }: AppProps) => {
         setMessages((prev) => [
           ...prev,
           { role: "system", text: "  Usage: /session <command>" },
-          { role: "system", text: "    /session list [limit]" },
+          { role: "system", text: "    /session list [limit|next [limit]]" },
           { role: "system", text: "    /session resume <sessionId>" },
           { role: "system", text: "    /session takeover <sessionId>" },
           { role: "system", text: "    /session transfer pending|request|accept|dismiss" },
@@ -620,14 +628,30 @@ export const App = ({ url, token }: AppProps) => {
       }
 
       if (sub === "list") {
-        const requestedLimit = parts[1] ? Number.parseInt(parts[1], 10) : undefined;
-        if (parts[1] && (!Number.isFinite(requestedLimit) || (requestedLimit ?? 0) <= 0)) {
-          setMessages((prev) => [...prev, { role: "system", text: "  Usage: /session list [limit]" }]);
+        const rawArg = parts[1]?.toLowerCase();
+        const isNext = rawArg === "next";
+        const limitArg = isNext ? parts[2] : parts[1];
+        const requestedLimit = limitArg ? Number.parseInt(limitArg, 10) : undefined;
+        if (limitArg && (!Number.isFinite(requestedLimit) || (requestedLimit ?? 0) <= 0)) {
+          setMessages((prev) => [...prev, { role: "system", text: "  Usage: /session list [limit|next [limit]]" }]);
           return;
         }
-        pendingSessionListLimitRef.current = requestedLimit ?? 10;
+        const limit = requestedLimit ?? sessionListLimitRef.current;
+        if (isNext) {
+          if (!session.sessionListHasMore || !session.sessionListNextCursor) {
+            setMessages((prev) => [...prev, { role: "system", text: "  No additional sessions in the current list window." }]);
+            return;
+          }
+          pendingSessionListLimitRef.current = limit;
+          sessionListLimitRef.current = limit;
+          setMessages((prev) => [...prev, { role: "system", text: "  Fetching next sessions page..." }]);
+          session.requestSessionList({ limit, cursor: session.sessionListNextCursor });
+          return;
+        }
+        pendingSessionListLimitRef.current = limit;
+        sessionListLimitRef.current = limit;
         setMessages((prev) => [...prev, { role: "system", text: "  Fetching sessions..." }]);
-        session.requestSessionList();
+        session.requestSessionList({ limit });
         return;
       }
 

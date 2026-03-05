@@ -13,6 +13,15 @@ export interface ExecutionStore {
   createExecution: (execution: ExecutionRecord) => void;
   getExecution: (id: string) => ExecutionRecord | null;
   listExecutions: (sessionId: string, limit?: number) => ExecutionRecord[];
+  getExecutionStateCounts: (sessionId: string) => {
+    total: number;
+    queued: number;
+    running: number;
+    succeeded: number;
+    failed: number;
+    cancelled: number;
+    timedOut: number;
+  };
   transitionExecutionState: (
     id: string,
     nextState: ExecutionState,
@@ -40,6 +49,11 @@ interface ExecutionRow {
   updatedAt: string;
   startedAt: string | null;
   completedAt: string | null;
+}
+
+interface ExecutionCountRow {
+  state: ExecutionState;
+  count: number;
 }
 
 const TRANSITIONS: Record<ExecutionState, ReadonlySet<ExecutionState>> = {
@@ -130,6 +144,9 @@ export const createExecutionStore = (db: DatabaseAdapter): ExecutionStore => {
   const listBySessionStmt = db.prepare(
     "SELECT * FROM executions WHERE sessionId = @sessionId ORDER BY createdAt DESC LIMIT @limit",
   );
+  const countByStateStmt = db.prepare(
+    "SELECT state, COUNT(*) AS count FROM executions WHERE sessionId = @sessionId GROUP BY state",
+  );
 
   const createExecution = (execution: ExecutionRecord): void => {
     insertStmt.run({
@@ -167,6 +184,54 @@ export const createExecutionStore = (db: DatabaseAdapter): ExecutionStore => {
       limit: safeLimit,
     }) as ExecutionRow[];
     return rows.map(rowToRecord);
+  };
+
+  const getExecutionStateCounts = (
+    sessionId: string,
+  ): {
+    total: number;
+    queued: number;
+    running: number;
+    succeeded: number;
+    failed: number;
+    cancelled: number;
+    timedOut: number;
+  } => {
+    const rows = countByStateStmt.all({ sessionId }) as ExecutionCountRow[];
+    const counts = {
+      total: 0,
+      queued: 0,
+      running: 0,
+      succeeded: 0,
+      failed: 0,
+      cancelled: 0,
+      timedOut: 0,
+    };
+    for (const row of rows) {
+      const count = Number.isFinite(row.count) ? row.count : 0;
+      counts.total += count;
+      switch (row.state) {
+        case "queued":
+          counts.queued += count;
+          break;
+        case "running":
+          counts.running += count;
+          break;
+        case "succeeded":
+          counts.succeeded += count;
+          break;
+        case "failed":
+          counts.failed += count;
+          break;
+        case "cancelled":
+          counts.cancelled += count;
+          break;
+        case "timed_out":
+          counts.timedOut += count;
+          break;
+      }
+    }
+    return counts;
   };
 
   const transitionExecutionState = (
@@ -216,6 +281,7 @@ export const createExecutionStore = (db: DatabaseAdapter): ExecutionStore => {
     createExecution,
     getExecution,
     listExecutions,
+    getExecutionStateCounts,
     transitionExecutionState,
   };
 };

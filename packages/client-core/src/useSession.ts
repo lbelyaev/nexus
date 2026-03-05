@@ -22,6 +22,11 @@ export interface UsageQueryInput {
   limit?: number;
 }
 
+export interface SessionListRequestInput {
+  limit?: number;
+  cursor?: string;
+}
+
 export type UsageResultEvent = Extract<GatewayEvent, { type: "usage_result" }>;
 export type SessionTransferRequestedEvent = Extract<GatewayEvent, { type: "session_transfer_requested" }>;
 export type SessionListEvent = Extract<GatewayEvent, { type: "session_list" }>;
@@ -68,6 +73,8 @@ export interface UseSessionResult {
   authPrincipalId: string | null;
   pendingSessionTransfers: SessionTransferRequestedEvent[];
   sessionList: SessionListEvent["sessions"];
+  sessionListHasMore: boolean;
+  sessionListNextCursor: string | null;
   responseText: string;
   thinkingText: string;
   isStreaming: boolean;
@@ -81,7 +88,7 @@ export interface UseSessionResult {
   cancel: () => void;
   closeSession: () => void;
   requestReplay: (sessionId: string) => void;
-  requestSessionList: () => void;
+  requestSessionList: (request?: SessionListRequestInput) => void;
   resumeSession: (sessionId: string) => void;
   requestSessionTransfer: (
     targetPrincipalId: string,
@@ -121,6 +128,8 @@ export const useSession = (
   const authPrincipalIdRef = useRef(authPrincipalId);
   const [pendingSessionTransfers, setPendingSessionTransfers] = useState<SessionTransferRequestedEvent[]>([]);
   const [sessionList, setSessionList] = useState<SessionListEvent["sessions"]>([]);
+  const [sessionListHasMore, setSessionListHasMore] = useState(false);
+  const [sessionListNextCursor, setSessionListNextCursor] = useState<string | null>(null);
   const sessionListRef = useRef<SessionListEvent["sessions"]>([]);
   const [responseText, setResponseText] = useState("");
   const [thinkingText, setThinkingText] = useState("");
@@ -533,6 +542,8 @@ export const useSession = (
         break;
       case "session_list":
         setSessionList(event.sessions);
+        setSessionListHasMore(event.hasMore ?? false);
+        setSessionListNextCursor(event.nextCursor ?? null);
         break;
       case "usage_result":
         setUsageResults((prev) => [...prev, event]);
@@ -601,8 +612,12 @@ export const useSession = (
   );
 
   const requestSessionList = useCallback(
-    () => {
-      sendMessage({ type: "session_list" });
+    (request?: SessionListRequestInput) => {
+      sendMessage({
+        type: "session_list",
+        ...(request?.limit !== undefined ? { limit: request.limit } : {}),
+        ...(request?.cursor ? { cursor: request.cursor } : {}),
+      });
     },
     [sendMessage],
   );
@@ -700,6 +715,8 @@ export const useSession = (
     authPrincipalId,
     pendingSessionTransfers,
     sessionList,
+    sessionListHasMore,
+    sessionListNextCursor,
     responseText,
     thinkingText,
     isStreaming,

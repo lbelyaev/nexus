@@ -70,6 +70,57 @@ describe("SessionStore", () => {
     expect(store.listSessions()).toEqual([]);
   });
 
+  it("listSessionsPage filters by principal and paginates with cursor", () => {
+    store.createSession(makeSession({
+      id: "sess-1",
+      principalId: "user:web:1",
+      lastActivityAt: "2025-01-01T00:00:00Z",
+    }));
+    store.createSession(makeSession({
+      id: "sess-2",
+      principalId: "user:web:1",
+      lastActivityAt: "2025-01-03T00:00:00Z",
+    }));
+    store.createSession(makeSession({
+      id: "sess-3",
+      principalId: "user:web:1",
+      lastActivityAt: "2025-01-02T00:00:00Z",
+    }));
+    store.createSession(makeSession({
+      id: "sess-4",
+      principalId: "user:web:2",
+      lastActivityAt: "2025-01-04T00:00:00Z",
+    }));
+
+    const page1 = store.listSessionsPage({
+      principalType: "user",
+      principalId: "user:web:1",
+      limit: 2,
+    });
+    expect(page1.sessions.map((session) => session.id)).toEqual(["sess-2", "sess-3"]);
+    expect(page1.hasMore).toBe(true);
+    expect(page1.nextCursor).toBeDefined();
+
+    const page2 = store.listSessionsPage({
+      principalType: "user",
+      principalId: "user:web:1",
+      limit: 2,
+      cursor: page1.nextCursor,
+    });
+    expect(page2.sessions.map((session) => session.id)).toEqual(["sess-1"]);
+    expect(page2.hasMore).toBe(false);
+    expect(page2.nextCursor).toBeUndefined();
+  });
+
+  it("listSessionsPage throws on malformed cursor", () => {
+    expect(() => store.listSessionsPage({
+      principalType: "user",
+      principalId: "user:web:1",
+      limit: 5,
+      cursor: "bad-cursor",
+    })).toThrow(/invalid session list cursor/i);
+  });
+
   it("updateSession patches status field", () => {
     store.createSession(makeSession());
     store.updateSession("sess-1", { status: "idle" });
@@ -96,6 +147,22 @@ describe("SessionStore", () => {
 
   it("updateSession throws for non-existent session ID", () => {
     expect(() => store.updateSession("no-such-id", { status: "idle" })).toThrow();
+  });
+
+  it("incrementSessionTokenUsage applies deltas atomically", () => {
+    store.createSession(makeSession({
+      tokenUsage: { input: 10, output: 5 },
+    }));
+
+    store.incrementSessionTokenUsage("sess-1", 7, 3);
+    store.incrementSessionTokenUsage("sess-1", 2, 9);
+
+    const updated = store.getSession("sess-1");
+    expect(updated?.tokenUsage).toEqual({ input: 19, output: 17 });
+  });
+
+  it("incrementSessionTokenUsage throws for non-existent session ID", () => {
+    expect(() => store.incrementSessionTokenUsage("no-such-id", 1, 1)).toThrow();
   });
 
   it("createSession throws on duplicate ID", () => {

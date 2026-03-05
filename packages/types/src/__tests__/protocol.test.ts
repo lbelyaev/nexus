@@ -46,6 +46,8 @@ describe("isClientMessage", () => {
 
   it("validates a session_list message", () => {
     expect(isClientMessage({ type: "session_list" })).toBe(true);
+    expect(isClientMessage({ type: "session_list", limit: 20 })).toBe(true);
+    expect(isClientMessage({ type: "session_list", limit: 20, cursor: "abc" })).toBe(true);
   });
 
   it("validates a session_replay message", () => {
@@ -124,6 +126,12 @@ describe("isClientMessage", () => {
     expect(isClientMessage({ type: "usage_query", sessionId: "s1", action: "bogus" })).toBe(false);
     expect(isClientMessage({ type: "usage_query", sessionId: "s1", action: "stats", limit: 0 })).toBe(false);
     expect(isClientMessage({ type: "usage_query", sessionId: "s1", action: "search", scope: "global" })).toBe(false);
+  });
+
+  it("rejects invalid session_list message", () => {
+    expect(isClientMessage({ type: "session_list", limit: 0 })).toBe(false);
+    expect(isClientMessage({ type: "session_list", limit: "10" })).toBe(false);
+    expect(isClientMessage({ type: "session_list", cursor: 123 })).toBe(false);
   });
 
   it("rejects session_replay with missing sessionId", () => {
@@ -306,6 +314,8 @@ describe("isGatewayEvent", () => {
 
   it("validates session_list", () => {
     expect(isGatewayEvent({ type: "session_list", sessions: [] })).toBe(true);
+    expect(isGatewayEvent({ type: "session_list", sessions: [], hasMore: false })).toBe(true);
+    expect(isGatewayEvent({ type: "session_list", sessions: [], hasMore: true, nextCursor: "abc" })).toBe(true);
   });
 
   it("validates transcript", () => {

@@ -69,7 +69,11 @@ export type ClientMessage =
       principalId?: string;
       source?: PromptSource;
     }
-  | { type: "session_list" }
+  | {
+      type: "session_list";
+      limit?: number;
+      cursor?: string;
+    }
   | { type: "session_replay"; sessionId: string }
   | {
       type: "auth_proof";
@@ -220,7 +224,12 @@ export type GatewayEvent =
       transferredAt: string;
     }
   | { type: "runtime_health"; runtime: RuntimeHealthInfo }
-  | { type: "session_list"; sessions: SessionInfo[] }
+  | {
+      type: "session_list";
+      sessions: SessionInfo[];
+      hasMore?: boolean;
+      nextCursor?: string;
+    }
   | { type: "transcript"; sessionId: string; messages: TranscriptMessage[] }
   | {
       type: "memory_result";
@@ -466,7 +475,13 @@ export const isClientMessage = (value: unknown): value is ClientMessage => {
         && (obj.source === undefined || (typeof obj.source === "string" && PROMPT_SOURCES.has(obj.source as PromptSource)))
       );
     case "session_list":
-      return true;
+      return (
+        (
+          obj.limit === undefined
+          || (typeof obj.limit === "number" && Number.isFinite(obj.limit) && obj.limit > 0)
+        )
+        && (obj.cursor === undefined || typeof obj.cursor === "string")
+      );
     case "session_replay":
       return typeof obj.sessionId === "string";
     case "auth_proof":
@@ -665,7 +680,11 @@ export const isGatewayEvent = (value: unknown): value is GatewayEvent => {
         )
       );
     case "session_list":
-      return Array.isArray(obj.sessions);
+      return (
+        Array.isArray(obj.sessions)
+        && (obj.hasMore === undefined || typeof obj.hasMore === "boolean")
+        && (obj.nextCursor === undefined || typeof obj.nextCursor === "string")
+      );
     case "transcript":
       return (
         typeof obj.sessionId === "string"

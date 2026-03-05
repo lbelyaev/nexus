@@ -847,7 +847,7 @@ describe("createChannelManager", () => {
         principalType: "user",
         principalId: "user:telegram-test:user-1",
       }));
-      expect(gatewayClient.send).toHaveBeenCalledWith({ type: "session_list" });
+      expect(gatewayClient.send).toHaveBeenCalledWith({ type: "session_list", limit: 5 });
     });
 
     handlers.onEvent?.({
@@ -875,6 +875,92 @@ describe("createChannelManager", () => {
           "- gw-session-list-active (current) status=active workspace=default model=claude-sonnet-4-6 last=2026-03-04T01:00:00.000Z",
           "Use /session resume <sessionId> to attach this conversation.",
         ].join("\n"),
+      });
+    });
+
+    await manager.stop();
+  });
+
+  it("handles /session list next using server cursor", async () => {
+    const { gatewayClient, handlers } = createMockGateway();
+    createGatewayClientMock.mockReturnValue(gatewayClient);
+    wireAuthFlow(gatewayClient, handlers);
+    const adapterFixture = createAdapter();
+
+    const manager = createChannelManager({
+      gatewayUrl: "ws://127.0.0.1:18800/ws",
+      token: "test-token",
+      adapters: [{ adapter: adapterFixture.adapter }],
+    });
+
+    await manager.start();
+    const context = adapterFixture.getContext();
+    expect(context).toBeDefined();
+
+    const prompt = context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-session-list-next",
+      senderId: "user-1",
+      text: "seed list session next",
+    });
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith(expect.objectContaining({ type: "session_new" }));
+    });
+    handlers.onEvent?.({
+      type: "session_created",
+      sessionId: "gw-session-list-next-active",
+      runtimeId: "claude",
+      model: "claude-sonnet-4-6",
+      workspaceId: "default",
+      principalType: "user",
+      principalId: "user:telegram-test:user-1",
+      source: "api",
+    });
+    await prompt;
+
+    gatewayClient.send.mockClear();
+    await context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-session-list-next",
+      senderId: "user-1",
+      text: "/session list 2",
+    });
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith({ type: "session_list", limit: 2 });
+    });
+
+    handlers.onEvent?.({
+      type: "session_list",
+      hasMore: true,
+      nextCursor: "cursor-2",
+      sessions: [
+        {
+          id: "gw-session-list-next-active",
+          status: "active",
+          model: "claude-sonnet-4-6",
+          workspaceId: "default",
+          principalType: "user",
+          principalId: "user:telegram-test:user-1",
+          source: "api",
+          createdAt: "2026-03-01T00:00:00.000Z",
+          lastActivityAt: "2026-03-04T01:00:00.000Z",
+        },
+      ],
+    });
+
+    gatewayClient.send.mockClear();
+    await context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-session-list-next",
+      senderId: "user-1",
+      text: "/session list next",
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith({
+        type: "session_list",
+        limit: 2,
+        cursor: "cursor-2",
       });
     });
 
