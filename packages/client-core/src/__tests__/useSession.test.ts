@@ -41,6 +41,7 @@ describe("useSession", () => {
     expect(result.current.sessionList).toEqual([]);
     expect(result.current.sessionListHasMore).toBe(false);
     expect(result.current.sessionListNextCursor).toBeNull();
+    expect(result.current.sessionLifecycleHistory).toEqual([]);
   });
 
   it("sets sessionId on session_created event", () => {
@@ -676,6 +677,29 @@ describe("useSession", () => {
     });
   });
 
+  it("requestSessionLifecycle sends session_lifecycle_query for the active session", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_created",
+        sessionId: "sess-42",
+        model: "claude-4",
+      });
+    });
+
+    act(() => {
+      result.current.requestSessionLifecycle(undefined, 25);
+    });
+
+    expect(sendMessage).toHaveBeenCalledWith({
+      type: "session_lifecycle_query",
+      sessionId: "sess-42",
+      limit: 25,
+    });
+  });
+
   it("stores session_list page metadata", () => {
     const sendMessage = vi.fn();
     const { result } = renderHook(() => useSession(sendMessage));
@@ -698,6 +722,31 @@ describe("useSession", () => {
     expect(result.current.sessionList).toHaveLength(1);
     expect(result.current.sessionListHasMore).toBe(true);
     expect(result.current.sessionListNextCursor).toBe("cursor-2");
+  });
+
+  it("stores session lifecycle history results", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_lifecycle_result",
+        sessionId: "sess-a",
+        events: [
+          {
+            sessionId: "sess-a",
+            eventType: "TRANSFER_REQUESTED",
+            fromState: "live",
+            toState: "parked",
+            parkedReason: "transfer_pending",
+            createdAt: "2026-01-01T00:00:00Z",
+          },
+        ],
+      });
+    });
+
+    expect(result.current.sessionLifecycleHistory).toHaveLength(1);
+    expect(result.current.sessionLifecycleHistory[0].eventType).toBe("TRANSFER_REQUESTED");
   });
 
   it("requestSessionTransfer targets current session by default", () => {

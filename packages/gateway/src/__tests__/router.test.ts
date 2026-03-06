@@ -990,6 +990,101 @@ describe("createRouter", () => {
     expect(secondPage.hasMore).toBe(false);
   });
 
+  it("session_lifecycle_query returns persisted lifecycle history for the owner", async () => {
+    stateStore.createSession({
+      id: "sess-history",
+      workspaceId: "default",
+      principalType: "user",
+      principalId: "user:web:user-1",
+      source: "interactive",
+      runtimeId: "claude",
+      acpSessionId: "acp-history",
+      status: "active",
+      createdAt: "2026-03-01T00:00:00.000Z",
+      lastActivityAt: "2026-03-01T00:01:00.000Z",
+      tokenUsage: { input: 1, output: 2 },
+      model: "claude",
+    });
+    stateStore.applySessionLifecycleEvent("sess-history", {
+      eventType: "TRANSFER_REQUESTED",
+      parkedReason: "transfer_pending",
+      reason: "transfer_requested",
+      actorPrincipalType: "user",
+      actorPrincipalId: "user:web:user-1",
+      at: "2026-03-01T00:02:00.000Z",
+    });
+
+    const { emit, events } = collectEvents();
+    router.registerConnection("conn-history", emit);
+    const challenge = events.find((event): event is Extract<GatewayEvent, { type: "auth_challenge" }> => event.type === "auth_challenge");
+    if (!challenge) throw new Error("expected auth_challenge");
+
+    events.length = 0;
+    router.handleMessage(createAuthProof({
+      challengeId: challenge.challengeId,
+      nonce: challenge.nonce,
+      principalId: "user:web:user-1",
+    }), emit, { connectionId: "conn-history" });
+    await vi.waitFor(() => {
+      expect(events.some((event) => event.type === "auth_result" && event.ok)).toBe(true);
+    });
+
+    events.length = 0;
+    router.handleMessage({ type: "session_lifecycle_query", sessionId: "sess-history", limit: 5 }, emit, {
+      connectionId: "conn-history",
+    });
+
+    expect(events).toHaveLength(1);
+    expect(events[0].type).toBe("session_lifecycle_result");
+    if (events[0].type !== "session_lifecycle_result") throw new Error("expected session_lifecycle_result");
+    expect(events[0].events.map((event) => event.eventType)).toEqual([
+      "TRANSFER_REQUESTED",
+      "SESSION_CREATED",
+    ]);
+  });
+
+  it("session_lifecycle_query rejects non-owner principal", async () => {
+    stateStore.createSession({
+      id: "sess-history-denied",
+      workspaceId: "default",
+      principalType: "user",
+      principalId: "user:web:user-1",
+      source: "interactive",
+      runtimeId: "claude",
+      acpSessionId: "acp-history-denied",
+      status: "active",
+      createdAt: "2026-03-01T00:00:00.000Z",
+      lastActivityAt: "2026-03-01T00:01:00.000Z",
+      tokenUsage: { input: 1, output: 2 },
+      model: "claude",
+    });
+
+    const { emit, events } = collectEvents();
+    router.registerConnection("conn-history-denied", emit);
+    const challenge = events.find((event): event is Extract<GatewayEvent, { type: "auth_challenge" }> => event.type === "auth_challenge");
+    if (!challenge) throw new Error("expected auth_challenge");
+
+    events.length = 0;
+    router.handleMessage(createAuthProof({
+      challengeId: challenge.challengeId,
+      nonce: challenge.nonce,
+      principalId: "user:web:user-2",
+    }), emit, { connectionId: "conn-history-denied" });
+    await vi.waitFor(() => {
+      expect(events.some((event) => event.type === "auth_result" && event.ok)).toBe(true);
+    });
+
+    events.length = 0;
+    router.handleMessage({ type: "session_lifecycle_query", sessionId: "sess-history-denied" }, emit, {
+      connectionId: "conn-history-denied",
+    });
+
+    expect(events).toHaveLength(1);
+    expect(events[0].type).toBe("error");
+    if (events[0].type !== "error") throw new Error("expected error");
+    expect(events[0].message).toMatch(/does not own this session/i);
+  });
+
   it("cancel calls acpSession.cancel()", async () => {
     const { emit, events } = collectEvents();
     router.handleMessage({ type: "session_new" }, emit);

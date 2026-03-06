@@ -3,11 +3,13 @@
 import type { MemoryItem, TranscriptMessage } from "./memory.js";
 import { isMemoryItem, isTranscriptMessage } from "./memory.js";
 import type {
+  SessionLifecycleEventRecord,
   SessionLifecycleEventType,
   SessionLifecycleState,
   SessionParkedReason,
 } from "./sessionLifecycle.js";
 import {
+  isSessionLifecycleEventRecord,
   isSessionLifecycleEventType,
   isSessionLifecycleState,
   isSessionParkedReason,
@@ -88,6 +90,11 @@ export type ClientMessage =
       type: "session_list";
       limit?: number;
       cursor?: string;
+    }
+  | {
+      type: "session_lifecycle_query";
+      sessionId: string;
+      limit?: number;
     }
   | { type: "session_replay"; sessionId: string }
   | { type: "session_takeover"; sessionId: string }
@@ -267,6 +274,11 @@ export type GatewayEvent =
       actorPrincipalType?: PrincipalType;
       actorPrincipalId?: string;
     }
+  | {
+      type: "session_lifecycle_result";
+      sessionId: string;
+      events: SessionLifecycleEventRecord[];
+    }
   | { type: "runtime_health"; runtime: RuntimeHealthInfo }
   | {
       type: "session_list";
@@ -374,6 +386,7 @@ const CLIENT_MESSAGE_TYPES = new Set([
   "session_close",
   "session_new",
   "session_list",
+  "session_lifecycle_query",
   "session_replay",
   "session_takeover",
   "auth_proof",
@@ -401,6 +414,7 @@ const GATEWAY_EVENT_TYPES = new Set([
   "session_transfer_updated",
   "session_transferred",
   "session_lifecycle",
+  "session_lifecycle_result",
   "runtime_health",
   "session_list",
   "transcript",
@@ -529,6 +543,14 @@ export const isClientMessage = (value: unknown): value is ClientMessage => {
           || (typeof obj.limit === "number" && Number.isFinite(obj.limit) && obj.limit > 0)
         )
         && (obj.cursor === undefined || typeof obj.cursor === "string")
+      );
+    case "session_lifecycle_query":
+      return (
+        typeof obj.sessionId === "string"
+        && (
+          obj.limit === undefined
+          || (typeof obj.limit === "number" && Number.isFinite(obj.limit) && obj.limit > 0)
+        )
       );
     case "session_replay":
       return typeof obj.sessionId === "string";
@@ -745,6 +767,12 @@ export const isGatewayEvent = (value: unknown): value is GatewayEvent => {
         && (obj.parkedReason === undefined || isSessionParkedReason(obj.parkedReason))
         && (obj.actorPrincipalType === undefined || (typeof obj.actorPrincipalType === "string" && PRINCIPAL_TYPES.has(obj.actorPrincipalType as PrincipalType)))
         && (obj.actorPrincipalId === undefined || typeof obj.actorPrincipalId === "string")
+      );
+    case "session_lifecycle_result":
+      return (
+        typeof obj.sessionId === "string"
+        && Array.isArray(obj.events)
+        && obj.events.every((event) => isSessionLifecycleEventRecord(event))
       );
     case "runtime_health":
       return (

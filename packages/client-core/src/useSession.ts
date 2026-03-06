@@ -1,5 +1,10 @@
 import { useState, useCallback, useRef, useEffect } from "react";
-import type { ClientMessage, GatewayEvent, PromptImageInput, TranscriptMessage } from "@nexus/types";
+import type {
+  ClientMessage,
+  GatewayEvent,
+  PromptImageInput,
+  TranscriptMessage,
+} from "@nexus/types";
 
 export interface ActiveTool {
   tool: string;
@@ -31,6 +36,7 @@ export type UsageResultEvent = Extract<GatewayEvent, { type: "usage_result" }>;
 export type SessionTransferRequestedEvent = Extract<GatewayEvent, { type: "session_transfer_requested" }>;
 export type SessionTransferUpdatedEvent = Extract<GatewayEvent, { type: "session_transfer_updated" }>;
 export type SessionListEvent = Extract<GatewayEvent, { type: "session_list" }>;
+export type SessionLifecycleResultEvent = Extract<GatewayEvent, { type: "session_lifecycle_result" }>;
 
 export interface PendingSessionTransfer {
   sessionId: string;
@@ -104,6 +110,7 @@ export interface UseSessionResult {
   sessionList: SessionListEvent["sessions"];
   sessionListHasMore: boolean;
   sessionListNextCursor: string | null;
+  sessionLifecycleHistory: SessionLifecycleResultEvent["events"];
   responseText: string;
   thinkingText: string;
   isStreaming: boolean;
@@ -118,6 +125,7 @@ export interface UseSessionResult {
   closeSession: () => void;
   requestReplay: (sessionId: string) => void;
   requestSessionList: (request?: SessionListRequestInput) => void;
+  requestSessionLifecycle: (sessionId?: string, limit?: number) => void;
   resumeSession: (sessionId: string) => void;
   takeoverSession: (sessionId: string) => void;
   requestSessionTransfer: (
@@ -160,6 +168,7 @@ export const useSession = (
   const [sessionList, setSessionList] = useState<SessionListEvent["sessions"]>([]);
   const [sessionListHasMore, setSessionListHasMore] = useState(false);
   const [sessionListNextCursor, setSessionListNextCursor] = useState<string | null>(null);
+  const [sessionLifecycleHistory, setSessionLifecycleHistory] = useState<SessionLifecycleResultEvent["events"]>([]);
   const sessionListRef = useRef<SessionListEvent["sessions"]>([]);
   const [responseText, setResponseText] = useState("");
   const [thinkingText, setThinkingText] = useState("");
@@ -596,6 +605,9 @@ export const useSession = (
         setSessionListHasMore(event.hasMore ?? false);
         setSessionListNextCursor(event.nextCursor ?? null);
         break;
+      case "session_lifecycle_result":
+        setSessionLifecycleHistory(event.events);
+        break;
       case "usage_result":
         setUsageResults((prev) => [...prev, event]);
         break;
@@ -671,6 +683,19 @@ export const useSession = (
       });
     },
     [sendMessage],
+  );
+
+  const requestSessionLifecycle = useCallback(
+    (explicitSessionId?: string, limit?: number) => {
+      const sid = explicitSessionId ?? sessionId;
+      if (!sid) return;
+      sendMessage({
+        type: "session_lifecycle_query",
+        sessionId: sid,
+        ...(limit !== undefined ? { limit } : {}),
+      });
+    },
+    [sendMessage, sessionId],
   );
 
   const resumeSession = useCallback(
@@ -780,6 +805,7 @@ export const useSession = (
     sessionList,
     sessionListHasMore,
     sessionListNextCursor,
+    sessionLifecycleHistory,
     responseText,
     thinkingText,
     isStreaming,
@@ -794,6 +820,7 @@ export const useSession = (
     closeSession,
     requestReplay,
     requestSessionList,
+    requestSessionLifecycle,
     resumeSession,
     takeoverSession,
     requestSessionTransfer,

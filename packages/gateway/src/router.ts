@@ -2492,6 +2492,38 @@ export const createRouter = (deps: RouterDeps): Router => {
     });
   };
 
+  const handleSessionLifecycleQuery = (
+    msg: Extract<ClientMessage, { type: "session_lifecycle_query" }>,
+    emit: EventEmitter,
+    context?: RouterMessageContext,
+  ): void => {
+    const sessionRecord = stateStore.getSession(msg.sessionId);
+    if (!sessionRecord) {
+      emit({
+        type: "error",
+        sessionId: msg.sessionId,
+        message: `Session not found: ${msg.sessionId}`,
+      });
+      return;
+    }
+    if (!ensureSessionOwnerForConnection(msg.sessionId, emit, context)) {
+      return;
+    }
+
+    const requestedLimit = Math.max(
+      1,
+      Math.min(
+        Number.isFinite(msg.limit) ? Math.floor(msg.limit as number) : DEFAULT_SESSION_LIST_LIMIT,
+        MAX_SESSION_LIST_LIMIT,
+      ),
+    );
+    emit({
+      type: "session_lifecycle_result",
+      sessionId: msg.sessionId,
+      events: stateStore.listSessionLifecycleEvents(msg.sessionId, requestedLimit),
+    });
+  };
+
   const handleCancel = (
     msg: Extract<ClientMessage, { type: "cancel" }>,
     emit: EventEmitter,
@@ -3202,6 +3234,8 @@ export const createRouter = (deps: RouterDeps): Router => {
         return handlePrompt(msg, emit, context);
       case "session_list":
         return handleSessionList(msg, emit, context);
+      case "session_lifecycle_query":
+        return handleSessionLifecycleQuery(msg, emit, context);
       case "cancel":
         return handleCancel(msg, emit, context);
       case "session_close":

@@ -50,6 +50,11 @@ describe("isClientMessage", () => {
     expect(isClientMessage({ type: "session_list", limit: 20, cursor: "abc" })).toBe(true);
   });
 
+  it("validates a session_lifecycle_query message", () => {
+    expect(isClientMessage({ type: "session_lifecycle_query", sessionId: "s1" })).toBe(true);
+    expect(isClientMessage({ type: "session_lifecycle_query", sessionId: "s1", limit: 25 })).toBe(true);
+  });
+
   it("validates a session_replay message", () => {
     expect(isClientMessage({ type: "session_replay", sessionId: "s1" })).toBe(true);
   });
@@ -140,6 +145,11 @@ describe("isClientMessage", () => {
     expect(isClientMessage({ type: "session_list", limit: 0 })).toBe(false);
     expect(isClientMessage({ type: "session_list", limit: "10" })).toBe(false);
     expect(isClientMessage({ type: "session_list", cursor: 123 })).toBe(false);
+  });
+
+  it("rejects invalid session_lifecycle_query message", () => {
+    expect(isClientMessage({ type: "session_lifecycle_query", sessionId: 123 })).toBe(false);
+    expect(isClientMessage({ type: "session_lifecycle_query", sessionId: "s1", limit: 0 })).toBe(false);
   });
 
   it("rejects session_replay with missing sessionId", () => {
@@ -372,6 +382,23 @@ describe("isGatewayEvent", () => {
     expect(isGatewayEvent({ type: "session_list", sessions: [] })).toBe(true);
     expect(isGatewayEvent({ type: "session_list", sessions: [], hasMore: false })).toBe(true);
     expect(isGatewayEvent({ type: "session_list", sessions: [], hasMore: true, nextCursor: "abc" })).toBe(true);
+  });
+
+  it("validates session_lifecycle_result", () => {
+    expect(isGatewayEvent({
+      type: "session_lifecycle_result",
+      sessionId: "s1",
+      events: [
+        {
+          sessionId: "s1",
+          eventType: "TRANSFER_REQUESTED",
+          fromState: "live",
+          toState: "parked",
+          parkedReason: "transfer_pending",
+          createdAt: "2026-01-01T00:00:00Z",
+        },
+      ],
+    })).toBe(true);
   });
 
   it("validates transcript", () => {
