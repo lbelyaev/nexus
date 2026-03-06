@@ -487,6 +487,80 @@ describe("createChannelManager", () => {
     await manager.stop();
   });
 
+  it("retries once when gateway reports closed non-resumable session", async () => {
+    const { gatewayClient, handlers } = createMockGateway();
+    createGatewayClientMock.mockReturnValue(gatewayClient);
+    const adapterFixture = createAdapter();
+
+    const manager = createChannelManager({
+      gatewayUrl: "ws://127.0.0.1:18800/ws",
+      token: "test-token",
+      adapters: [{ adapter: adapterFixture.adapter }],
+    });
+
+    await manager.start();
+    const context = adapterFixture.getContext();
+    expect(context).toBeDefined();
+
+    const inboundPromise = context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-closed",
+      senderId: "user-1",
+      text: "resume me",
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith(expect.objectContaining({ type: "session_new" }));
+    });
+    handlers.onEvent?.({
+      type: "session_created",
+      sessionId: "gw-session-closed-1",
+      runtimeId: "claude",
+      model: "claude-sonnet-4-6",
+      workspaceId: "default",
+    });
+    await inboundPromise;
+
+    handlers.onEvent?.({
+      type: "error",
+      sessionId: "gw-session-closed-1",
+      message: "Session is closed and cannot be resumed. Start a new session.",
+    });
+
+    await vi.waitFor(() => {
+      expect(adapterFixture.sendMessage).toHaveBeenCalledWith({
+        conversationId: "chat-closed",
+        text: "Session was reset on gateway. Retrying your last message once...",
+      });
+    });
+
+    await vi.waitFor(() => {
+      const sessionNewCalls = gatewayClient.send.mock.calls.filter(
+        ([payload]) => (payload as { type?: string }).type === "session_new",
+      );
+      expect(sessionNewCalls.length).toBeGreaterThanOrEqual(2);
+    });
+
+    handlers.onEvent?.({
+      type: "session_created",
+      sessionId: "gw-session-closed-2",
+      runtimeId: "claude",
+      model: "claude-sonnet-4-6",
+      workspaceId: "default",
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith({
+        type: "prompt",
+        sessionId: "gw-session-closed-2",
+        text: "resume me",
+        images: undefined,
+      });
+    });
+
+    await manager.stop();
+  });
+
   it("queues steer and auto-prompts queued message after turn_end when steering mode is enabled", async () => {
     const { gatewayClient, handlers } = createMockGateway();
     createGatewayClientMock.mockReturnValue(gatewayClient);

@@ -216,6 +216,13 @@ const isGatewayDisconnectedError = (error: unknown): boolean =>
 
 const isSessionNotFoundMessage = (message: string): boolean =>
   message.startsWith("Session not found:");
+const isSessionClosedMessage = (message: string): boolean => {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.startsWith("session is closed")
+    || normalized.includes("closed and cannot be resumed")
+  );
+};
 const isPromptTimeoutMessage = (message: string): boolean =>
   message.includes('RPC request "session/prompt"') && message.includes("timed out");
 const formatUserFacingError = (message: string): string => {
@@ -2290,7 +2297,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
           }
           return;
         }
-        if (isSessionNotFoundMessage(event.message)) {
+        if (isSessionNotFoundMessage(event.message) || isSessionClosedMessage(event.message)) {
           const pending = pendingPrompts.get(event.sessionId);
           const sourceConversationId = binding.conversationId;
           const sourceAdapterId = binding.adapterId;
