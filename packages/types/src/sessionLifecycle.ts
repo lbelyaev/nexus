@@ -42,6 +42,37 @@ export interface SessionLifecycleTransitionResult {
   parkedReason?: SessionParkedReason;
 }
 
+export const TRANSFER_ACCEPT_ALLOWED_PARKED_REASONS = [
+  "transfer_pending",
+] as const satisfies readonly SessionParkedReason[];
+
+export const TRANSFER_DISMISS_ALLOWED_PARKED_REASONS = [
+  "transfer_pending",
+  "transfer_expired",
+] as const satisfies readonly SessionParkedReason[];
+
+export const OWNER_TRANSFER_RESUME_ALLOWED_PARKED_REASONS = [
+  "transfer_pending",
+  "transfer_expired",
+] as const satisfies readonly SessionParkedReason[];
+
+export const OWNER_RESUMABLE_PARKED_REASONS = [
+  "owner_disconnected",
+  "runtime_timeout",
+  "manual",
+  "transfer_expired",
+] as const satisfies readonly SessionParkedReason[];
+
+export const TAKEOVER_ALLOWED_PARKED_REASONS = [
+  "owner_disconnected",
+  "runtime_timeout",
+  "manual",
+  "transfer_expired",
+] as const satisfies readonly SessionParkedReason[];
+
+const OWNER_RESUMABLE_PARKED_REASON_SET = new Set<SessionParkedReason>(OWNER_RESUMABLE_PARKED_REASONS);
+const TAKEOVER_ALLOWED_PARKED_REASON_SET = new Set<SessionParkedReason>(TAKEOVER_ALLOWED_PARKED_REASONS);
+
 const SESSION_LIFECYCLE_STATES = new Set<SessionLifecycleState>([
   "live",
   "parked",
@@ -109,6 +140,30 @@ export const isSessionParkedReason = (value: unknown): value is SessionParkedRea
 export const isSessionLifecycleEventType = (value: unknown): value is SessionLifecycleEventType => (
   typeof value === "string" && SESSION_LIFECYCLE_EVENT_TYPES.has(value as SessionLifecycleEventType)
 );
+
+export const canOwnerResumeParkedSession = (
+  parkedReason: SessionParkedReason | null | undefined,
+): boolean => {
+  const normalized = parkedReason ?? "manual";
+  return OWNER_RESUMABLE_PARKED_REASON_SET.has(normalized);
+};
+
+export const canTakeoverParkedSession = (
+  parkedReason: SessionParkedReason | null | undefined,
+): boolean => {
+  const normalized = parkedReason ?? "manual";
+  return TAKEOVER_ALLOWED_PARKED_REASON_SET.has(normalized);
+};
+
+export const canAutoResumeSession = (
+  lifecycleState: SessionLifecycleState | null | undefined,
+  parkedReason: SessionParkedReason | null | undefined,
+): boolean => {
+  const normalizedState = lifecycleState ?? "live";
+  if (normalizedState === "closed") return false;
+  if (normalizedState !== "parked") return true;
+  return canOwnerResumeParkedSession(parkedReason);
+};
 
 export const getSessionLifecycleNextState = (
   currentState: SessionLifecycleState,

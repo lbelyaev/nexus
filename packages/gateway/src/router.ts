@@ -14,7 +14,16 @@ import type {
   SessionParkedReason,
   UsageSummary,
 } from "@nexus/types";
-import { estimateTokens, getSessionLifecycleNextState } from "@nexus/types";
+import {
+  canTakeoverParkedSession,
+  estimateTokens,
+  getSessionLifecycleNextState,
+  OWNER_RESUMABLE_PARKED_REASONS,
+  OWNER_TRANSFER_RESUME_ALLOWED_PARKED_REASONS,
+  TAKEOVER_ALLOWED_PARKED_REASONS,
+  TRANSFER_ACCEPT_ALLOWED_PARKED_REASONS,
+  TRANSFER_DISMISS_ALLOWED_PARKED_REASONS,
+} from "@nexus/types";
 import { createHash, createPublicKey, randomBytes, verify } from "node:crypto";
 import type { SessionTransferRecord, StateStore } from "@nexus/state";
 import type { AcpSession } from "@nexus/acp-bridge";
@@ -650,7 +659,7 @@ export const createRouter = (deps: RouterDeps): Router => {
     persistTransfer(transfer);
     applyLifecycleEvent(transfer.sessionId, "TRANSFER_EXPIRED", {
       parkedReason: "transfer_expired",
-      allowedParkedReasons: ["transfer_pending", "transfer_expired"],
+      allowedParkedReasons: [...TRANSFER_DISMISS_ALLOWED_PARKED_REASONS],
       reason,
       actorPrincipalType: transfer.fromPrincipalType,
       actorPrincipalId: transfer.fromPrincipalId,
@@ -943,6 +952,7 @@ export const createRouter = (deps: RouterDeps): Router => {
     context?: RouterMessageContext,
     options?: {
       allowTransferTarget?: boolean;
+      allowTakeover?: boolean;
     },
   ): Promise<boolean> => {
     if (sessions.has(sessionId)) return Promise.resolve(true);
@@ -993,6 +1003,19 @@ export const createRouter = (deps: RouterDeps): Router => {
               type: "error",
               sessionId,
               message: "Authenticated principal does not own this session.",
+            });
+            return false;
+          }
+        } else if (options?.allowTakeover) {
+          const lifecycleState = sessionRecord.lifecycleState ?? (
+            sessionRecord.status === "active" ? "live" : "parked"
+          );
+          const parkedReason = sessionRecord.parkedReason ?? "manual";
+          if (lifecycleState !== "parked" || !canTakeoverParkedSession(parkedReason)) {
+            emit({
+              type: "error",
+              sessionId,
+              message: "Session is not parked and cannot be taken over.",
             });
             return false;
           }
@@ -1752,7 +1775,7 @@ export const createRouter = (deps: RouterDeps): Router => {
     if (!applyLifecycleEvent(msg.sessionId, "TRANSFER_ACCEPTED", {
       reason: "transfer_accepted",
       actorRelation: "transfer_target",
-      allowedParkedReasons: ["transfer_pending"],
+      allowedParkedReasons: [...TRANSFER_ACCEPT_ALLOWED_PARKED_REASONS],
       actorPrincipalType: principal.principalType,
       actorPrincipalId: principal.principalId,
       notifyEmit: emit,
@@ -1860,7 +1883,7 @@ export const createRouter = (deps: RouterDeps): Router => {
     if (!applyLifecycleEvent(msg.sessionId, "TRANSFER_DISMISSED", {
       reason: transfer.state === "expired" ? "target_dismissed_after_expiry" : "target_dismissed",
       actorRelation: "transfer_target",
-      allowedParkedReasons: ["transfer_pending", "transfer_expired"],
+      allowedParkedReasons: [...TRANSFER_DISMISS_ALLOWED_PARKED_REASONS],
       actorPrincipalType: principal.principalType,
       actorPrincipalId: principal.principalId,
       notifyEmit: emit,
@@ -1924,7 +1947,7 @@ export const createRouter = (deps: RouterDeps): Router => {
       if (!applyLifecycleEvent(msg.sessionId, "OWNER_RESUMED", {
         reason: resolvedTransfer.state === "expired" ? "owner_resumed_after_expiry" : "owner_resumed",
         actorRelation: "transfer_source",
-        allowedParkedReasons: ["transfer_pending", "transfer_expired"],
+        allowedParkedReasons: [...OWNER_TRANSFER_RESUME_ALLOWED_PARKED_REASONS],
         actorPrincipalType: resolvedTransfer.fromPrincipalType,
         actorPrincipalId: resolvedTransfer.fromPrincipalId,
         notifyEmit: emit,
@@ -1954,7 +1977,7 @@ export const createRouter = (deps: RouterDeps): Router => {
         if (!applyLifecycleEvent(msg.sessionId, "OWNER_RESUMED", {
           reason: "owner_prompt_resumed",
           actorRelation: "session_owner",
-          allowedParkedReasons: ["owner_disconnected", "runtime_timeout", "manual"],
+          allowedParkedReasons: [...OWNER_RESUMABLE_PARKED_REASONS],
           actorPrincipalType: principal.principalType,
           actorPrincipalId: principal.principalId,
           notifyEmit: emit,
@@ -2719,7 +2742,9 @@ export const createRouter = (deps: RouterDeps): Router => {
         });
         return;
       }
-      void hydrateSessionIfPersisted(msg.sessionId, emit, context).then((hydrated) => {
+      void hydrateSessionIfPersisted(msg.sessionId, emit, context, {
+        allowTakeover: true,
+      }).then((hydrated) => {
         if (!hydrated) return;
         handleSessionTakeover(msg, emit, context);
       });
@@ -2733,14 +2758,6 @@ export const createRouter = (deps: RouterDeps): Router => {
         type: "error",
         sessionId: msg.sessionId,
         message: "Session takeover requires authenticated connection principal.",
-      });
-      return;
-    }
-    if (!canConnectionClaimSession(msg.sessionId, connectionId)) {
-      emit({
-        type: "error",
-        sessionId: msg.sessionId,
-        message: "Authenticated principal does not own this session.",
       });
       return;
     }
@@ -2778,24 +2795,36 @@ export const createRouter = (deps: RouterDeps): Router => {
       emitTransferUpdated(resolved, "cancelled", emit, "takeover_cancelled_expired_transfer");
     }
 
-    rebindOwnedSessionPrincipalIfLocal(
-      msg.sessionId,
-      emit,
-      principal.principalType,
-      principal.principalId,
-    );
-
     if (!applyLifecycleEvent(msg.sessionId, "TAKEOVER", {
       reason: "session_takeover",
-      actorRelation: "session_owner",
-      allowedParkedReasons: ["owner_disconnected", "runtime_timeout", "manual", "transfer_expired"],
+      allowedParkedReasons: [...TAKEOVER_ALLOWED_PARKED_REASONS],
       actorPrincipalType: principal.principalType,
       actorPrincipalId: principal.principalId,
       notifyEmit: emit,
       stateErrorMessage: "Session is not parked and cannot be taken over.",
-      authorizationErrorMessage: "Authenticated principal does not own this session.",
     })) {
       return;
+    }
+    sessionPrincipals.set(msg.sessionId, {
+      principalType: principal.principalType,
+      principalId: principal.principalId,
+      source: "interactive",
+    });
+    const policyContext = sessionPolicyContexts.get(msg.sessionId);
+    if (policyContext) {
+      policyContext.principalType = principal.principalType;
+      policyContext.principalId = principal.principalId;
+      policyContext.source = "interactive";
+    }
+    try {
+      stateStore.updateSession(msg.sessionId, {
+        principalType: principal.principalType,
+        principalId: principal.principalId,
+        source: "interactive",
+        lastActivityAt: new Date().toISOString(),
+      });
+    } catch {
+      // Session may already be gone from persistence if concurrently closed.
     }
     touchSession(msg.sessionId);
     const messages = stateStore.getTranscript(msg.sessionId);

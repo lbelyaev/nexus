@@ -6,6 +6,7 @@ import type {
   SessionInfo,
   SessionLifecycleEventRecord,
 } from "@nexus/types";
+import { canAutoResumeSession } from "@nexus/types";
 import { generateKeyPairSync, sign, type KeyObject } from "node:crypto";
 import { createGatewayClient, type GatewayClient } from "./gatewayClient.js";
 import type {
@@ -1166,8 +1167,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     conversationKey: string,
   ): SessionInfo | null => {
     for (const session of sessions) {
-      if (session.lifecycleState === "closed") continue;
-      if (session.parkedReason === "transfer_pending") continue;
+      if (!canAutoResumeSession(session.lifecycleState, session.parkedReason)) continue;
       const boundConversationKey = sessionToConversation.get(session.id);
       if (boundConversationKey && boundConversationKey !== conversationKey) continue;
       return session;

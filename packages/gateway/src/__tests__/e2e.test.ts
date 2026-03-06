@@ -157,10 +157,7 @@ describe("E2E: WS client -> Gateway -> mock ACP session -> events back", () => {
     rules: [{ tool: "*", action: "allow" }],
   };
 
-  beforeEach(async () => {
-    sessionCounter = 0;
-    stateStore = createStateStore(":memory:");
-
+  const startServer = async (): Promise<void> => {
     const router = createRouter({
       createAcpSession: async (_runtimeId, _model, _onEvent: EventEmitter, _policyContext) => {
         sessionCounter += 1;
@@ -179,6 +176,17 @@ describe("E2E: WS client -> Gateway -> mock ACP session -> events back", () => {
 
     const info = await server.start();
     port = info.port;
+  };
+
+  const restartServer = async (): Promise<void> => {
+    await server.stop();
+    await startServer();
+  };
+
+  beforeEach(async () => {
+    sessionCounter = 0;
+    stateStore = createStateStore(":memory:");
+    await startServer();
   });
 
   afterEach(async () => {
@@ -427,6 +435,148 @@ describe("E2E: WS client -> Gateway -> mock ACP session -> events back", () => {
       target.ws.close();
       await waitForClose(owner.ws);
       await waitForClose(target.ws);
+    });
+  });
+
+  describe("restart recovery", () => {
+    it("allows transfer target to accept after gateway restart", async () => {
+      const owner = await connectWs(port, TEST_TOKEN);
+      const target = await connectWs(port, TEST_TOKEN);
+
+      await sendAuthProof(owner.ws, owner.messages, "user:owner:restart");
+      await sendAuthProof(target.ws, target.messages, "user:target:restart");
+
+      owner.ws.send(JSON.stringify({ type: "session_new" }));
+      const created = await waitForEvent(owner.messages, "session_created");
+
+      owner.ws.send(JSON.stringify({
+        type: "session_transfer_request",
+        sessionId: created.sessionId,
+        targetPrincipalId: "user:target:restart",
+      }));
+      const requested = await waitForEvent(target.messages, "session_transfer_requested");
+      expect(requested.sessionId).toBe(created.sessionId);
+
+      await restartServer();
+      await waitForClose(owner.ws);
+      await waitForClose(target.ws);
+
+      const resumedTarget = await connectWs(port, TEST_TOKEN);
+      await sendAuthProof(resumedTarget.ws, resumedTarget.messages, "user:target:restart");
+
+      resumedTarget.ws.send(JSON.stringify({
+        type: "session_transfer_accept",
+        sessionId: created.sessionId,
+      }));
+
+      const transferred = await waitForEvent(resumedTarget.messages, "session_transferred");
+      expect(transferred.sessionId).toBe(created.sessionId);
+
+      resumedTarget.ws.send(JSON.stringify({
+        type: "prompt",
+        sessionId: created.sessionId,
+        text: "accepted after restart",
+      }));
+      const turnEnd = await waitForEvent(resumedTarget.messages, "turn_end");
+      expect(turnEnd.sessionId).toBe(created.sessionId);
+
+      resumedTarget.ws.close();
+      await waitForClose(resumedTarget.ws);
+    });
+
+    it("replays parked owner session after restart and resumes on prompt", async () => {
+      const owner = await connectWs(port, TEST_TOKEN);
+      await sendAuthProof(owner.ws, owner.messages, "user:owner:resume");
+
+      owner.ws.send(JSON.stringify({ type: "session_new" }));
+      const created = await waitForEvent(owner.messages, "session_created");
+
+      owner.ws.send(JSON.stringify({
+        type: "prompt",
+        sessionId: created.sessionId,
+        text: "remember restart resume",
+      }));
+      await waitForEvent(owner.messages, "turn_end");
+
+      owner.ws.close();
+      await waitForClose(owner.ws);
+      await vi.waitFor(() => {
+        expect(stateStore.getSession(created.sessionId)?.parkedReason).toBe("owner_disconnected");
+      });
+
+      await restartServer();
+
+      const resumedOwner = await connectWs(port, TEST_TOKEN);
+      await sendAuthProof(resumedOwner.ws, resumedOwner.messages, "user:owner:resume");
+
+      resumedOwner.ws.send(JSON.stringify({
+        type: "session_replay",
+        sessionId: created.sessionId,
+      }));
+      const transcript = await waitForEvent(resumedOwner.messages, "transcript");
+      expect(transcript.messages.some((message) => message.content.includes("remember restart resume"))).toBe(true);
+
+      resumedOwner.ws.send(JSON.stringify({
+        type: "prompt",
+        sessionId: created.sessionId,
+        text: "resume after restart",
+      }));
+      const turnEnd = await waitForEvent(resumedOwner.messages, "turn_end");
+      expect(turnEnd.sessionId).toBe(created.sessionId);
+      expect(stateStore.getSession(created.sessionId)?.lifecycleState).toBe("live");
+
+      resumedOwner.ws.close();
+      await waitForClose(resumedOwner.ws);
+    });
+
+    it("allows takeover of runtime-timeout session after restart", async () => {
+      const owner = await connectWs(port, TEST_TOKEN);
+      await sendAuthProof(owner.ws, owner.messages, "user:owner:takeover");
+
+      owner.ws.send(JSON.stringify({ type: "session_new" }));
+      const created = await waitForEvent(owner.messages, "session_created");
+
+      owner.ws.send(JSON.stringify({
+        type: "prompt",
+        sessionId: created.sessionId,
+        text: "timed out transcript",
+      }));
+      await waitForEvent(owner.messages, "turn_end");
+
+      stateStore.applySessionLifecycleEvent(created.sessionId, {
+        eventType: "RUNTIME_TIMEOUT",
+        parkedReason: "runtime_timeout",
+        reason: "e2e_runtime_timeout",
+        actorPrincipalType: "user",
+        actorPrincipalId: "user:owner:takeover",
+        at: new Date().toISOString(),
+      });
+
+      await restartServer();
+      await waitForClose(owner.ws);
+
+      const taker = await connectWs(port, TEST_TOKEN);
+      await sendAuthProof(taker.ws, taker.messages, "user:taker:takeover");
+
+      taker.ws.send(JSON.stringify({
+        type: "session_takeover",
+        sessionId: created.sessionId,
+      }));
+      const transcript = await waitForEvent(taker.messages, "transcript");
+      expect(transcript.messages.some((message) => message.content.includes("timed out transcript"))).toBe(true);
+
+      taker.ws.send(JSON.stringify({
+        type: "prompt",
+        sessionId: created.sessionId,
+        text: "taken over after restart",
+      }));
+      const turnEnd = await waitForEvent(taker.messages, "turn_end");
+      expect(turnEnd.sessionId).toBe(created.sessionId);
+      expect(stateStore.getSession(created.sessionId)?.lifecycleState).toBe("live");
+      expect(stateStore.getSession(created.sessionId)?.principalId).toBe("user:taker:takeover");
+
+      taker.ws.close();
+      await waitForClose(taker.ws);
     });
   });
 

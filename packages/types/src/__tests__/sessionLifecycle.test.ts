@@ -1,6 +1,9 @@
 import { describe, it, expect } from "vitest";
 import {
   applySessionLifecycleTransition,
+  canAutoResumeSession,
+  canOwnerResumeParkedSession,
+  canTakeoverParkedSession,
   getSessionLifecycleNextState,
   isSessionLifecycleEventRecord,
   isSessionLifecycleEventType,
@@ -72,5 +75,21 @@ describe("session lifecycle types", () => {
       parkedReason: "bad_reason",
       createdAt: "2026-01-01T00:00:00Z",
     })).toBe(false);
+  });
+
+  it("applies shared parked-session policy helpers", () => {
+    expect(canOwnerResumeParkedSession("owner_disconnected")).toBe(true);
+    expect(canOwnerResumeParkedSession("runtime_timeout")).toBe(true);
+    expect(canOwnerResumeParkedSession("transfer_pending")).toBe(false);
+
+    expect(canTakeoverParkedSession("manual")).toBe(true);
+    expect(canTakeoverParkedSession("transfer_expired")).toBe(true);
+    expect(canTakeoverParkedSession("transfer_pending")).toBe(false);
+
+    expect(canAutoResumeSession("live", undefined)).toBe(true);
+    expect(canAutoResumeSession("parked", "owner_disconnected")).toBe(true);
+    expect(canAutoResumeSession("parked", "transfer_expired")).toBe(true);
+    expect(canAutoResumeSession("parked", "transfer_pending")).toBe(false);
+    expect(canAutoResumeSession("closed", undefined)).toBe(false);
   });
 });

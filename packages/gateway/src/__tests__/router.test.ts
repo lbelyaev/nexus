@@ -1665,58 +1665,60 @@ describe("createRouter", () => {
     expect(stateStore.getSession(created.sessionId)?.lifecycleState).toBe("live");
   });
 
-  it("session_takeover replays parked session for authenticated owner and emits TAKEOVER lifecycle", async () => {
-    const ownerA = collectEvents();
-    const ownerB = collectEvents();
-    router.registerConnection("conn-owner-a", ownerA.emit);
-    router.registerConnection("conn-owner-b", ownerB.emit);
+  it("session_takeover replays parked session for a different authenticated principal and persists new ownership", async () => {
+    const owner = collectEvents();
+    const taker = collectEvents();
+    router.registerConnection("conn-owner", owner.emit);
+    router.registerConnection("conn-taker", taker.emit);
 
-    const ownerAChallenge = ownerA.events.find((event) => event.type === "auth_challenge");
-    const ownerBChallenge = ownerB.events.find((event) => event.type === "auth_challenge");
-    if (!ownerAChallenge || ownerAChallenge.type !== "auth_challenge") throw new Error("ownerA auth_challenge missing");
-    if (!ownerBChallenge || ownerBChallenge.type !== "auth_challenge") throw new Error("ownerB auth_challenge missing");
+    const ownerChallenge = owner.events.find((event) => event.type === "auth_challenge");
+    const takerChallenge = taker.events.find((event) => event.type === "auth_challenge");
+    if (!ownerChallenge || ownerChallenge.type !== "auth_challenge") throw new Error("owner auth_challenge missing");
+    if (!takerChallenge || takerChallenge.type !== "auth_challenge") throw new Error("taker auth_challenge missing");
 
-    ownerA.events.length = 0;
-    ownerB.events.length = 0;
+    owner.events.length = 0;
+    taker.events.length = 0;
     router.handleMessage(createAuthProof({
-      challengeId: ownerAChallenge.challengeId,
-      nonce: ownerAChallenge.nonce,
+      challengeId: ownerChallenge.challengeId,
+      nonce: ownerChallenge.nonce,
       principalId: "user:alice",
-    }), ownerA.emit, { connectionId: "conn-owner-a" });
+    }), owner.emit, { connectionId: "conn-owner" });
     router.handleMessage(createAuthProof({
-      challengeId: ownerBChallenge.challengeId,
-      nonce: ownerBChallenge.nonce,
-      principalId: "user:alice",
-    }), ownerB.emit, { connectionId: "conn-owner-b" });
+      challengeId: takerChallenge.challengeId,
+      nonce: takerChallenge.nonce,
+      principalId: "user:bob",
+    }), taker.emit, { connectionId: "conn-taker" });
 
-    ownerA.events.length = 0;
-    ownerB.events.length = 0;
-    router.handleMessage({ type: "session_new" }, ownerA.emit, { connectionId: "conn-owner-a" });
+    owner.events.length = 0;
+    taker.events.length = 0;
+    router.handleMessage({ type: "session_new" }, owner.emit, { connectionId: "conn-owner" });
     await vi.waitFor(() => {
-      expect(ownerA.events.some((event) => event.type === "session_created")).toBe(true);
+      expect(owner.events.some((event) => event.type === "session_created")).toBe(true);
     });
-    const created = ownerA.events.find((event) => event.type === "session_created");
+    const created = owner.events.find((event) => event.type === "session_created");
     if (!created || created.type !== "session_created") throw new Error("expected session_created");
 
-    router.unregisterConnection("conn-owner-a", ownerA.emit);
+    router.unregisterConnection("conn-owner", owner.emit);
     const parked = stateStore.getSession(created.sessionId);
     expect(parked?.lifecycleState).toBe("parked");
     expect(parked?.parkedReason).toBe("owner_disconnected");
 
-    ownerB.events.length = 0;
+    taker.events.length = 0;
     router.handleMessage({
       type: "session_takeover",
       sessionId: created.sessionId,
-    }, ownerB.emit, { connectionId: "conn-owner-b" });
+    }, taker.emit, { connectionId: "conn-taker" });
 
-    expect(ownerB.events.some((event) => event.type === "transcript" && event.sessionId === created.sessionId)).toBe(true);
-    expect(ownerB.events.some((event) => (
+    expect(taker.events.some((event) => event.type === "transcript" && event.sessionId === created.sessionId)).toBe(true);
+    expect(taker.events.some((event) => (
       event.type === "session_lifecycle"
       && event.sessionId === created.sessionId
       && event.eventType === "TAKEOVER"
       && event.fromState === "parked"
       && event.toState === "live"
     ))).toBe(true);
+    expect(stateStore.getSession(created.sessionId)?.principalId).toBe("user:bob");
+    expect(stateStore.getSession(created.sessionId)?.lifecycleState).toBe("live");
   });
 
   it("session_takeover rejects non-parked sessions", async () => {
