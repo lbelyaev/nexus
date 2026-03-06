@@ -163,6 +163,26 @@ const formatSessionListResult = (
   activeSessionId: string | null,
   hasMore: boolean,
 ): ChatMessage[] => {
+  const formatLifecycle = (session: ReturnType<typeof useSession>["sessionList"][number]): string => {
+    const state = session.lifecycleState ?? (session.status === "active" ? "live" : "parked");
+    if (state !== "parked") return state;
+    return `${state}(${session.parkedReason ?? "manual"})`;
+  };
+
+  const formatNextAction = (session: ReturnType<typeof useSession>["sessionList"][number]): string => {
+    if (session.id === activeSessionId) {
+      return "current";
+    }
+    const state = session.lifecycleState ?? (session.status === "active" ? "live" : "parked");
+    if (state === "closed") {
+      return `/session history ${session.id}`;
+    }
+    if (state === "parked" && (session.parkedReason ?? "manual") === "transfer_pending") {
+      return "transfer pending";
+    }
+    return `/session resume ${session.id}`;
+  };
+
   if (sessions.length === 0) {
     return [{ role: "system", text: "  No sessions found." }];
   }
@@ -172,9 +192,11 @@ const formatSessionListResult = (
     { role: "system", text: `  Sessions (${shown.length}/${sessions.length}):` },
     ...shown.map((session) => ({
       role: "system" as const,
-      text: `    - ${session.id}${session.id === activeSessionId ? " (current)" : ""} status=${session.status} workspace=${session.workspaceId ?? "default"} model=${session.model} last=${session.lastActivityAt}`,
+      text: `    - ${session.id}${session.id === activeSessionId ? " (current)" : ""} lifecycle=${formatLifecycle(session)} workspace=${session.workspaceId ?? "default"} model=${session.model} last=${session.lastActivityAt} next=${formatNextAction(session)}`,
     })),
     ...(hasMore ? [{ role: "system" as const, text: "  More sessions available. Use /session list next." }] : []),
+    { role: "system" as const, text: "  Use /session resume <sessionId> to attach a listed session." },
+    { role: "system" as const, text: "  Use /session delete [sessionId] to close a session explicitly." },
   ];
 };
 
@@ -662,6 +684,7 @@ export const App = ({ url, token }: AppProps) => {
           { role: "system", text: "    /session takeover <sessionId>" },
           { role: "system", text: "    /session transfer pending|request|accept|dismiss" },
           { role: "system", text: "    /session close [sessionId]" },
+          { role: "system", text: "    /session delete [sessionId]" },
         ]);
         return;
       }
@@ -749,7 +772,7 @@ export const App = ({ url, token }: AppProps) => {
         return;
       }
 
-      setMessages((prev) => [...prev, { role: "system", text: "  Usage: /session [list|history|resume|takeover|transfer|close]" }]);
+      setMessages((prev) => [...prev, { role: "system", text: "  Usage: /session [list|history|resume|takeover|transfer|close|delete]" }]);
     },
     [handleTransferCommand, sendMessage, session],
   );

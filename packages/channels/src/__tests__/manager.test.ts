@@ -930,6 +930,8 @@ describe("createChannelManager", () => {
         {
           id: "gw-session-list-active",
           status: "active",
+          lifecycleState: "parked",
+          parkedReason: "owner_disconnected",
           model: "claude-sonnet-4-6",
           workspaceId: "default",
           principalType: "user",
@@ -946,8 +948,9 @@ describe("createChannelManager", () => {
         conversationId: "chat-session-list",
         text: [
           "Sessions (1/1):",
-          "- gw-session-list-active (current) status=active workspace=default model=claude-sonnet-4-6 last=2026-03-04T01:00:00.000Z",
-          "Use /session resume <sessionId> to attach this conversation.",
+          "- gw-session-list-active (current) lifecycle=parked(owner_disconnected) workspace=default model=claude-sonnet-4-6 last=2026-03-04T01:00:00.000Z next=current",
+          "Use /session resume <sessionId> to attach a listed session.",
+          "Use /session delete [sessionId] to close a session explicitly.",
         ].join("\n"),
       });
     });
@@ -1257,6 +1260,72 @@ describe("createChannelManager", () => {
       type: "transcript",
       sessionId: "gw-session-parked",
       messages: [],
+    });
+
+    await manager.stop();
+  });
+
+  it("aliases /session delete to session_close", async () => {
+    const { gatewayClient, handlers } = createMockGateway();
+    createGatewayClientMock.mockReturnValue(gatewayClient);
+    wireAuthFlow(gatewayClient, handlers);
+    const adapterFixture = createAdapter();
+
+    const manager = createChannelManager({
+      gatewayUrl: "ws://127.0.0.1:18800/ws",
+      token: "test-token",
+      adapters: [{ adapter: adapterFixture.adapter }],
+    });
+
+    await manager.start();
+    const context = adapterFixture.getContext();
+    expect(context).toBeDefined();
+
+    const prompt = context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-session-delete",
+      senderId: "user-1",
+      text: "seed delete session",
+    });
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith(expect.objectContaining({ type: "session_new" }));
+    });
+    handlers.onEvent?.({
+      type: "session_created",
+      sessionId: "gw-session-delete",
+      runtimeId: "claude",
+      model: "claude-sonnet-4-6",
+      workspaceId: "default",
+      principalType: "user",
+      principalId: "user:telegram-test:user-1",
+      source: "api",
+    });
+    await prompt;
+
+    gatewayClient.send.mockClear();
+    adapterFixture.sendMessage.mockClear();
+
+    await context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-session-delete",
+      senderId: "user-1",
+      text: "/session delete",
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith({
+        type: "session_close",
+        sessionId: "gw-session-delete",
+      });
+    });
+
+    expect(adapterFixture.sendMessage).toHaveBeenCalledWith({
+      conversationId: "chat-session-delete",
+      text: "Hard delete is not supported yet; closing session instead.",
+    });
+    expect(adapterFixture.sendMessage).toHaveBeenCalledWith({
+      conversationId: "chat-session-delete",
+      text: "Closing session gw-session-delete...",
     });
 
     await manager.stop();
@@ -2468,7 +2537,7 @@ describe("createChannelManager", () => {
     await vi.waitFor(() => {
       expect(adapterFixture.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
         conversationId: "chat-transfer-dismiss",
-        text: "Transfer update for session gw-session-shared: dismissed (target dismissed).",
+        text: "Transfer update for session gw-session-shared: dismissed (target dismissed). Use /session resume gw-session-shared.",
       }));
     });
 

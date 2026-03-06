@@ -376,6 +376,26 @@ const formatSessionList = (
   activeSessionId?: string,
   hasMore = false,
 ): string => {
+  const formatLifecycle = (session: SessionInfo): string => {
+    const state = session.lifecycleState ?? (session.status === "active" ? "live" : "parked");
+    if (state !== "parked") return state;
+    return `${state}(${session.parkedReason ?? "manual"})`;
+  };
+
+  const formatNextAction = (session: SessionInfo): string => {
+    if (session.id === activeSessionId) {
+      return "current";
+    }
+    const state = session.lifecycleState ?? (session.status === "active" ? "live" : "parked");
+    if (state === "closed") {
+      return `/session history ${session.id}`;
+    }
+    if (state === "parked" && (session.parkedReason ?? "manual") === "transfer_pending") {
+      return "transfer pending";
+    }
+    return `/session resume ${session.id}`;
+  };
+
   if (sessions.length === 0) {
     return "No sessions found for this principal.";
   }
@@ -384,10 +404,11 @@ const formatSessionList = (
   return [
     `Sessions (${shown.length}/${sessions.length}):`,
     ...shown.map((session) => (
-      `- ${session.id}${session.id === activeSessionId ? " (current)" : ""} status=${session.status} workspace=${session.workspaceId ?? "default"} model=${session.model} last=${session.lastActivityAt}`
+      `- ${session.id}${session.id === activeSessionId ? " (current)" : ""} lifecycle=${formatLifecycle(session)} workspace=${session.workspaceId ?? "default"} model=${session.model} last=${session.lastActivityAt} next=${formatNextAction(session)}`
     )),
     ...(hasMore ? ["More sessions available. Use /session list next."] : []),
-    "Use /session resume <sessionId> to attach this conversation.",
+    "Use /session resume <sessionId> to attach a listed session.",
+    "Use /session delete [sessionId] to close a session explicitly.",
   ].join("\n");
 };
 
@@ -1458,7 +1479,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         "Nexus channel commands:",
         "/help",
         "/status",
-        "/session [list|history|resume|transfer|close]",
+        "/session [list|history|resume|transfer|close|delete]",
         "/usage [summary|stats|recent|search|context|clear]",
         "/new",
         "/cancel",
@@ -1711,6 +1732,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
             "/session takeover <sessionId>",
             "/session transfer pending|request|accept|dismiss",
             "/session close [sessionId]",
+            "/session delete [sessionId]",
           ].join("\n"),
         );
         return true;
@@ -1848,13 +1870,13 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         return true;
       }
 
-      await sendToConversation(
-        message.adapterId,
-        message.conversationId,
-        "Usage: /session [list|history|resume|takeover|transfer|close]",
-      );
-      return true;
-    }
+        await sendToConversation(
+          message.adapterId,
+          message.conversationId,
+          "Usage: /session [list|history|resume|takeover|transfer|close|delete]",
+        );
+        return true;
+      }
 
     if (command === "transfer") {
       return handleSessionTransferCommand(message, binding, resolvedPrincipal, parts, {
@@ -2308,10 +2330,13 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         if (fallback) {
           const stateLabel = event.state.replace(/_/g, " ");
           const reasonSuffix = event.reason ? ` (${event.reason.replace(/_/g, " ")})` : "";
+          const resumeHint = event.state === "dismissed" || event.state === "expired"
+            ? ` Use /session resume ${event.sessionId}.`
+            : "";
           await sendToConversation(
             fallback.adapterId,
             fallback.conversationId,
-            `Transfer update for session ${event.sessionId}: ${stateLabel}${reasonSuffix}.`,
+            `Transfer update for session ${event.sessionId}: ${stateLabel}${reasonSuffix}.${resumeHint}`,
           );
           transferCommandRoutes.delete(event.sessionId);
         }

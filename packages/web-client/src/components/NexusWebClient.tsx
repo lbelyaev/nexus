@@ -169,6 +169,26 @@ const formatSessionListResult = (
   activeSessionId: string | null,
   hasMore: boolean,
 ): ChatMessage[] => {
+  const formatLifecycle = (session: UseSessionResult["sessionList"][number]): string => {
+    const state = session.lifecycleState ?? (session.status === "active" ? "live" : "parked");
+    if (state !== "parked") return state;
+    return `${state}(${session.parkedReason ?? "manual"})`;
+  };
+
+  const formatNextAction = (session: UseSessionResult["sessionList"][number]): string => {
+    if (session.id === activeSessionId) {
+      return "current";
+    }
+    const state = session.lifecycleState ?? (session.status === "active" ? "live" : "parked");
+    if (state === "closed") {
+      return `/session history ${session.id}`;
+    }
+    if (state === "parked" && (session.parkedReason ?? "manual") === "transfer_pending") {
+      return "transfer pending";
+    }
+    return `/session resume ${session.id}`;
+  };
+
   if (sessions.length === 0) {
     return [{ id: makeId(), role: "system", text: "No sessions found." }];
   }
@@ -179,9 +199,11 @@ const formatSessionListResult = (
     ...shown.map((session) => ({
       id: makeId(),
       role: "system" as const,
-      text: `- ${session.id}${session.id === activeSessionId ? " (current)" : ""} status=${session.status} workspace=${session.workspaceId ?? "default"} model=${session.model} last=${session.lastActivityAt}`,
+      text: `- ${session.id}${session.id === activeSessionId ? " (current)" : ""} lifecycle=${formatLifecycle(session)} workspace=${session.workspaceId ?? "default"} model=${session.model} last=${session.lastActivityAt} next=${formatNextAction(session)}`,
     })),
     ...(hasMore ? [{ id: makeId(), role: "system" as const, text: "More sessions available. Use /session list next." }] : []),
+    { id: makeId(), role: "system" as const, text: "Use /session resume <sessionId> to attach a listed session." },
+    { id: makeId(), role: "system" as const, text: "Use /session delete [sessionId] to close a session explicitly." },
   ];
 };
 
@@ -883,6 +905,7 @@ const ConnectedClient = ({
             appendSystem("/session takeover <sessionId>");
             appendSystem("/session transfer pending|request|accept|dismiss");
             appendSystem("/session close [sessionId]");
+            appendSystem("/session delete [sessionId]");
             setPromptInput("");
             return;
           }
@@ -975,7 +998,7 @@ const ConnectedClient = ({
             setPromptInput("");
             return;
           }
-          appendSystem("Usage: /session [list|history|resume|takeover|transfer|close]");
+          appendSystem("Usage: /session [list|history|resume|takeover|transfer|close|delete]");
           setPromptInput("");
           return;
         }
