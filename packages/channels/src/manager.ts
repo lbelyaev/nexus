@@ -1167,6 +1167,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
   ): SessionInfo | null => {
     for (const session of sessions) {
       if (session.lifecycleState === "closed") continue;
+      if (session.parkedReason === "transfer_pending") continue;
       const boundConversationKey = sessionToConversation.get(session.id);
       if (boundConversationKey && boundConversationKey !== conversationKey) continue;
       return session;

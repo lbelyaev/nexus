@@ -1430,6 +1430,88 @@ describe("createChannelManager", () => {
     await manager.stop();
   });
 
+  it("does not auto-resume sessions parked for transfer", async () => {
+    const { gatewayClient, handlers } = createMockGateway();
+    createGatewayClientMock.mockReturnValue(gatewayClient);
+    wireAuthFlow(gatewayClient, handlers);
+    const adapterFixture = createAdapter();
+
+    const manager = createChannelManager({
+      gatewayUrl: "ws://127.0.0.1:18800/ws",
+      token: "test-token",
+      autoResumeOnUnboundPrompt: true,
+      adapters: [{ adapter: adapterFixture.adapter }],
+    });
+
+    await manager.start();
+    const context = adapterFixture.getContext();
+    expect(context).toBeDefined();
+
+    const inboundPromise = context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-auto-resume-transfer-pending",
+      senderId: "user-1",
+      text: "fresh turn please",
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith({
+        type: "session_list",
+        limit: 10,
+      });
+    });
+
+    handlers.onEvent?.({
+      type: "session_list",
+      sessions: [{
+        id: "gw-session-transfer-pending",
+        status: "idle",
+        lifecycleState: "parked",
+        parkedReason: "transfer_pending",
+        model: "claude-sonnet-4-6",
+        workspaceId: "default",
+        principalType: "user",
+        principalId: "user:telegram-test:user-1",
+        createdAt: "2026-01-01T00:00:00Z",
+        lastActivityAt: "2026-01-01T00:10:00Z",
+      }],
+      hasMore: false,
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: "session_new",
+      }));
+    });
+
+    expect(gatewayClient.send).not.toHaveBeenCalledWith({
+      type: "session_replay",
+      sessionId: "gw-session-transfer-pending",
+    });
+
+    handlers.onEvent?.({
+      type: "session_created",
+      sessionId: "gw-session-fresh-after-transfer",
+      runtimeId: "claude",
+      model: "claude-sonnet-4-6",
+      workspaceId: "default",
+      principalType: "user",
+      principalId: "user:telegram-test:user-1",
+      source: "api",
+    });
+
+    await inboundPromise;
+
+    expect(gatewayClient.send).toHaveBeenCalledWith({
+      type: "prompt",
+      sessionId: "gw-session-fresh-after-transfer",
+      text: "fresh turn please",
+      images: undefined,
+    });
+
+    await manager.stop();
+  });
+
   it("sends routed runtime/model/workspace on session creation", async () => {
     const { gatewayClient, handlers } = createMockGateway();
     createGatewayClientMock.mockReturnValue(gatewayClient);
