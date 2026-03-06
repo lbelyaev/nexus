@@ -10,6 +10,7 @@ import type {
   RuntimeHealthInfo,
   RuntimeHealthStatus,
   SessionLifecycleEventType,
+  SessionLifecycleState,
   UsageSummary,
 } from "@nexus/types";
 import { estimateTokens } from "@nexus/types";
@@ -196,17 +197,25 @@ const emitSessionOwnershipError = (
   });
 };
 
+type EnsureSessionOwnerResult = "ok" | "owned_by_other" | "claim_denied";
+
 const ensureSessionOwner = (
   sessionOwners: Map<string, EventEmitter>,
   sessionId: string,
   emit: EventEmitter,
-): boolean => {
+  options?: {
+    canClaimWhenUnowned?: boolean;
+  },
+): EnsureSessionOwnerResult => {
   const owner = sessionOwners.get(sessionId);
   if (!owner) {
+    if (options?.canClaimWhenUnowned === false) {
+      return "claim_denied";
+    }
     sessionOwners.set(sessionId, emit);
-    return true;
+    return "ok";
   }
-  return owner === emit;
+  return owner === emit ? "ok" : "owned_by_other";
 };
 
 /**
@@ -354,6 +363,69 @@ export const createRouter = (deps: RouterDeps): Router => {
   const resolvePrincipal = (connectionId?: string): ConnectionPrincipal | undefined => (
     connectionId ? connectionPrincipals.get(connectionId) : undefined
   );
+
+  const resolveSessionPrincipal = (
+    sessionId: string,
+  ): { principalType: PrincipalType; principalId: string; source: PromptSource } | null => {
+    const inMemory = sessionPrincipals.get(sessionId);
+    if (inMemory) return inMemory;
+    const persisted = stateStore.getSession(sessionId);
+    if (!persisted) return null;
+    return {
+      principalType: persisted.principalType,
+      principalId: persisted.principalId,
+      source: persisted.source,
+    };
+  };
+
+  const canConnectionClaimSession = (
+    sessionId: string,
+    connectionId?: string,
+  ): boolean => {
+    const sessionPrincipal = resolveSessionPrincipal(sessionId);
+    if (!sessionPrincipal) return false;
+
+    const connectionPrincipal = resolvePrincipal(connectionId);
+    const isSessionLocalInteractive =
+      sessionPrincipal.principalType === "user"
+      && sessionPrincipal.principalId === "user:local"
+      && sessionPrincipal.source === "interactive";
+
+    if (!connectionPrincipal?.verified) {
+      return isSessionLocalInteractive;
+    }
+
+    if (isSessionLocalInteractive) {
+      return true;
+    }
+
+    return (
+      connectionPrincipal.principalType === sessionPrincipal.principalType
+      && connectionPrincipal.principalId === sessionPrincipal.principalId
+    );
+  };
+
+  const ensureSessionOwnerForConnection = (
+    sessionId: string,
+    emit: EventEmitter,
+    context?: RouterMessageContext,
+  ): boolean => {
+    const connectionId = context?.connectionId ?? emitterConnectionIds.get(emit);
+    const result = ensureSessionOwner(sessionOwners, sessionId, emit, {
+      canClaimWhenUnowned: canConnectionClaimSession(sessionId, connectionId),
+    });
+    if (result === "ok") return true;
+    if (result === "owned_by_other") {
+      emitSessionOwnershipError(emit, sessionId);
+      return false;
+    }
+    emit({
+      type: "error",
+      sessionId,
+      message: "Authenticated principal does not own this session.",
+    });
+    return false;
+  };
 
   const rebindLocalOwnedSessionsToPrincipal = (
     connectionId: string,
@@ -539,6 +611,7 @@ export const createRouter = (deps: RouterDeps): Router => {
       reason,
       actorPrincipalType: transfer.fromPrincipalType,
       actorPrincipalId: transfer.fromPrincipalId,
+      ...(preferredEmit ? { notifyEmit: preferredEmit } : {}),
     });
     emitTransferUpdated(transfer, "expired", preferredEmit, reason);
     log.info("session_transfer_expired", {
@@ -636,10 +709,15 @@ export const createRouter = (deps: RouterDeps): Router => {
       actorPrincipalType?: PrincipalType;
       actorPrincipalId?: string;
       metadata?: string;
+      notifyEmit?: EventEmitter;
     },
   ): void => {
     try {
-      stateStore.applySessionLifecycleEvent(sessionId, {
+      const previous = stateStore.getSession(sessionId);
+      const previousState: SessionLifecycleState = previous?.lifecycleState ?? (
+        previous?.status === "active" ? "live" : "parked"
+      );
+      const updated = stateStore.applySessionLifecycleEvent(sessionId, {
         eventType,
         ...(options?.at ? { at: options.at } : {}),
         ...(options?.reason ? { reason: options.reason } : {}),
@@ -648,6 +726,28 @@ export const createRouter = (deps: RouterDeps): Router => {
         ...(options?.actorPrincipalId ? { actorPrincipalId: options.actorPrincipalId } : {}),
         ...(options?.metadata ? { metadata: options.metadata } : {}),
       });
+      const nextState: SessionLifecycleState = updated.lifecycleState ?? (
+        updated.status === "active" ? "live" : "parked"
+      );
+      const lifecycleEvent: GatewayEvent = {
+        type: "session_lifecycle",
+        sessionId,
+        eventType,
+        fromState: previousState,
+        toState: nextState,
+        at: options?.at ?? updated.lifecycleUpdatedAt ?? new Date().toISOString(),
+        ...(options?.reason ? { reason: options.reason } : {}),
+        ...(updated.parkedReason ? { parkedReason: updated.parkedReason } : {}),
+        ...(options?.actorPrincipalType ? { actorPrincipalType: options.actorPrincipalType } : {}),
+        ...(options?.actorPrincipalId ? { actorPrincipalId: options.actorPrincipalId } : {}),
+      };
+      const targets = new Set<EventEmitter>();
+      if (options?.notifyEmit) targets.add(options.notifyEmit);
+      const owner = sessionOwners.get(sessionId);
+      if (owner) targets.add(owner);
+      for (const target of targets) {
+        target(lifecycleEvent);
+      }
     } catch (error) {
       log.warn("session_lifecycle_apply_failed", {
         sessionId,
@@ -745,6 +845,7 @@ export const createRouter = (deps: RouterDeps): Router => {
             reason: "runtime_rehydrated",
             actorPrincipalType: principalType,
             actorPrincipalId: principalId,
+            notifyEmit: emit,
           });
         }
         stateStore.updateSession(sessionId, {
@@ -940,6 +1041,7 @@ export const createRouter = (deps: RouterDeps): Router => {
       applyLifecycleEvent(sessionId, "SESSION_CLOSED", {
         at: nowIso,
         reason,
+        ...(emit ? { notifyEmit: emit } : {}),
       });
       stateStore.updateSession(sessionId, {
         status: "idle",
@@ -1278,8 +1380,7 @@ export const createRouter = (deps: RouterDeps): Router => {
       });
       return;
     }
-    if (!ensureSessionOwner(sessionOwners, msg.sessionId, emit)) {
-      emitSessionOwnershipError(emit, msg.sessionId);
+    if (!ensureSessionOwnerForConnection(msg.sessionId, emit, context)) {
       return;
     }
 
@@ -1371,6 +1472,7 @@ export const createRouter = (deps: RouterDeps): Router => {
       reason: "transfer_requested",
       actorPrincipalType: transfer.fromPrincipalType,
       actorPrincipalId: transfer.fromPrincipalId,
+      notifyEmit: emit,
     });
 
     const requestedEvent: GatewayEvent = {
@@ -1478,6 +1580,7 @@ export const createRouter = (deps: RouterDeps): Router => {
       reason: "transfer_accepted",
       actorPrincipalType: principal.principalType,
       actorPrincipalId: principal.principalId,
+      notifyEmit: emit,
     });
     emitTransferUpdated(transfer, "accepted", emit);
     sessionPrincipals.set(msg.sessionId, {
@@ -1577,6 +1680,7 @@ export const createRouter = (deps: RouterDeps): Router => {
       reason: transfer.state === "expired" ? "target_dismissed_after_expiry" : "target_dismissed",
       actorPrincipalType: principal.principalType,
       actorPrincipalId: principal.principalId,
+      notifyEmit: emit,
     });
     emitTransferUpdated(transfer, "dismissed", emit, transfer.state === "expired" ? "target_dismissed_after_expiry" : "target_dismissed");
     log.info("session_transfer_dismissed", {
@@ -1603,8 +1707,7 @@ export const createRouter = (deps: RouterDeps): Router => {
       });
       return;
     }
-    if (!ensureSessionOwner(sessionOwners, msg.sessionId, emit)) {
-      emitSessionOwnershipError(emit, msg.sessionId);
+    if (!ensureSessionOwnerForConnection(msg.sessionId, emit, context)) {
       return;
     }
 
@@ -1635,6 +1738,7 @@ export const createRouter = (deps: RouterDeps): Router => {
         reason: resolvedTransfer.state === "expired" ? "owner_resumed_after_expiry" : "owner_resumed",
         actorPrincipalType: resolvedTransfer.fromPrincipalType,
         actorPrincipalId: resolvedTransfer.fromPrincipalId,
+        notifyEmit: emit,
       });
       emitTransferUpdated(
         resolvedTransfer,
@@ -1657,6 +1761,7 @@ export const createRouter = (deps: RouterDeps): Router => {
           reason: "owner_prompt_resumed",
           actorPrincipalType: principal.principalType,
           actorPrincipalId: principal.principalId,
+          notifyEmit: emit,
         });
       }
     }
@@ -2200,8 +2305,7 @@ export const createRouter = (deps: RouterDeps): Router => {
       });
       return;
     }
-    if (!ensureSessionOwner(sessionOwners, msg.sessionId, emit)) {
-      emitSessionOwnershipError(emit, msg.sessionId);
+    if (!ensureSessionOwnerForConnection(msg.sessionId, emit, context)) {
       return;
     }
 
@@ -2228,8 +2332,7 @@ export const createRouter = (deps: RouterDeps): Router => {
       });
       return;
     }
-    if (!ensureSessionOwner(sessionOwners, msg.sessionId, emit)) {
-      emitSessionOwnershipError(emit, msg.sessionId);
+    if (!ensureSessionOwnerForConnection(msg.sessionId, emit, context)) {
       return;
     }
     const closed = closeSession(msg.sessionId, "client_close", emit);
@@ -2272,8 +2375,7 @@ export const createRouter = (deps: RouterDeps): Router => {
       source: "interactive" as const,
     };
 
-    if (!ensureSessionOwner(sessionOwners, sessionId, emit)) {
-      emitSessionOwnershipError(emit, sessionId);
+    if (!ensureSessionOwnerForConnection(sessionId, emit, context)) {
       return;
     }
 
@@ -2353,8 +2455,7 @@ export const createRouter = (deps: RouterDeps): Router => {
       });
       return;
     }
-    if (!ensureSessionOwner(sessionOwners, msg.sessionId, emit)) {
-      emitSessionOwnershipError(emit, msg.sessionId);
+    if (!ensureSessionOwnerForConnection(msg.sessionId, emit, context)) {
       return;
     }
     touchSession(msg.sessionId);
@@ -2367,6 +2468,102 @@ export const createRouter = (deps: RouterDeps): Router => {
     log.info("session_replayed", {
       connectionId: context?.connectionId ?? emitterConnectionIds.get(emit) ?? null,
       sessionId: msg.sessionId,
+      messageCount: messages.length,
+    });
+  };
+
+  const handleSessionTakeover = (
+    msg: Extract<ClientMessage, { type: "session_takeover" }>,
+    emit: EventEmitter,
+    context?: RouterMessageContext,
+  ): void => {
+    const session = sessions.get(msg.sessionId);
+    if (!session) {
+      if (!stateStore.getSession(msg.sessionId)) {
+        emit({
+          type: "error",
+          sessionId: msg.sessionId,
+          message: `Session not found: ${msg.sessionId}`,
+        });
+        return;
+      }
+      void hydrateSessionIfPersisted(msg.sessionId, emit, context).then((hydrated) => {
+        if (!hydrated) return;
+        handleSessionTakeover(msg, emit, context);
+      });
+      return;
+    }
+
+    const connectionId = context?.connectionId ?? emitterConnectionIds.get(emit);
+    const principal = resolvePrincipal(connectionId);
+    if (!principal?.verified) {
+      emit({
+        type: "error",
+        sessionId: msg.sessionId,
+        message: "Session takeover requires authenticated connection principal.",
+      });
+      return;
+    }
+    if (!canConnectionClaimSession(msg.sessionId, connectionId)) {
+      emit({
+        type: "error",
+        sessionId: msg.sessionId,
+        message: "Authenticated principal does not own this session.",
+      });
+      return;
+    }
+
+    const ownership = ensureSessionOwner(sessionOwners, msg.sessionId, emit, {
+      canClaimWhenUnowned: true,
+    });
+    if (ownership === "owned_by_other") {
+      emitSessionOwnershipError(emit, msg.sessionId);
+      return;
+    }
+
+    const pendingTransfer = sessionTransfers.get(msg.sessionId);
+    if (pendingTransfer) {
+      const resolved = markTransferExpiredIfNeeded(pendingTransfer, emit);
+      if (resolved.state !== "expired") {
+        emit({
+          type: "error",
+          sessionId: msg.sessionId,
+          message: "Session has an active transfer request. Use transfer accept/dismiss first.",
+        });
+        return;
+      }
+      sessionTransfers.delete(msg.sessionId);
+      emitTransferUpdated(resolved, "cancelled", emit, "takeover_cancelled_expired_transfer");
+    }
+
+    rebindOwnedSessionPrincipalIfLocal(
+      msg.sessionId,
+      emit,
+      principal.principalType,
+      principal.principalId,
+    );
+
+    const persisted = stateStore.getSession(msg.sessionId);
+    if (persisted?.lifecycleState === "parked") {
+      applyLifecycleEvent(msg.sessionId, "TAKEOVER", {
+        reason: "session_takeover",
+        actorPrincipalType: principal.principalType,
+        actorPrincipalId: principal.principalId,
+        notifyEmit: emit,
+      });
+    }
+    touchSession(msg.sessionId);
+    const messages = stateStore.getTranscript(msg.sessionId);
+    emit({
+      type: "transcript",
+      sessionId: msg.sessionId,
+      messages,
+    });
+    log.info("session_takeover_completed", {
+      connectionId: connectionId ?? null,
+      sessionId: msg.sessionId,
+      principalType: principal.principalType,
+      principalId: principal.principalId,
       messageCount: messages.length,
     });
   };
@@ -2579,8 +2776,7 @@ export const createRouter = (deps: RouterDeps): Router => {
       });
       return null;
     }
-    if (!ensureSessionOwner(sessionOwners, sessionId, emit)) {
-      emitSessionOwnershipError(emit, sessionId);
+    if (!ensureSessionOwnerForConnection(sessionId, emit, context)) {
       return null;
     }
     touchSession(sessionId);
@@ -2802,6 +2998,8 @@ export const createRouter = (deps: RouterDeps): Router => {
         return handleApprovalResponse(msg, emit, context);
       case "session_replay":
         return handleSessionReplay(msg, emit, context);
+      case "session_takeover":
+        return handleSessionTakeover(msg, emit, context);
       case "session_transfer_request":
         return handleSessionTransferRequest(msg, emit, context);
       case "session_transfer_accept":

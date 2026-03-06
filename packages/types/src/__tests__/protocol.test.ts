@@ -54,6 +54,10 @@ describe("isClientMessage", () => {
     expect(isClientMessage({ type: "session_replay", sessionId: "s1" })).toBe(true);
   });
 
+  it("validates a session_takeover message", () => {
+    expect(isClientMessage({ type: "session_takeover", sessionId: "s1" })).toBe(true);
+  });
+
   it("validates auth_proof and session transfer messages", () => {
     expect(isClientMessage({
       type: "auth_proof",
@@ -140,6 +144,10 @@ describe("isClientMessage", () => {
 
   it("rejects session_replay with missing sessionId", () => {
     expect(isClientMessage({ type: "session_replay" })).toBe(false);
+  });
+
+  it("rejects session_takeover with missing sessionId", () => {
+    expect(isClientMessage({ type: "session_takeover" })).toBe(false);
   });
 
   it("rejects null and non-objects", () => {
@@ -256,6 +264,28 @@ describe("isGatewayEvent", () => {
       modelCatalog: { codex: ["gpt-5.2-codex", "gpt-5.3-codex"] },
       runtimeDefaults: { codex: "gpt-5.2-codex" },
     })).toBe(true);
+  });
+
+  it("validates session_lifecycle", () => {
+    expect(isGatewayEvent({
+      type: "session_lifecycle",
+      sessionId: "s1",
+      eventType: "TRANSFER_REQUESTED",
+      fromState: "live",
+      toState: "parked",
+      at: "2026-01-01T00:00:00Z",
+      parkedReason: "transfer_pending",
+      actorPrincipalType: "user",
+      actorPrincipalId: "user:alice",
+    })).toBe(true);
+    expect(isGatewayEvent({
+      type: "session_lifecycle",
+      sessionId: "s1",
+      eventType: "UNKNOWN",
+      fromState: "live",
+      toState: "parked",
+      at: "2026-01-01T00:00:00Z",
+    })).toBe(false);
   });
 
   it("validates session_closed", () => {

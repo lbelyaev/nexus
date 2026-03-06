@@ -884,7 +884,11 @@ const ConnectedClient = ({
               setPromptInput("");
               return;
             }
-            session.resumeSession(sid);
+            if (sub === "takeover") {
+              session.takeoverSession(sid);
+            } else {
+              session.resumeSession(sid);
+            }
             appendSystem(`${sub === "takeover" ? "Taking over" : "Resuming"} session ${sid}...`);
             setPromptInput("");
             return;

@@ -119,6 +119,7 @@ export interface UseSessionResult {
   requestReplay: (sessionId: string) => void;
   requestSessionList: (request?: SessionListRequestInput) => void;
   resumeSession: (sessionId: string) => void;
+  takeoverSession: (sessionId: string) => void;
   requestSessionTransfer: (
     targetPrincipalId: string,
     targetPrincipalType?: "user" | "service_account",
@@ -681,6 +682,15 @@ export const useSession = (
     [sendMessage],
   );
 
+  const takeoverSession = useCallback(
+    (sid: string) => {
+      const normalized = sid.trim();
+      if (!normalized) return;
+      sendMessage({ type: "session_takeover", sessionId: normalized });
+    },
+    [sendMessage],
+  );
+
   const requestSessionTransfer = useCallback(
     (
       targetPrincipalId: string,
@@ -785,6 +795,7 @@ export const useSession = (
     requestReplay,
     requestSessionList,
     resumeSession,
+    takeoverSession,
     requestSessionTransfer,
     acceptSessionTransfer,
     dismissPendingSessionTransfer,

@@ -2,7 +2,16 @@
 
 import type { MemoryItem, TranscriptMessage } from "./memory.js";
 import { isMemoryItem, isTranscriptMessage } from "./memory.js";
-import type { SessionLifecycleState, SessionParkedReason } from "./sessionLifecycle.js";
+import type {
+  SessionLifecycleEventType,
+  SessionLifecycleState,
+  SessionParkedReason,
+} from "./sessionLifecycle.js";
+import {
+  isSessionLifecycleEventType,
+  isSessionLifecycleState,
+  isSessionParkedReason,
+} from "./sessionLifecycle.js";
 
 export interface SessionInfo {
   id: string;
@@ -81,6 +90,7 @@ export type ClientMessage =
       cursor?: string;
     }
   | { type: "session_replay"; sessionId: string }
+  | { type: "session_takeover"; sessionId: string }
   | {
       type: "auth_proof";
       principalType?: PrincipalType;
@@ -245,6 +255,18 @@ export type GatewayEvent =
       targetPrincipalId: string;
       transferredAt: string;
     }
+  | {
+      type: "session_lifecycle";
+      sessionId: string;
+      eventType: SessionLifecycleEventType;
+      fromState: SessionLifecycleState;
+      toState: SessionLifecycleState;
+      at: string;
+      reason?: string;
+      parkedReason?: SessionParkedReason;
+      actorPrincipalType?: PrincipalType;
+      actorPrincipalId?: string;
+    }
   | { type: "runtime_health"; runtime: RuntimeHealthInfo }
   | {
       type: "session_list";
@@ -353,6 +375,7 @@ const CLIENT_MESSAGE_TYPES = new Set([
   "session_new",
   "session_list",
   "session_replay",
+  "session_takeover",
   "auth_proof",
   "session_transfer_request",
   "session_transfer_accept",
@@ -377,6 +400,7 @@ const GATEWAY_EVENT_TYPES = new Set([
   "session_transfer_requested",
   "session_transfer_updated",
   "session_transferred",
+  "session_lifecycle",
   "runtime_health",
   "session_list",
   "transcript",
@@ -507,6 +531,8 @@ export const isClientMessage = (value: unknown): value is ClientMessage => {
         && (obj.cursor === undefined || typeof obj.cursor === "string")
       );
     case "session_replay":
+      return typeof obj.sessionId === "string";
+    case "session_takeover":
       return typeof obj.sessionId === "string";
     case "auth_proof":
       return (
@@ -707,6 +733,18 @@ export const isGatewayEvent = (value: unknown): value is GatewayEvent => {
         && PRINCIPAL_TYPES.has(obj.targetPrincipalType as PrincipalType)
         && typeof obj.targetPrincipalId === "string"
         && typeof obj.transferredAt === "string"
+      );
+    case "session_lifecycle":
+      return (
+        typeof obj.sessionId === "string"
+        && isSessionLifecycleEventType(obj.eventType)
+        && isSessionLifecycleState(obj.fromState)
+        && isSessionLifecycleState(obj.toState)
+        && typeof obj.at === "string"
+        && (obj.reason === undefined || typeof obj.reason === "string")
+        && (obj.parkedReason === undefined || isSessionParkedReason(obj.parkedReason))
+        && (obj.actorPrincipalType === undefined || (typeof obj.actorPrincipalType === "string" && PRINCIPAL_TYPES.has(obj.actorPrincipalType as PrincipalType)))
+        && (obj.actorPrincipalId === undefined || typeof obj.actorPrincipalId === "string")
       );
     case "runtime_health":
       return (

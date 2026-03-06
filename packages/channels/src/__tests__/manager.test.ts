@@ -1122,6 +1122,50 @@ describe("createChannelManager", () => {
     await manager.stop();
   });
 
+  it("uses session_takeover message for /session takeover", async () => {
+    const { gatewayClient, handlers } = createMockGateway();
+    createGatewayClientMock.mockReturnValue(gatewayClient);
+    wireAuthFlow(gatewayClient, handlers);
+    const adapterFixture = createAdapter();
+
+    const manager = createChannelManager({
+      gatewayUrl: "ws://127.0.0.1:18800/ws",
+      token: "test-token",
+      adapters: [{ adapter: adapterFixture.adapter }],
+    });
+
+    await manager.start();
+    const context = adapterFixture.getContext();
+    expect(context).toBeDefined();
+
+    await context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-session-takeover",
+      senderId: "user-1",
+      text: "/session takeover gw-session-parked",
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: "auth_proof",
+        principalType: "user",
+        principalId: "user:telegram-test:user-1",
+      }));
+      expect(gatewayClient.send).toHaveBeenCalledWith({
+        type: "session_takeover",
+        sessionId: "gw-session-parked",
+      });
+    });
+
+    handlers.onEvent?.({
+      type: "transcript",
+      sessionId: "gw-session-parked",
+      messages: [],
+    });
+
+    await manager.stop();
+  });
+
   it("sends routed runtime/model/workspace on session creation", async () => {
     const { gatewayClient, handlers } = createMockGateway();
     createGatewayClientMock.mockReturnValue(gatewayClient);

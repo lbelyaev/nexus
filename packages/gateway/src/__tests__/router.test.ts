@@ -1026,8 +1026,15 @@ describe("createRouter", () => {
       { connectionId: "conn-1" },
     );
 
-    expect(events).toHaveLength(1);
-    expect(events[0]).toEqual({
+    expect(events.some((event) => (
+      event.type === "session_lifecycle"
+      && event.sessionId === sessionCreated.sessionId
+      && event.eventType === "SESSION_CLOSED"
+      && event.fromState === "live"
+      && event.toState === "closed"
+    ))).toBe(true);
+    const closedEvent = events.find((event): event is Extract<GatewayEvent, { type: "session_closed" }> => event.type === "session_closed");
+    expect(closedEvent).toEqual({
       type: "session_closed",
       sessionId: sessionCreated.sessionId,
       reason: "client_close",
@@ -1404,6 +1411,107 @@ describe("createRouter", () => {
     ))).toBe(true);
   });
 
+  it("session_takeover replays parked session for authenticated owner and emits TAKEOVER lifecycle", async () => {
+    const ownerA = collectEvents();
+    const ownerB = collectEvents();
+    router.registerConnection("conn-owner-a", ownerA.emit);
+    router.registerConnection("conn-owner-b", ownerB.emit);
+
+    const ownerAChallenge = ownerA.events.find((event) => event.type === "auth_challenge");
+    const ownerBChallenge = ownerB.events.find((event) => event.type === "auth_challenge");
+    if (!ownerAChallenge || ownerAChallenge.type !== "auth_challenge") throw new Error("ownerA auth_challenge missing");
+    if (!ownerBChallenge || ownerBChallenge.type !== "auth_challenge") throw new Error("ownerB auth_challenge missing");
+
+    ownerA.events.length = 0;
+    ownerB.events.length = 0;
+    router.handleMessage(createAuthProof({
+      challengeId: ownerAChallenge.challengeId,
+      nonce: ownerAChallenge.nonce,
+      principalId: "user:alice",
+    }), ownerA.emit, { connectionId: "conn-owner-a" });
+    router.handleMessage(createAuthProof({
+      challengeId: ownerBChallenge.challengeId,
+      nonce: ownerBChallenge.nonce,
+      principalId: "user:alice",
+    }), ownerB.emit, { connectionId: "conn-owner-b" });
+
+    ownerA.events.length = 0;
+    ownerB.events.length = 0;
+    router.handleMessage({ type: "session_new" }, ownerA.emit, { connectionId: "conn-owner-a" });
+    await vi.waitFor(() => {
+      expect(ownerA.events.some((event) => event.type === "session_created")).toBe(true);
+    });
+    const created = ownerA.events.find((event) => event.type === "session_created");
+    if (!created || created.type !== "session_created") throw new Error("expected session_created");
+
+    router.unregisterConnection("conn-owner-a", ownerA.emit);
+    const parked = stateStore.getSession(created.sessionId);
+    expect(parked?.lifecycleState).toBe("parked");
+    expect(parked?.parkedReason).toBe("owner_disconnected");
+
+    ownerB.events.length = 0;
+    router.handleMessage({
+      type: "session_takeover",
+      sessionId: created.sessionId,
+    }, ownerB.emit, { connectionId: "conn-owner-b" });
+
+    expect(ownerB.events.some((event) => event.type === "transcript" && event.sessionId === created.sessionId)).toBe(true);
+    expect(ownerB.events.some((event) => (
+      event.type === "session_lifecycle"
+      && event.sessionId === created.sessionId
+      && event.eventType === "TAKEOVER"
+      && event.fromState === "parked"
+      && event.toState === "live"
+    ))).toBe(true);
+  });
+
+  it("rejects ownerless replay claims from different authenticated principal", async () => {
+    const owner = collectEvents();
+    const other = collectEvents();
+    router.registerConnection("conn-owner", owner.emit);
+    router.registerConnection("conn-other", other.emit);
+
+    const ownerChallenge = owner.events.find((event) => event.type === "auth_challenge");
+    const otherChallenge = other.events.find((event) => event.type === "auth_challenge");
+    if (!ownerChallenge || ownerChallenge.type !== "auth_challenge") throw new Error("owner auth_challenge missing");
+    if (!otherChallenge || otherChallenge.type !== "auth_challenge") throw new Error("other auth_challenge missing");
+
+    owner.events.length = 0;
+    other.events.length = 0;
+    router.handleMessage(createAuthProof({
+      challengeId: ownerChallenge.challengeId,
+      nonce: ownerChallenge.nonce,
+      principalId: "user:alice",
+    }), owner.emit, { connectionId: "conn-owner" });
+    router.handleMessage(createAuthProof({
+      challengeId: otherChallenge.challengeId,
+      nonce: otherChallenge.nonce,
+      principalId: "user:bob",
+    }), other.emit, { connectionId: "conn-other" });
+
+    owner.events.length = 0;
+    other.events.length = 0;
+    router.handleMessage({ type: "session_new" }, owner.emit, { connectionId: "conn-owner" });
+    await vi.waitFor(() => {
+      expect(owner.events.some((event) => event.type === "session_created")).toBe(true);
+    });
+    const created = owner.events.find((event) => event.type === "session_created");
+    if (!created || created.type !== "session_created") throw new Error("expected session_created");
+
+    router.unregisterConnection("conn-owner", owner.emit);
+    other.events.length = 0;
+    router.handleMessage({
+      type: "session_replay",
+      sessionId: created.sessionId,
+    }, other.emit, { connectionId: "conn-other" });
+
+    const denied = other.events.find((event) => event.type === "error");
+    expect(denied).toBeDefined();
+    if (denied?.type === "error") {
+      expect(denied.message).toMatch(/does not own this session/i);
+    }
+  });
+
   it("owner prompt resumes session parked by owner disconnect", async () => {
     const owner = collectEvents();
     router.registerConnection("conn-owner", owner.emit);
@@ -1547,18 +1655,22 @@ describe("createRouter", () => {
 
     const closed = router.closeSessionsByRuntime("default", "runtime_unavailable");
     expect(closed).toEqual([created.sessionId]);
-    expect(owner.events).toEqual([
-      {
-        type: "error",
-        sessionId: created.sessionId,
-        message: "Runtime unavailable: default (runtime_unavailable)",
-      },
-      {
-        type: "session_closed",
-        sessionId: created.sessionId,
-        reason: "runtime_unavailable",
-      },
-    ]);
+    expect(owner.events[0]).toEqual({
+      type: "error",
+      sessionId: created.sessionId,
+      message: "Runtime unavailable: default (runtime_unavailable)",
+    });
+    expect(owner.events.some((event) => (
+      event.type === "session_lifecycle"
+      && event.sessionId === created.sessionId
+      && event.eventType === "SESSION_CLOSED"
+      && event.toState === "closed"
+    ))).toBe(true);
+    expect(owner.events.some((event) => (
+      event.type === "session_closed"
+      && event.sessionId === created.sessionId
+      && event.reason === "runtime_unavailable"
+    ))).toBe(true);
 
     const stored = stateStore.getSession(created.sessionId);
     expect(stored?.status).toBe("idle");

@@ -647,6 +647,20 @@ describe("useSession", () => {
     });
   });
 
+  it("takeoverSession sends session_takeover message", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.takeoverSession("sess-77");
+    });
+
+    expect(sendMessage).toHaveBeenCalledWith({
+      type: "session_takeover",
+      sessionId: "sess-77",
+    });
+  });
+
   it("requestSessionList sends paginated session_list message", () => {
     const sendMessage = vi.fn();
     const { result } = renderHook(() => useSession(sendMessage));

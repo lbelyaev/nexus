@@ -1570,7 +1570,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
           principalId: resolvedPrincipal.principalId,
           previousSessionId: binding?.sessionId,
         });
-        gatewayClient.send({ type: "session_replay", sessionId });
+        gatewayClient.send({ type: sub === "takeover" ? "session_takeover" : "session_replay", sessionId });
         await sendToConversation(
           message.adapterId,
           message.conversationId,

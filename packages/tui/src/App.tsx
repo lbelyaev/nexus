@@ -661,7 +661,11 @@ export const App = ({ url, token }: AppProps) => {
           setMessages((prev) => [...prev, { role: "system", text: `  Usage: /session ${sub} <sessionId>` }]);
           return;
         }
-        session.resumeSession(sessionId);
+        if (sub === "takeover") {
+          session.takeoverSession(sessionId);
+        } else {
+          session.resumeSession(sessionId);
+        }
         setMessages((prev) => [...prev, { role: "system", text: `  ${sub === "takeover" ? "Taking over" : "Resuming"} session ${sessionId}...` }]);
         return;
       }
