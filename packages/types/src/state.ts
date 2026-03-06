@@ -1,4 +1,6 @@
 import type { PrincipalType, PromptSource } from "./protocol.js";
+import type { SessionLifecycleState, SessionParkedReason } from "./sessionLifecycle.js";
+import { isSessionLifecycleState, isSessionParkedReason } from "./sessionLifecycle.js";
 
 // State record types
 
@@ -11,6 +13,11 @@ export interface SessionRecord {
   runtimeId: string;
   acpSessionId: string;
   status: "active" | "idle";
+  lifecycleState?: SessionLifecycleState;
+  parkedReason?: SessionParkedReason;
+  parkedAt?: string;
+  lifecycleUpdatedAt?: string;
+  lifecycleVersion?: number;
   createdAt: string;
   lastActivityAt: string;
   tokenUsage: { input: number; output: number };
@@ -98,6 +105,18 @@ export const isSessionRecord = (value: unknown): value is SessionRecord => {
     typeof obj.acpSessionId === "string" &&
     typeof obj.status === "string" &&
     SESSION_STATUSES.has(obj.status) &&
+    (obj.lifecycleState === undefined || isSessionLifecycleState(obj.lifecycleState)) &&
+    (obj.parkedReason === undefined || isSessionParkedReason(obj.parkedReason)) &&
+    (obj.parkedAt === undefined || typeof obj.parkedAt === "string") &&
+    (obj.lifecycleUpdatedAt === undefined || typeof obj.lifecycleUpdatedAt === "string") &&
+    (
+      obj.lifecycleVersion === undefined
+      || (
+        typeof obj.lifecycleVersion === "number"
+        && Number.isInteger(obj.lifecycleVersion)
+        && obj.lifecycleVersion >= 0
+      )
+    ) &&
     typeof obj.createdAt === "string" &&
     typeof obj.lastActivityAt === "string" &&
     typeof obj.model === "string" &&

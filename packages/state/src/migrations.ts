@@ -16,6 +16,11 @@ export const initDatabase = (db: DatabaseAdapter): void => {
       runtimeId TEXT NOT NULL,
       acpSessionId TEXT NOT NULL,
       status TEXT NOT NULL,
+      lifecycleState TEXT NOT NULL DEFAULT 'live',
+      parkedReason TEXT,
+      parkedAt TEXT,
+      lifecycleUpdatedAt TEXT NOT NULL DEFAULT '',
+      lifecycleVersion INTEGER NOT NULL DEFAULT 0,
       createdAt TEXT NOT NULL,
       lastActivityAt TEXT NOT NULL,
       tokenInput INTEGER NOT NULL DEFAULT 0,
@@ -106,6 +111,20 @@ export const initDatabase = (db: DatabaseAdapter): void => {
       PRIMARY KEY (adapterId, conversationId)
     );
 
+    CREATE TABLE IF NOT EXISTS session_lifecycle_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      sessionId TEXT NOT NULL,
+      eventType TEXT NOT NULL,
+      fromState TEXT NOT NULL,
+      toState TEXT NOT NULL,
+      reason TEXT,
+      parkedReason TEXT,
+      actorPrincipalType TEXT,
+      actorPrincipalId TEXT,
+      metadata TEXT,
+      createdAt TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_memory_items_session_kind_createdAt
       ON memory_items(sessionId, kind, createdAt DESC);
     CREATE INDEX IF NOT EXISTS idx_memory_items_session_lastAccessedAt
@@ -122,6 +141,12 @@ export const initDatabase = (db: DatabaseAdapter): void => {
       ON channel_bindings(sessionId);
     CREATE INDEX IF NOT EXISTS idx_channel_bindings_principal
       ON channel_bindings(principalType, principalId, updatedAt DESC);
+    CREATE INDEX IF NOT EXISTS idx_sessions_lifecycleState
+      ON sessions(lifecycleState);
+    CREATE INDEX IF NOT EXISTS idx_session_lifecycle_events_session_createdAt
+      ON session_lifecycle_events(sessionId, createdAt DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_session_lifecycle_events_eventType_createdAt
+      ON session_lifecycle_events(eventType, createdAt DESC, id DESC);
   `);
 
   if (!hasColumn(db, "sessions", "workspaceId")) {
@@ -135,6 +160,21 @@ export const initDatabase = (db: DatabaseAdapter): void => {
   }
   if (!hasColumn(db, "sessions", "source")) {
     db.exec("ALTER TABLE sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'interactive';");
+  }
+  if (!hasColumn(db, "sessions", "lifecycleState")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN lifecycleState TEXT NOT NULL DEFAULT 'live';");
+  }
+  if (!hasColumn(db, "sessions", "parkedReason")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN parkedReason TEXT;");
+  }
+  if (!hasColumn(db, "sessions", "parkedAt")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN parkedAt TEXT;");
+  }
+  if (!hasColumn(db, "sessions", "lifecycleUpdatedAt")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN lifecycleUpdatedAt TEXT NOT NULL DEFAULT '';");
+  }
+  if (!hasColumn(db, "sessions", "lifecycleVersion")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN lifecycleVersion INTEGER NOT NULL DEFAULT 0;");
   }
   if (!hasColumn(db, "transcript_messages", "workspaceId")) {
     db.exec("ALTER TABLE transcript_messages ADD COLUMN workspaceId TEXT NOT NULL DEFAULT 'default';");
@@ -192,8 +232,29 @@ export const initDatabase = (db: DatabaseAdapter): void => {
   }
 
   db.exec(`
+    UPDATE sessions
+    SET lifecycleState = CASE
+      WHEN status = 'active' THEN 'live'
+      ELSE 'closed'
+    END
+    WHERE lifecycleState IS NULL OR lifecycleState = '';
+  `);
+  db.exec(`
+    UPDATE sessions
+    SET lifecycleUpdatedAt = lastActivityAt
+    WHERE lifecycleUpdatedAt IS NULL OR lifecycleUpdatedAt = '';
+  `);
+  db.exec(`
+    UPDATE sessions
+    SET lifecycleVersion = 0
+    WHERE lifecycleVersion IS NULL;
+  `);
+
+  db.exec(`
     CREATE INDEX IF NOT EXISTS idx_sessions_workspaceId
       ON sessions(workspaceId, lastActivityAt DESC);
+    CREATE INDEX IF NOT EXISTS idx_sessions_lifecycleState
+      ON sessions(lifecycleState);
     CREATE INDEX IF NOT EXISTS idx_sessions_lastActivity_id
       ON sessions(lastActivityAt DESC, id DESC);
     CREATE INDEX IF NOT EXISTS idx_sessions_principal_lastActivity_id
@@ -214,5 +275,9 @@ export const initDatabase = (db: DatabaseAdapter): void => {
       ON channel_bindings(sessionId);
     CREATE INDEX IF NOT EXISTS idx_channel_bindings_principal
       ON channel_bindings(principalType, principalId, updatedAt DESC);
+    CREATE INDEX IF NOT EXISTS idx_session_lifecycle_events_session_createdAt
+      ON session_lifecycle_events(sessionId, createdAt DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_session_lifecycle_events_eventType_createdAt
+      ON session_lifecycle_events(eventType, createdAt DESC, id DESC);
   `);
 };

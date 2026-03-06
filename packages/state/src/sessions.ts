@@ -1,5 +1,13 @@
 import type { DatabaseAdapter } from "./database.js";
-import type { SessionRecord, SessionInfo } from "@nexus/types";
+import {
+  applySessionLifecycleTransition,
+  type SessionLifecycleEventRecord,
+  type SessionLifecycleEventType,
+  type SessionLifecycleState,
+  type SessionParkedReason,
+  type SessionRecord,
+  type SessionInfo,
+} from "@nexus/types";
 
 export interface SessionListPageQuery {
   principalType?: SessionRecord["principalType"];
@@ -14,13 +22,30 @@ export interface SessionListPage {
   nextCursor?: string;
 }
 
+export interface ApplySessionLifecycleEventInput {
+  eventType: SessionLifecycleEventType;
+  at?: string;
+  reason?: string;
+  parkedReason?: SessionParkedReason;
+  actorPrincipalType?: SessionRecord["principalType"];
+  actorPrincipalId?: string;
+  metadata?: string;
+}
+
+export type SessionPatch = Partial<Omit<SessionRecord, "id" | "parkedReason" | "parkedAt">> & {
+  parkedReason?: SessionParkedReason | null;
+  parkedAt?: string | null;
+};
+
 export interface SessionStore {
   createSession: (session: SessionRecord) => void;
   getSession: (id: string) => SessionRecord | null;
   listSessions: () => SessionInfo[];
   listSessionsPage: (query: SessionListPageQuery) => SessionListPage;
-  updateSession: (id: string, patch: Partial<Omit<SessionRecord, "id">>) => void;
+  updateSession: (id: string, patch: SessionPatch) => void;
   incrementSessionTokenUsage: (id: string, inputDelta: number, outputDelta: number) => void;
+  applySessionLifecycleEvent: (id: string, input: ApplySessionLifecycleEventInput) => SessionRecord;
+  listSessionLifecycleEvents: (sessionId: string, limit?: number) => SessionLifecycleEventRecord[];
 }
 
 interface SessionRow {
@@ -32,6 +57,11 @@ interface SessionRow {
   runtimeId: string;
   acpSessionId: string;
   status: string;
+  lifecycleState?: string;
+  parkedReason?: string | null;
+  parkedAt?: string | null;
+  lifecycleUpdatedAt?: string;
+  lifecycleVersion?: number;
   createdAt: string;
   lastActivityAt: string;
   tokenInput: number;
@@ -39,31 +69,99 @@ interface SessionRow {
   model: string;
 }
 
-const rowToRecord = (row: SessionRow): SessionRecord => ({
-  id: row.id,
-  workspaceId: row.workspaceId,
-  principalType: row.principalType,
-  principalId: row.principalId,
-  source: row.source,
-  runtimeId: row.runtimeId,
-  acpSessionId: row.acpSessionId,
-  status: row.status as SessionRecord["status"],
-  createdAt: row.createdAt,
-  lastActivityAt: row.lastActivityAt,
-  tokenUsage: { input: row.tokenInput, output: row.tokenOutput },
-  model: row.model,
-});
+interface SessionLifecycleEventRow {
+  id: number;
+  sessionId: string;
+  eventType: string;
+  fromState: string;
+  toState: string;
+  reason?: string | null;
+  parkedReason?: string | null;
+  actorPrincipalType?: SessionRecord["principalType"] | null;
+  actorPrincipalId?: string | null;
+  metadata?: string | null;
+  createdAt: string;
+}
 
-const rowToInfo = (row: SessionRow): SessionInfo => ({
+const sessionStatusToLifecycleState = (status: SessionRecord["status"]): SessionLifecycleState => (
+  status === "active" ? "live" : "closed"
+);
+
+const lifecycleStateToSessionStatus = (state: SessionLifecycleState): SessionRecord["status"] => (
+  state === "live" ? "active" : "idle"
+);
+
+const rowToRecord = (row: SessionRow): SessionRecord => {
+  const lifecycleState =
+    row.lifecycleState === "live" || row.lifecycleState === "parked" || row.lifecycleState === "closed"
+      ? row.lifecycleState
+      : sessionStatusToLifecycleState(row.status as SessionRecord["status"]);
+  const lifecycleUpdatedAt = row.lifecycleUpdatedAt && row.lifecycleUpdatedAt.length > 0
+    ? row.lifecycleUpdatedAt
+    : row.lastActivityAt;
+  const lifecycleVersion = typeof row.lifecycleVersion === "number" ? row.lifecycleVersion : 0;
+
+  return {
+    id: row.id,
+    workspaceId: row.workspaceId,
+    principalType: row.principalType,
+    principalId: row.principalId,
+    source: row.source,
+    runtimeId: row.runtimeId,
+    acpSessionId: row.acpSessionId,
+    status: row.status as SessionRecord["status"],
+    lifecycleState,
+    ...(row.parkedReason ? { parkedReason: row.parkedReason as SessionParkedReason } : {}),
+    ...(row.parkedAt ? { parkedAt: row.parkedAt } : {}),
+    lifecycleUpdatedAt,
+    lifecycleVersion,
+    createdAt: row.createdAt,
+    lastActivityAt: row.lastActivityAt,
+    tokenUsage: { input: row.tokenInput, output: row.tokenOutput },
+    model: row.model,
+  };
+};
+
+const rowToInfo = (row: SessionRow): SessionInfo => {
+  const lifecycleState =
+    row.lifecycleState === "live" || row.lifecycleState === "parked" || row.lifecycleState === "closed"
+      ? row.lifecycleState
+      : sessionStatusToLifecycleState(row.status as SessionRecord["status"]);
+  const lifecycleUpdatedAt = row.lifecycleUpdatedAt && row.lifecycleUpdatedAt.length > 0
+    ? row.lifecycleUpdatedAt
+    : row.lastActivityAt;
+  const lifecycleVersion = typeof row.lifecycleVersion === "number" ? row.lifecycleVersion : 0;
+
+  return {
+    id: row.id,
+    status: row.status as SessionInfo["status"],
+    lifecycleState,
+    ...(row.parkedReason ? { parkedReason: row.parkedReason as SessionParkedReason } : {}),
+    ...(row.parkedAt ? { parkedAt: row.parkedAt } : {}),
+    lifecycleUpdatedAt,
+    lifecycleVersion,
+    model: row.model,
+    workspaceId: row.workspaceId,
+    principalType: row.principalType,
+    principalId: row.principalId,
+    source: row.source,
+    createdAt: row.createdAt,
+    lastActivityAt: row.lastActivityAt,
+  };
+};
+
+const rowToLifecycleEventRecord = (row: SessionLifecycleEventRow): SessionLifecycleEventRecord => ({
   id: row.id,
-  status: row.status as SessionInfo["status"],
-  model: row.model,
-  workspaceId: row.workspaceId,
-  principalType: row.principalType,
-  principalId: row.principalId,
-  source: row.source,
+  sessionId: row.sessionId,
+  eventType: row.eventType as SessionLifecycleEventType,
+  fromState: row.fromState as SessionLifecycleState,
+  toState: row.toState as SessionLifecycleState,
+  ...(row.reason ? { reason: row.reason } : {}),
+  ...(row.parkedReason ? { parkedReason: row.parkedReason as SessionParkedReason } : {}),
+  ...(row.actorPrincipalType ? { actorPrincipalType: row.actorPrincipalType } : {}),
+  ...(row.actorPrincipalId ? { actorPrincipalId: row.actorPrincipalId } : {}),
+  ...(row.metadata ? { metadata: row.metadata } : {}),
   createdAt: row.createdAt,
-  lastActivityAt: row.lastActivityAt,
 });
 
 const encodeSessionListCursor = (row: Pick<SessionRow, "id" | "lastActivityAt">): string =>
@@ -89,8 +187,73 @@ const decodeSessionListCursor = (cursor: string): { id: string; lastActivityAt: 
 
 export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
   const insertStmt = db.prepare(
-    `INSERT INTO sessions (id, workspaceId, principalType, principalId, source, runtimeId, acpSessionId, status, createdAt, lastActivityAt, tokenInput, tokenOutput, model)
-     VALUES (@id, @workspaceId, @principalType, @principalId, @source, @runtimeId, @acpSessionId, @status, @createdAt, @lastActivityAt, @tokenInput, @tokenOutput, @model)`,
+    `INSERT INTO sessions (
+      id,
+      workspaceId,
+      principalType,
+      principalId,
+      source,
+      runtimeId,
+      acpSessionId,
+      status,
+      lifecycleState,
+      parkedReason,
+      parkedAt,
+      lifecycleUpdatedAt,
+      lifecycleVersion,
+      createdAt,
+      lastActivityAt,
+      tokenInput,
+      tokenOutput,
+      model
+    )
+    VALUES (
+      @id,
+      @workspaceId,
+      @principalType,
+      @principalId,
+      @source,
+      @runtimeId,
+      @acpSessionId,
+      @status,
+      @lifecycleState,
+      @parkedReason,
+      @parkedAt,
+      @lifecycleUpdatedAt,
+      @lifecycleVersion,
+      @createdAt,
+      @lastActivityAt,
+      @tokenInput,
+      @tokenOutput,
+      @model
+    )`,
+  );
+
+  const insertLifecycleEventStmt = db.prepare(
+    `INSERT INTO session_lifecycle_events (
+      sessionId,
+      eventType,
+      fromState,
+      toState,
+      reason,
+      parkedReason,
+      actorPrincipalType,
+      actorPrincipalId,
+      metadata,
+      createdAt
+    )
+    VALUES (
+      @sessionId,
+      @eventType,
+      @fromState,
+      @toState,
+      @reason,
+      @parkedReason,
+      @actorPrincipalType,
+      @actorPrincipalId,
+      @metadata,
+      @createdAt
+    )`,
   );
 
   const getStmt = db.prepare("SELECT * FROM sessions WHERE id = ?");
@@ -110,8 +273,35 @@ export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
      ORDER BY lastActivityAt DESC, id DESC
      LIMIT @limitPlusOne`,
   );
+  const listLifecycleEventsStmt = db.prepare(
+    `SELECT * FROM session_lifecycle_events
+     WHERE sessionId = @sessionId
+     ORDER BY createdAt DESC, id DESC
+     LIMIT @limit`,
+  );
+
+  const logLifecycleEvent = (event: Omit<SessionLifecycleEventRecord, "id">): void => {
+    insertLifecycleEventStmt.run({
+      sessionId: event.sessionId,
+      eventType: event.eventType,
+      fromState: event.fromState,
+      toState: event.toState,
+      reason: event.reason ?? null,
+      parkedReason: event.parkedReason ?? null,
+      actorPrincipalType: event.actorPrincipalType ?? null,
+      actorPrincipalId: event.actorPrincipalId ?? null,
+      metadata: event.metadata ?? null,
+      createdAt: event.createdAt,
+    });
+  };
 
   const createSession = (session: SessionRecord): void => {
+    const lifecycleState = session.lifecycleState ?? sessionStatusToLifecycleState(session.status);
+    const lifecycleUpdatedAt = session.lifecycleUpdatedAt ?? session.lastActivityAt;
+    const lifecycleVersion = session.lifecycleVersion ?? 0;
+    const parkedReason = lifecycleState === "parked" ? (session.parkedReason ?? null) : null;
+    const parkedAt = lifecycleState === "parked" ? (session.parkedAt ?? lifecycleUpdatedAt) : null;
+
     insertStmt.run({
       id: session.id,
       workspaceId: session.workspaceId,
@@ -121,11 +311,25 @@ export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
       runtimeId: session.runtimeId,
       acpSessionId: session.acpSessionId,
       status: session.status,
+      lifecycleState,
+      parkedReason,
+      parkedAt,
+      lifecycleUpdatedAt,
+      lifecycleVersion,
       createdAt: session.createdAt,
       lastActivityAt: session.lastActivityAt,
       tokenInput: session.tokenUsage.input,
       tokenOutput: session.tokenUsage.output,
       model: session.model,
+    });
+
+    logLifecycleEvent({
+      sessionId: session.id,
+      eventType: "SESSION_CREATED",
+      fromState: lifecycleState,
+      toState: lifecycleState,
+      ...(parkedReason ? { parkedReason } : {}),
+      createdAt: lifecycleUpdatedAt,
     });
   };
 
@@ -164,55 +368,87 @@ export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
 
   const updateSession = (
     id: string,
-    patch: Partial<Omit<SessionRecord, "id">>,
+    patch: SessionPatch,
   ): void => {
+    const normalizedPatch: SessionPatch = { ...patch };
+    if (normalizedPatch.lifecycleState !== undefined && normalizedPatch.status === undefined) {
+      normalizedPatch.status = lifecycleStateToSessionStatus(normalizedPatch.lifecycleState);
+    }
+    if (normalizedPatch.status !== undefined && normalizedPatch.lifecycleState === undefined) {
+      normalizedPatch.lifecycleState = sessionStatusToLifecycleState(normalizedPatch.status);
+    }
+    if (normalizedPatch.lifecycleState !== undefined && normalizedPatch.lifecycleState !== "parked") {
+      if (normalizedPatch.parkedReason === undefined) normalizedPatch.parkedReason = null;
+      if (normalizedPatch.parkedAt === undefined) normalizedPatch.parkedAt = null;
+    }
+
     const setClauses: string[] = [];
     const params: Record<string, unknown> = { id };
 
-    if (patch.status !== undefined) {
+    if (normalizedPatch.status !== undefined) {
       setClauses.push("status = @status");
-      params.status = patch.status;
+      params.status = normalizedPatch.status;
     }
-    if (patch.runtimeId !== undefined) {
+    if (normalizedPatch.lifecycleState !== undefined) {
+      setClauses.push("lifecycleState = @lifecycleState");
+      params.lifecycleState = normalizedPatch.lifecycleState;
+    }
+    if (normalizedPatch.parkedReason !== undefined) {
+      setClauses.push("parkedReason = @parkedReason");
+      params.parkedReason = normalizedPatch.parkedReason;
+    }
+    if (normalizedPatch.parkedAt !== undefined) {
+      setClauses.push("parkedAt = @parkedAt");
+      params.parkedAt = normalizedPatch.parkedAt;
+    }
+    if (normalizedPatch.lifecycleUpdatedAt !== undefined) {
+      setClauses.push("lifecycleUpdatedAt = @lifecycleUpdatedAt");
+      params.lifecycleUpdatedAt = normalizedPatch.lifecycleUpdatedAt;
+    }
+    if (normalizedPatch.lifecycleVersion !== undefined) {
+      setClauses.push("lifecycleVersion = @lifecycleVersion");
+      params.lifecycleVersion = normalizedPatch.lifecycleVersion;
+    }
+    if (normalizedPatch.runtimeId !== undefined) {
       setClauses.push("runtimeId = @runtimeId");
-      params.runtimeId = patch.runtimeId;
+      params.runtimeId = normalizedPatch.runtimeId;
     }
-    if (patch.principalType !== undefined) {
+    if (normalizedPatch.principalType !== undefined) {
       setClauses.push("principalType = @principalType");
-      params.principalType = patch.principalType;
+      params.principalType = normalizedPatch.principalType;
     }
-    if (patch.principalId !== undefined) {
+    if (normalizedPatch.principalId !== undefined) {
       setClauses.push("principalId = @principalId");
-      params.principalId = patch.principalId;
+      params.principalId = normalizedPatch.principalId;
     }
-    if (patch.source !== undefined) {
+    if (normalizedPatch.source !== undefined) {
       setClauses.push("source = @source");
-      params.source = patch.source;
+      params.source = normalizedPatch.source;
     }
-    if (patch.workspaceId !== undefined) {
+    if (normalizedPatch.workspaceId !== undefined) {
       setClauses.push("workspaceId = @workspaceId");
-      params.workspaceId = patch.workspaceId;
+      params.workspaceId = normalizedPatch.workspaceId;
     }
-    if (patch.acpSessionId !== undefined) {
+    if (normalizedPatch.acpSessionId !== undefined) {
       setClauses.push("acpSessionId = @acpSessionId");
-      params.acpSessionId = patch.acpSessionId;
+      params.acpSessionId = normalizedPatch.acpSessionId;
     }
-    if (patch.createdAt !== undefined) {
+    if (normalizedPatch.createdAt !== undefined) {
       setClauses.push("createdAt = @createdAt");
-      params.createdAt = patch.createdAt;
+      params.createdAt = normalizedPatch.createdAt;
     }
-    if (patch.lastActivityAt !== undefined) {
+    if (normalizedPatch.lastActivityAt !== undefined) {
       setClauses.push("lastActivityAt = @lastActivityAt");
-      params.lastActivityAt = patch.lastActivityAt;
+      params.lastActivityAt = normalizedPatch.lastActivityAt;
     }
-    if (patch.model !== undefined) {
+    if (normalizedPatch.model !== undefined) {
       setClauses.push("model = @model");
-      params.model = patch.model;
+      params.model = normalizedPatch.model;
     }
-    if (patch.tokenUsage !== undefined) {
+    if (normalizedPatch.tokenUsage !== undefined) {
       setClauses.push("tokenInput = @tokenInput, tokenOutput = @tokenOutput");
-      params.tokenInput = patch.tokenUsage.input;
-      params.tokenOutput = patch.tokenUsage.output;
+      params.tokenInput = normalizedPatch.tokenUsage.input;
+      params.tokenOutput = normalizedPatch.tokenUsage.output;
     }
 
     if (setClauses.length === 0) return;
@@ -250,6 +486,68 @@ export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
     }
   };
 
+  const applySessionLifecycleEvent = (
+    id: string,
+    input: ApplySessionLifecycleEventInput,
+  ): SessionRecord => {
+    const current = getSession(id);
+    if (!current) {
+      throw new Error(`Session not found: ${id}`);
+    }
+    const currentState = current.lifecycleState ?? sessionStatusToLifecycleState(current.status);
+    const transition = applySessionLifecycleTransition(currentState, input.eventType, {
+      currentParkedReason: current.parkedReason,
+      parkedReason: input.parkedReason,
+    });
+    if (!transition) {
+      throw new Error(`Invalid lifecycle transition: ${currentState} -> ${input.eventType}`);
+    }
+
+    const at = input.at ?? new Date().toISOString();
+    const nextVersion = (current.lifecycleVersion ?? 0) + 1;
+    const nextParkedReason =
+      transition.toState === "parked"
+        ? (transition.parkedReason ?? current.parkedReason ?? "manual")
+        : null;
+    const nextParkedAt =
+      transition.toState === "parked"
+        ? (current.parkedAt ?? at)
+        : null;
+
+    updateSession(id, {
+      status: lifecycleStateToSessionStatus(transition.toState),
+      lifecycleState: transition.toState,
+      parkedReason: nextParkedReason,
+      parkedAt: nextParkedAt,
+      lifecycleUpdatedAt: at,
+      lifecycleVersion: nextVersion,
+    });
+
+    logLifecycleEvent({
+      sessionId: id,
+      eventType: input.eventType,
+      fromState: transition.fromState,
+      toState: transition.toState,
+      ...(input.reason ? { reason: input.reason } : {}),
+      ...(nextParkedReason ? { parkedReason: nextParkedReason } : {}),
+      ...(input.actorPrincipalType ? { actorPrincipalType: input.actorPrincipalType } : {}),
+      ...(input.actorPrincipalId ? { actorPrincipalId: input.actorPrincipalId } : {}),
+      ...(input.metadata ? { metadata: input.metadata } : {}),
+      createdAt: at,
+    });
+
+    return getSession(id)!;
+  };
+
+  const listSessionLifecycleEvents = (
+    sessionId: string,
+    limit = 50,
+  ): SessionLifecycleEventRecord[] => {
+    const safeLimit = Math.max(1, Math.min(Math.floor(limit), 200));
+    const rows = listLifecycleEventsStmt.all({ sessionId, limit: safeLimit }) as SessionLifecycleEventRow[];
+    return rows.map(rowToLifecycleEventRecord);
+  };
+
   return {
     createSession,
     getSession,
@@ -257,5 +555,7 @@ export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
     listSessionsPage,
     updateSession,
     incrementSessionTokenUsage,
+    applySessionLifecycleEvent,
+    listSessionLifecycleEvents,
   };
 };

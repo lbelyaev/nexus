@@ -2,10 +2,16 @@
 
 import type { MemoryItem, TranscriptMessage } from "./memory.js";
 import { isMemoryItem, isTranscriptMessage } from "./memory.js";
+import type { SessionLifecycleState, SessionParkedReason } from "./sessionLifecycle.js";
 
 export interface SessionInfo {
   id: string;
   status: "active" | "idle";
+  lifecycleState?: SessionLifecycleState;
+  parkedReason?: SessionParkedReason;
+  parkedAt?: string;
+  lifecycleUpdatedAt?: string;
+  lifecycleVersion?: number;
   model: string;
   workspaceId?: string;
   principalType?: PrincipalType;

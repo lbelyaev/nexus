@@ -25,6 +25,11 @@ describe("initDatabase", () => {
     expect(columnNames).toContain("runtimeId");
     expect(columnNames).toContain("acpSessionId");
     expect(columnNames).toContain("status");
+    expect(columnNames).toContain("lifecycleState");
+    expect(columnNames).toContain("parkedReason");
+    expect(columnNames).toContain("parkedAt");
+    expect(columnNames).toContain("lifecycleUpdatedAt");
+    expect(columnNames).toContain("lifecycleVersion");
     expect(columnNames).toContain("createdAt");
     expect(columnNames).toContain("lastActivityAt");
     expect(columnNames).toContain("tokenInput");
@@ -139,6 +144,27 @@ describe("initDatabase", () => {
     expect(columnNames).toContain("updatedAt");
   });
 
+  it("creates session_lifecycle_events table with correct columns", () => {
+    initDatabase(db);
+
+    const columns = db
+      .prepare("PRAGMA table_info(session_lifecycle_events)")
+      .all() as Array<{ name: string; type: string }>;
+    const columnNames = columns.map((c) => c.name);
+
+    expect(columnNames).toContain("id");
+    expect(columnNames).toContain("sessionId");
+    expect(columnNames).toContain("eventType");
+    expect(columnNames).toContain("fromState");
+    expect(columnNames).toContain("toState");
+    expect(columnNames).toContain("reason");
+    expect(columnNames).toContain("parkedReason");
+    expect(columnNames).toContain("actorPrincipalType");
+    expect(columnNames).toContain("actorPrincipalId");
+    expect(columnNames).toContain("metadata");
+    expect(columnNames).toContain("createdAt");
+  });
+
   it("is idempotent (calling twice does not error)", () => {
     initDatabase(db);
     expect(() => initDatabase(db)).not.toThrow();
@@ -157,6 +183,7 @@ describe("initDatabase", () => {
 
     expect(indexNames).toContain("idx_audit_events_sessionId");
     expect(indexNames).toContain("idx_sessions_status");
+    expect(indexNames).toContain("idx_sessions_lifecycleState");
     expect(indexNames).toContain("idx_sessions_workspaceId");
     expect(indexNames).toContain("idx_transcript_sessionId");
     expect(indexNames).toContain("idx_transcript_workspaceId_session");
@@ -169,5 +196,7 @@ describe("initDatabase", () => {
     expect(indexNames).toContain("idx_executions_session_idempotencyKey");
     expect(indexNames).toContain("idx_channel_bindings_sessionId");
     expect(indexNames).toContain("idx_channel_bindings_principal");
+    expect(indexNames).toContain("idx_session_lifecycle_events_session_createdAt");
+    expect(indexNames).toContain("idx_session_lifecycle_events_eventType_createdAt");
   });
 });

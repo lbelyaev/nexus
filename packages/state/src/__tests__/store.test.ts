@@ -20,6 +20,8 @@ describe("createStateStore", () => {
     expect(typeof store.listSessionsPage).toBe("function");
     expect(typeof store.updateSession).toBe("function");
     expect(typeof store.incrementSessionTokenUsage).toBe("function");
+    expect(typeof store.applySessionLifecycleEvent).toBe("function");
+    expect(typeof store.listSessionLifecycleEvents).toBe("function");
     expect(typeof store.logEvent).toBe("function");
     expect(typeof store.getEvents).toBe("function");
     expect(typeof store.appendMessage).toBe("function");

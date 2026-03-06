@@ -9,6 +9,7 @@ import type {
   PromptSource,
   RuntimeHealthInfo,
   RuntimeHealthStatus,
+  SessionLifecycleEventType,
   UsageSummary,
 } from "@nexus/types";
 import { estimateTokens } from "@nexus/types";
@@ -533,6 +534,12 @@ export const createRouter = (deps: RouterDeps): Router => {
     transfer.state = "expired";
     transfer.updatedAtMs = Date.now();
     sessionTransfers.set(transfer.sessionId, transfer);
+    applyLifecycleEvent(transfer.sessionId, "TRANSFER_EXPIRED", {
+      parkedReason: "transfer_expired",
+      reason,
+      actorPrincipalType: transfer.fromPrincipalType,
+      actorPrincipalId: transfer.fromPrincipalId,
+    });
     emitTransferUpdated(transfer, "expired", preferredEmit, reason);
     log.info("session_transfer_expired", {
       sessionId: transfer.sessionId,
@@ -619,6 +626,38 @@ export const createRouter = (deps: RouterDeps): Router => {
     stateStore.incrementSessionTokenUsage(sessionId, normalizedInput, normalizedOutput);
   };
 
+  const applyLifecycleEvent = (
+    sessionId: string,
+    eventType: SessionLifecycleEventType,
+    options?: {
+      at?: string;
+      reason?: string;
+      parkedReason?: "transfer_pending" | "transfer_expired" | "runtime_timeout" | "owner_disconnected" | "manual";
+      actorPrincipalType?: PrincipalType;
+      actorPrincipalId?: string;
+      metadata?: string;
+    },
+  ): void => {
+    try {
+      stateStore.applySessionLifecycleEvent(sessionId, {
+        eventType,
+        ...(options?.at ? { at: options.at } : {}),
+        ...(options?.reason ? { reason: options.reason } : {}),
+        ...(options?.parkedReason ? { parkedReason: options.parkedReason } : {}),
+        ...(options?.actorPrincipalType ? { actorPrincipalType: options.actorPrincipalType } : {}),
+        ...(options?.actorPrincipalId ? { actorPrincipalId: options.actorPrincipalId } : {}),
+        ...(options?.metadata ? { metadata: options.metadata } : {}),
+      });
+    } catch (error) {
+      log.warn("session_lifecycle_apply_failed", {
+        sessionId,
+        eventType,
+        reason: options?.reason ?? null,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
+
   const hydrateSessionIfPersisted = (
     sessionId: string,
     emit: EventEmitter,
@@ -635,6 +674,14 @@ export const createRouter = (deps: RouterDeps): Router => {
           type: "error",
           sessionId,
           message: `Session not found: ${sessionId}`,
+        });
+        return false;
+      }
+      if (sessionRecord.lifecycleState === "closed") {
+        emit({
+          type: "error",
+          sessionId,
+          message: "Session is closed and cannot be resumed. Start a new session.",
         });
         return false;
       }
@@ -691,6 +738,15 @@ export const createRouter = (deps: RouterDeps): Router => {
         });
         sessionPolicyContexts.set(sessionId, policyContext);
         sessionLastActivityMs.set(sessionId, Date.now());
+        const resumedAt = new Date().toISOString();
+        if (sessionRecord.lifecycleState === "parked") {
+          applyLifecycleEvent(sessionId, "OWNER_RESUMED", {
+            at: resumedAt,
+            reason: "runtime_rehydrated",
+            actorPrincipalType: principalType,
+            actorPrincipalId: principalId,
+          });
+        }
         stateStore.updateSession(sessionId, {
           runtimeId: restored.runtimeId,
           acpSessionId: restored.acpSessionId,
@@ -700,7 +756,7 @@ export const createRouter = (deps: RouterDeps): Router => {
           principalId,
           source,
           workspaceId,
-          lastActivityAt: new Date().toISOString(),
+          lastActivityAt: resumedAt,
         });
         emit({
           type: "session_invalidated",
@@ -881,8 +937,16 @@ export const createRouter = (deps: RouterDeps): Router => {
 
     const nowIso = new Date().toISOString();
     try {
+      applyLifecycleEvent(sessionId, "SESSION_CLOSED", {
+        at: nowIso,
+        reason,
+      });
       stateStore.updateSession(sessionId, {
         status: "idle",
+        lifecycleState: "closed",
+        parkedReason: null,
+        parkedAt: null,
+        lifecycleUpdatedAt: nowIso,
         lastActivityAt: nowIso,
       });
     } catch {
@@ -995,6 +1059,9 @@ export const createRouter = (deps: RouterDeps): Router => {
           runtimeId: acpSession.runtimeId,
           acpSessionId: acpSession.acpSessionId,
           status: "active",
+          lifecycleState: "live",
+          lifecycleUpdatedAt: now,
+          lifecycleVersion: 0,
           createdAt: now,
           lastActivityAt: now,
           tokenUsage: { input: 0, output: 0 },
@@ -1299,6 +1366,12 @@ export const createRouter = (deps: RouterDeps): Router => {
       updatedAtMs: Date.now(),
     };
     sessionTransfers.set(msg.sessionId, transfer);
+    applyLifecycleEvent(msg.sessionId, "TRANSFER_REQUESTED", {
+      parkedReason: "transfer_pending",
+      reason: "transfer_requested",
+      actorPrincipalType: transfer.fromPrincipalType,
+      actorPrincipalId: transfer.fromPrincipalId,
+    });
 
     const requestedEvent: GatewayEvent = {
       type: "session_transfer_requested",
@@ -1401,6 +1474,11 @@ export const createRouter = (deps: RouterDeps): Router => {
 
     sessionOwners.set(msg.sessionId, emit);
     sessionTransfers.delete(msg.sessionId);
+    applyLifecycleEvent(msg.sessionId, "TRANSFER_ACCEPTED", {
+      reason: "transfer_accepted",
+      actorPrincipalType: principal.principalType,
+      actorPrincipalId: principal.principalId,
+    });
     emitTransferUpdated(transfer, "accepted", emit);
     sessionPrincipals.set(msg.sessionId, {
       principalType: principal.principalType,
@@ -1495,6 +1573,11 @@ export const createRouter = (deps: RouterDeps): Router => {
     }
 
     sessionTransfers.delete(msg.sessionId);
+    applyLifecycleEvent(msg.sessionId, "TRANSFER_DISMISSED", {
+      reason: transfer.state === "expired" ? "target_dismissed_after_expiry" : "target_dismissed",
+      actorPrincipalType: principal.principalType,
+      actorPrincipalId: principal.principalId,
+    });
     emitTransferUpdated(transfer, "dismissed", emit, transfer.state === "expired" ? "target_dismissed_after_expiry" : "target_dismissed");
     log.info("session_transfer_dismissed", {
       connectionId,
@@ -1526,6 +1609,11 @@ export const createRouter = (deps: RouterDeps): Router => {
     }
 
     const connectionId = context?.connectionId ?? emitterConnectionIds.get(emit) ?? null;
+    const principal = sessionPrincipals.get(msg.sessionId) ?? {
+      principalType: "user" as const,
+      principalId: "user:local" as const,
+      source: "interactive" as const,
+    };
     const transfer = sessionTransfers.get(msg.sessionId);
     if (transfer) {
       const resolvedTransfer = markTransferExpiredIfNeeded(transfer, emit);
@@ -1543,6 +1631,11 @@ export const createRouter = (deps: RouterDeps): Router => {
         return;
       }
       sessionTransfers.delete(msg.sessionId);
+      applyLifecycleEvent(msg.sessionId, "OWNER_RESUMED", {
+        reason: resolvedTransfer.state === "expired" ? "owner_resumed_after_expiry" : "owner_resumed",
+        actorPrincipalType: resolvedTransfer.fromPrincipalType,
+        actorPrincipalId: resolvedTransfer.fromPrincipalId,
+      });
       emitTransferUpdated(
         resolvedTransfer,
         "cancelled",
@@ -1557,6 +1650,15 @@ export const createRouter = (deps: RouterDeps): Router => {
         targetPrincipalType: resolvedTransfer.targetPrincipalType,
         targetPrincipalId: resolvedTransfer.targetPrincipalId,
       });
+    } else {
+      const persisted = stateStore.getSession(msg.sessionId);
+      if (persisted?.lifecycleState === "parked") {
+        applyLifecycleEvent(msg.sessionId, "OWNER_RESUMED", {
+          reason: "owner_prompt_resumed",
+          actorPrincipalType: principal.principalType,
+          actorPrincipalId: principal.principalId,
+        });
+      }
     }
 
     const executionId = `exec-${msg.sessionId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -1583,11 +1685,6 @@ export const createRouter = (deps: RouterDeps): Router => {
       parentExecutionId,
       turnId,
       policySnapshotId,
-    };
-    const principal = sessionPrincipals.get(msg.sessionId) ?? {
-      principalType: "user" as const,
-      principalId: "user:local",
-      source: "interactive" as const,
     };
     const idempotencyKey = msg.idempotencyKey?.trim() || undefined;
     const dedup = idempotencyKey ? getOrCreateIdempotencyMap(msg.sessionId) : undefined;
@@ -2586,6 +2683,10 @@ export const createRouter = (deps: RouterDeps): Router => {
       if (owner === emit) {
         sessionOwners.delete(sessionId);
         released.push(sessionId);
+        applyLifecycleEvent(sessionId, "OWNER_DISCONNECTED", {
+          parkedReason: "owner_disconnected",
+          reason: "owner_disconnected",
+        });
       }
     }
     for (const transfer of sessionTransfers.values()) {

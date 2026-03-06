@@ -13,6 +13,9 @@ const makeSession = (overrides: Partial<SessionRecord> = {}): SessionRecord => (
   runtimeId: "rt-1",
   acpSessionId: "acp-1",
   status: "active",
+  lifecycleState: "live",
+  lifecycleUpdatedAt: "2025-01-01T00:00:00Z",
+  lifecycleVersion: 0,
   createdAt: "2025-01-01T00:00:00Z",
   lastActivityAt: "2025-01-01T00:00:00Z",
   tokenUsage: { input: 0, output: 0 },
@@ -168,5 +171,60 @@ describe("SessionStore", () => {
   it("createSession throws on duplicate ID", () => {
     store.createSession(makeSession());
     expect(() => store.createSession(makeSession())).toThrow();
+  });
+
+  it("applySessionLifecycleEvent parks and resumes session with persisted metadata", () => {
+    store.createSession(makeSession());
+
+    const parked = store.applySessionLifecycleEvent("sess-1", {
+      eventType: "TRANSFER_REQUESTED",
+      parkedReason: "transfer_pending",
+      reason: "owner_requested_transfer",
+      actorPrincipalType: "user",
+      actorPrincipalId: "user:web:alice",
+      at: "2025-01-01T00:01:00Z",
+    });
+    expect(parked.lifecycleState).toBe("parked");
+    expect(parked.parkedReason).toBe("transfer_pending");
+    expect(parked.parkedAt).toBe("2025-01-01T00:01:00Z");
+    expect(parked.lifecycleVersion).toBe(1);
+    expect(parked.status).toBe("idle");
+
+    const resumed = store.applySessionLifecycleEvent("sess-1", {
+      eventType: "OWNER_RESUMED",
+      reason: "owner_sent_prompt",
+      at: "2025-01-01T00:02:00Z",
+    });
+    expect(resumed.lifecycleState).toBe("live");
+    expect(resumed.parkedReason).toBeUndefined();
+    expect(resumed.parkedAt).toBeUndefined();
+    expect(resumed.lifecycleVersion).toBe(2);
+    expect(resumed.status).toBe("active");
+  });
+
+  it("applySessionLifecycleEvent rejects invalid transitions", () => {
+    store.createSession(makeSession());
+    expect(() => store.applySessionLifecycleEvent("sess-1", {
+      eventType: "TRANSFER_ACCEPTED",
+      at: "2025-01-01T00:01:00Z",
+    })).toThrow(/invalid lifecycle transition/i);
+  });
+
+  it("listSessionLifecycleEvents returns newest-first lifecycle records", () => {
+    store.createSession(makeSession());
+    store.applySessionLifecycleEvent("sess-1", {
+      eventType: "TRANSFER_REQUESTED",
+      parkedReason: "transfer_pending",
+      at: "2025-01-01T00:01:00Z",
+    });
+    store.applySessionLifecycleEvent("sess-1", {
+      eventType: "TRANSFER_EXPIRED",
+      at: "2025-01-01T00:02:00Z",
+    });
+
+    const events = store.listSessionLifecycleEvents("sess-1", 5);
+    expect(events[0]?.eventType).toBe("TRANSFER_EXPIRED");
+    expect(events[1]?.eventType).toBe("TRANSFER_REQUESTED");
+    expect(events.some((event) => event.eventType === "SESSION_CREATED")).toBe(true);
   });
 });

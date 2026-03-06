@@ -333,6 +333,40 @@ describe("createRouter", () => {
     expect(events.some((event) => event.type === "session_invalidated" && event.sessionId === "gw-persisted-usage")).toBe(true);
   });
 
+  it("does not rehydrate closed sessions", async () => {
+    const { emit, events } = collectEvents();
+    router.handleMessage({ type: "session_new" }, emit);
+
+    await vi.waitFor(() => {
+      expect(events.some((event) => event.type === "session_created")).toBe(true);
+    });
+    const created = events.find((event) => event.type === "session_created");
+    if (!created || created.type !== "session_created") throw new Error("expected session_created");
+
+    events.length = 0;
+    router.handleMessage({ type: "session_close", sessionId: created.sessionId }, emit);
+    await vi.waitFor(() => {
+      expect(events.some((event) => event.type === "session_closed")).toBe(true);
+    });
+
+    const callsBeforeResumeAttempt = createAcpSessionMock.mock.calls.length;
+    events.length = 0;
+    router.handleMessage({
+      type: "prompt",
+      sessionId: created.sessionId,
+      text: "try to reopen closed",
+    }, emit);
+
+    await vi.waitFor(() => {
+      const errorEvent = events.find((event) => event.type === "error");
+      expect(errorEvent).toBeDefined();
+      if (errorEvent?.type === "error") {
+        expect(errorEvent.message).toMatch(/closed and cannot be resumed/i);
+      }
+    });
+    expect(createAcpSessionMock.mock.calls.length).toBe(callsBeforeResumeAttempt);
+  });
+
   it("auth_proof binds a verified principal that session_new reuses", async () => {
     const { emit, events } = collectEvents();
     router.registerConnection("conn-1", emit);
@@ -1368,6 +1402,39 @@ describe("createRouter", () => {
     expect(owner.events.some((event) => (
       event.type === "session_transfer_updated" && event.state === "cancelled"
     ))).toBe(true);
+  });
+
+  it("owner prompt resumes session parked by owner disconnect", async () => {
+    const owner = collectEvents();
+    router.registerConnection("conn-owner", owner.emit);
+    router.handleMessage({ type: "session_new" }, owner.emit, { connectionId: "conn-owner" });
+
+    await vi.waitFor(() => {
+      expect(owner.events.some((event) => event.type === "session_created")).toBe(true);
+    });
+    const created = owner.events.find((event) => event.type === "session_created");
+    if (!created || created.type !== "session_created") throw new Error("expected session_created");
+
+    router.unregisterConnection("conn-owner", owner.emit);
+    const parked = stateStore.getSession(created.sessionId);
+    expect(parked?.lifecycleState).toBe("parked");
+    expect(parked?.parkedReason).toBe("owner_disconnected");
+
+    const resumed = collectEvents();
+    router.registerConnection("conn-resumed", resumed.emit);
+    resumed.events.length = 0;
+    router.handleMessage({
+      type: "prompt",
+      sessionId: created.sessionId,
+      text: "resume after disconnect",
+    }, resumed.emit, { connectionId: "conn-resumed" });
+
+    await vi.waitFor(() => {
+      expect((acpSession.prompt as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith("resume after disconnect", []);
+    });
+    const live = stateStore.getSession(created.sessionId);
+    expect(live?.lifecycleState).toBe("live");
+    expect(live?.parkedReason).toBeUndefined();
   });
 
   it("broadcasts session_transfer_requested to unverified channel multiplexer with matching owned principal session", async () => {

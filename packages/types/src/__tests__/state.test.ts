@@ -11,6 +11,9 @@ describe("isSessionRecord", () => {
     runtimeId: "claude-code",
     acpSessionId: "acp-123",
     status: "active",
+    lifecycleState: "live",
+    lifecycleUpdatedAt: "2026-01-01T00:01:00Z",
+    lifecycleVersion: 1,
     createdAt: "2026-01-01T00:00:00Z",
     lastActivityAt: "2026-01-01T00:01:00Z",
     tokenUsage: { input: 100, output: 50 },
@@ -27,6 +30,22 @@ describe("isSessionRecord", () => {
 
   it("rejects invalid status", () => {
     expect(isSessionRecord({ ...validSession, status: "unknown" })).toBe(false);
+  });
+
+  it("validates optional lifecycle fields when present", () => {
+    expect(isSessionRecord({
+      ...validSession,
+      lifecycleState: "parked",
+      parkedReason: "transfer_pending",
+      parkedAt: "2026-01-01T00:02:00Z",
+      lifecycleUpdatedAt: "2026-01-01T00:02:00Z",
+      lifecycleVersion: 2,
+    })).toBe(true);
+    expect(isSessionRecord({
+      ...validSession,
+      lifecycleState: "parked",
+      parkedReason: "bad_reason",
+    })).toBe(false);
   });
 
   it("rejects missing fields", () => {
