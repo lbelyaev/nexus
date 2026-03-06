@@ -1,4 +1,11 @@
-import type { ChannelBindingRecord, GatewayEvent, PrincipalType, PromptSource, SessionInfo } from "@nexus/types";
+import type {
+  ChannelBindingRecord,
+  GatewayEvent,
+  PrincipalType,
+  PromptSource,
+  SessionInfo,
+  SessionLifecycleEventRecord,
+} from "@nexus/types";
 import { generateKeyPairSync, sign, type KeyObject } from "node:crypto";
 import { createGatewayClient, type GatewayClient } from "./gatewayClient.js";
 import type {
@@ -105,6 +112,12 @@ interface SessionListPageState {
   nextCursor?: string;
 }
 
+interface PendingSessionLifecycleRequest {
+  adapterId: string;
+  conversationId: string;
+  sessionId: string;
+}
+
 interface PendingSessionResume {
   adapterId: string;
   conversationId: string;
@@ -132,6 +145,7 @@ type AuthResultEvent = Extract<GatewayEvent, { type: "auth_result" }>;
 type UsageResultEvent = Extract<GatewayEvent, { type: "usage_result" }>;
 type MemoryResultEvent = Extract<GatewayEvent, { type: "memory_result" }>;
 type SessionListEvent = Extract<GatewayEvent, { type: "session_list" }>;
+type SessionLifecycleResultEvent = Extract<GatewayEvent, { type: "session_lifecycle_result" }>;
 
 interface AuthKeyPair {
   publicKey: string;
@@ -376,6 +390,26 @@ const formatSessionList = (
   ].join("\n");
 };
 
+const formatSessionLifecycleHistory = (
+  sessionId: string,
+  events: SessionLifecycleEventRecord[],
+): string => {
+  if (events.length === 0) {
+    return `No lifecycle history found for session ${sessionId}.`;
+  }
+  return [
+    `Session history for ${sessionId} (${events.length} event${events.length === 1 ? "" : "s"}):`,
+    ...events.map((event) => [
+      `- ${event.createdAt} ${event.eventType} ${event.fromState}->${event.toState}`,
+      event.parkedReason ? `parked=${event.parkedReason}` : null,
+      event.actorPrincipalId
+        ? `actor=${formatPrincipalDisplay(event.actorPrincipalType ?? "user", event.actorPrincipalId)}`
+        : null,
+      event.reason ? `reason=${event.reason}` : null,
+    ].filter((part): part is string => Boolean(part)).join(" ")),
+  ].join("\n");
+};
+
 const formatSessionBoundary = (title: string, lines: string[]): string => [
   `----- ${title} -----`,
   ...lines,
@@ -414,6 +448,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
   const pendingTransfersBySession = new Map<string, PendingTransfer>();
   const transferCommandRoutes = new Map<string, { adapterId: string; conversationId: string }>();
   const pendingSessionListRequests: PendingSessionListRequest[] = [];
+  const pendingSessionLifecycleRequests: PendingSessionLifecycleRequest[] = [];
   const sessionListStateByConversation = new Map<string, SessionListPageState>();
   const pendingSessionResumeBySession = new Map<string, PendingSessionResume>();
   const sessionInfoById = new Map<string, SessionInfo>();
@@ -1422,7 +1457,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         "Nexus channel commands:",
         "/help",
         "/status",
-        "/session [list|resume|transfer|close]",
+        "/session [list|history|resume|transfer|close]",
         "/usage [summary|stats|recent|search|context|clear]",
         "/new",
         "/cancel",
@@ -1670,6 +1705,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
           [
             "Usage: /session <command>",
             "/session list [limit|next [limit]]",
+            "/session history [sessionId] [limit]",
             "/session resume <sessionId>",
             "/session takeover <sessionId>",
             "/session transfer pending|request|accept|dismiss",
@@ -1727,6 +1763,41 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         return true;
       }
 
+      if (sub === "history") {
+        const rawTarget = parts[1]?.trim();
+        const implicitLimit = parsePositiveInteger(rawTarget);
+        const sessionId = implicitLimit !== undefined
+          ? binding?.sessionId
+          : rawTarget || binding?.sessionId;
+        const limitArg = implicitLimit !== undefined ? rawTarget : parts[2];
+        const parsedLimit = parsePositiveInteger(limitArg);
+        if ((limitArg && parsedLimit === undefined) || !sessionId) {
+          await sendToConversation(
+            message.adapterId,
+            message.conversationId,
+            "Usage: /session history [sessionId] [limit]",
+          );
+          return true;
+        }
+        await ensureConnectionPrincipal(resolvedPrincipal.principalType, resolvedPrincipal.principalId);
+        pendingSessionLifecycleRequests.push({
+          adapterId: message.adapterId,
+          conversationId: message.conversationId,
+          sessionId,
+        });
+        gatewayClient.send({
+          type: "session_lifecycle_query",
+          sessionId,
+          ...(parsedLimit !== undefined ? { limit: parsedLimit } : {}),
+        });
+        await sendToConversation(
+          message.adapterId,
+          message.conversationId,
+          `Fetching session history for ${sessionId}...`,
+        );
+        return true;
+      }
+
       if (sub === "resume" || sub === "takeover") {
         const sessionId = parts[1]?.trim();
         if (!sessionId) {
@@ -1779,7 +1850,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
       await sendToConversation(
         message.adapterId,
         message.conversationId,
-        "Usage: /session [list|resume|takeover|transfer|close]",
+        "Usage: /session [list|history|resume|takeover|transfer|close]",
       );
       return true;
     }
@@ -2370,6 +2441,18 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         );
         break;
       }
+      case "session_lifecycle_result": {
+        const pendingIndex = pendingSessionLifecycleRequests.findIndex((entry) => entry.sessionId === event.sessionId);
+        if (pendingIndex < 0) break;
+        const [pending] = pendingSessionLifecycleRequests.splice(pendingIndex, 1);
+        if (!pending) break;
+        await sendToConversation(
+          pending.adapterId,
+          pending.conversationId,
+          formatSessionLifecycleHistory(event.sessionId, event.events),
+        );
+        break;
+      }
       case "transcript": {
         const pending = clearPendingSessionResume(event.sessionId);
         if (!pending) break;
@@ -2639,6 +2722,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         pending.reject(new Error("Gateway connection closed before session list probe completed."));
       }
     }
+    pendingSessionLifecycleRequests.length = 0;
     sessionListStateByConversation.clear();
     for (const [sessionId] of pendingSessionResumeBySession) {
       clearPendingSessionResume(sessionId, new Error("Gateway connection closed before session replay completed."));
@@ -2686,6 +2770,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
           pending.reject(new Error("Channel manager stopped before session list probe completed."));
         }
       }
+      pendingSessionLifecycleRequests.length = 0;
       sessionListStateByConversation.clear();
       for (const [sessionId] of pendingSessionResumeBySession) {
         clearPendingSessionResume(sessionId, new Error("Channel manager stopped before session replay completed."));

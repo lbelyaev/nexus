@@ -52,6 +52,15 @@ const normalizePrincipalIdInput = (
   return principalId;
 };
 
+const formatPrincipalDisplay = (
+  principalType: "user" | "service_account",
+  principalId: string,
+): string => (
+  principalId.startsWith(`${principalType}:`)
+    ? principalId
+    : `${principalType}:${principalId}`
+);
+
 const parseUsageScope = (
   value: string | undefined,
 ): "session" | "workspace" | "hybrid" | undefined => {
@@ -176,6 +185,28 @@ const formatSessionListResult = (
   ];
 };
 
+const formatSessionLifecycleResult = (
+  sessionId: string,
+  events: UseSessionResult["sessionLifecycleHistory"],
+): ChatMessage[] => {
+  if (events.length === 0) {
+    return [{ id: makeId(), role: "system", text: `No lifecycle history found for session ${sessionId}.` }];
+  }
+  return [
+    { id: makeId(), role: "system", text: `Session history for ${sessionId} (${events.length} event${events.length === 1 ? "" : "s"}):` },
+    ...events.map((event) => ({
+      id: makeId(),
+      role: "system" as const,
+      text: [
+        `- ${event.createdAt} ${event.eventType} ${event.fromState}->${event.toState}`,
+        event.parkedReason ? `parked=${event.parkedReason}` : null,
+        event.actorPrincipalId ? `actor=${formatPrincipalDisplay(event.actorPrincipalType ?? "user", event.actorPrincipalId)}` : null,
+        event.reason ? `reason=${event.reason}` : null,
+      ].filter((part): part is string => Boolean(part)).join(" "),
+    })),
+  ];
+};
+
 const MarkdownView = ({ text }: { text: string }) => (
   <div className="markdown-body">
     <ReactMarkdown
@@ -239,6 +270,7 @@ const ConnectedClient = ({
   const prevStreamingRef = useRef(false);
   const processedUsageResultsRef = useRef(0);
   const pendingSessionListLimitRef = useRef<number | null>(null);
+  const pendingSessionHistorySessionIdRef = useRef<string | null>(null);
   const sessionListLimitRef = useRef(10);
   const lastErrorRef = useRef<string | null>(null);
   const chatViewportRef = useRef<HTMLDivElement | null>(null);
@@ -379,6 +411,13 @@ const ConnectedClient = ({
       ),
     );
   }, [appendMessages, session.sessionId, session.sessionList, session.sessionListHasMore]);
+
+  useEffect(() => {
+    const requestedSessionId = pendingSessionHistorySessionIdRef.current;
+    if (!requestedSessionId) return;
+    pendingSessionHistorySessionIdRef.current = null;
+    appendMessages(formatSessionLifecycleResult(requestedSessionId, session.sessionLifecycleHistory));
+  }, [appendMessages, session.sessionLifecycleHistory]);
 
   useEffect(() => {
     if (!session.error) return;
@@ -839,6 +878,7 @@ const ConnectedClient = ({
           if (!sub || sub === "help") {
             appendSystem("Usage: /session <command>");
             appendSystem("/session list [limit|next [limit]]");
+            appendSystem("/session history [sessionId] [limit]");
             appendSystem("/session resume <sessionId>");
             appendSystem("/session takeover <sessionId>");
             appendSystem("/session transfer pending|request|accept|dismiss");
@@ -874,6 +914,28 @@ const ConnectedClient = ({
             sessionListLimitRef.current = limit;
             appendSystem("Fetching sessions...");
             session.requestSessionList({ limit });
+            setPromptInput("");
+            return;
+          }
+          if (sub === "history") {
+            const rawTarget = restParts[1];
+            const parsedImplicitLimit = rawTarget ? Number.parseInt(rawTarget, 10) : undefined;
+            const hasImplicitLimit = parsedImplicitLimit !== undefined
+              && Number.isFinite(parsedImplicitLimit)
+              && parsedImplicitLimit > 0;
+            const sid = hasImplicitLimit
+              ? session.sessionId ?? undefined
+              : rawTarget ?? session.sessionId ?? undefined;
+            const limitArg = hasImplicitLimit ? rawTarget : restParts[2];
+            const parsedLimit = limitArg ? Number.parseInt(limitArg, 10) : undefined;
+            if ((limitArg && (!Number.isFinite(parsedLimit) || (parsedLimit ?? 0) <= 0)) || !sid) {
+              appendSystem("Usage: /session history [sessionId] [limit]");
+              setPromptInput("");
+              return;
+            }
+            pendingSessionHistorySessionIdRef.current = sid;
+            appendSystem(`Fetching session history for ${sid}...`);
+            session.requestSessionLifecycle(sid, parsedLimit);
             setPromptInput("");
             return;
           }
@@ -913,7 +975,7 @@ const ConnectedClient = ({
             setPromptInput("");
             return;
           }
-          appendSystem("Usage: /session [list|resume|takeover|transfer|close]");
+          appendSystem("Usage: /session [list|history|resume|takeover|transfer|close]");
           setPromptInput("");
           return;
         }

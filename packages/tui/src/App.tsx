@@ -59,6 +59,15 @@ const normalizePrincipalIdInput = (
   return principalId;
 };
 
+const formatPrincipalDisplay = (
+  principalType: "user" | "service_account",
+  principalId: string,
+): string => (
+  principalId.startsWith(`${principalType}:`)
+    ? principalId
+    : `${principalType}:${principalId}`
+);
+
 const formatUsageResult = (
   event: ReturnType<typeof useSession>["usageResults"][number],
 ): ChatMessage[] => {
@@ -169,6 +178,27 @@ const formatSessionListResult = (
   ];
 };
 
+const formatSessionLifecycleResult = (
+  sessionId: string,
+  events: ReturnType<typeof useSession>["sessionLifecycleHistory"],
+): ChatMessage[] => {
+  if (events.length === 0) {
+    return [{ role: "system", text: `  No lifecycle history found for session ${sessionId}.` }];
+  }
+  return [
+    { role: "system", text: `  Session history for ${sessionId} (${events.length} event${events.length === 1 ? "" : "s"}):` },
+    ...events.map((event) => ({
+      role: "system" as const,
+      text: [
+        `    - ${event.createdAt} ${event.eventType} ${event.fromState}->${event.toState}`,
+        event.parkedReason ? `parked=${event.parkedReason}` : null,
+        event.actorPrincipalId ? `actor=${formatPrincipalDisplay(event.actorPrincipalType ?? "user", event.actorPrincipalId)}` : null,
+        event.reason ? `reason=${event.reason}` : null,
+      ].filter((part): part is string => Boolean(part)).join(" "),
+    })),
+  ];
+};
+
 export const App = ({ url, token }: AppProps) => {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [preferredRuntimeId, setPreferredRuntimeId] = useState<string | undefined>(
@@ -227,6 +257,7 @@ export const App = ({ url, token }: AppProps) => {
   const processedUsageResultsRef = useRef(0);
   const lastErrorRef = useRef<string | null>(null);
   const pendingSessionListLimitRef = useRef<number | null>(null);
+  const pendingSessionHistorySessionIdRef = useRef<string | null>(null);
   const sessionListLimitRef = useRef(10);
   useEffect(() => {
     if (prevStreamingRef.current && !session.isStreaming) {
@@ -318,6 +349,13 @@ export const App = ({ url, token }: AppProps) => {
     );
     setMessages((prev) => [...prev, ...rendered]);
   }, [session.sessionId, session.sessionList, session.sessionListHasMore]);
+
+  useEffect(() => {
+    const requestedSessionId = pendingSessionHistorySessionIdRef.current;
+    if (!requestedSessionId) return;
+    pendingSessionHistorySessionIdRef.current = null;
+    setMessages((prev) => [...prev, ...formatSessionLifecycleResult(requestedSessionId, session.sessionLifecycleHistory)]);
+  }, [session.sessionLifecycleHistory]);
 
   const createSession = useCallback(
     (runtimeId?: string, model?: string, workspaceId?: string) => {
@@ -619,6 +657,7 @@ export const App = ({ url, token }: AppProps) => {
           ...prev,
           { role: "system", text: "  Usage: /session <command>" },
           { role: "system", text: "    /session list [limit|next [limit]]" },
+          { role: "system", text: "    /session history [sessionId] [limit]" },
           { role: "system", text: "    /session resume <sessionId>" },
           { role: "system", text: "    /session takeover <sessionId>" },
           { role: "system", text: "    /session transfer pending|request|accept|dismiss" },
@@ -652,6 +691,27 @@ export const App = ({ url, token }: AppProps) => {
         sessionListLimitRef.current = limit;
         setMessages((prev) => [...prev, { role: "system", text: "  Fetching sessions..." }]);
         session.requestSessionList({ limit });
+        return;
+      }
+
+      if (sub === "history") {
+        const rawTarget = parts[1];
+        const parsedImplicitLimit = rawTarget ? Number.parseInt(rawTarget, 10) : undefined;
+        const hasImplicitLimit = parsedImplicitLimit !== undefined
+          && Number.isFinite(parsedImplicitLimit)
+          && parsedImplicitLimit > 0;
+        const sessionId = hasImplicitLimit
+          ? session.sessionId ?? undefined
+          : rawTarget ?? session.sessionId ?? undefined;
+        const limitArg = hasImplicitLimit ? rawTarget : parts[2];
+        const parsedLimit = limitArg ? Number.parseInt(limitArg, 10) : undefined;
+        if ((limitArg && (!Number.isFinite(parsedLimit) || (parsedLimit ?? 0) <= 0)) || !sessionId) {
+          setMessages((prev) => [...prev, { role: "system", text: "  Usage: /session history [sessionId] [limit]" }]);
+          return;
+        }
+        pendingSessionHistorySessionIdRef.current = sessionId;
+        setMessages((prev) => [...prev, { role: "system", text: `  Fetching session history for ${sessionId}...` }]);
+        session.requestSessionLifecycle(sessionId, parsedLimit);
         return;
       }
 
@@ -689,7 +749,7 @@ export const App = ({ url, token }: AppProps) => {
         return;
       }
 
-      setMessages((prev) => [...prev, { role: "system", text: "  Usage: /session [list|resume|takeover|transfer|close]" }]);
+      setMessages((prev) => [...prev, { role: "system", text: "  Usage: /session [list|history|resume|takeover|transfer|close]" }]);
     },
     [handleTransferCommand, sendMessage, session],
   );

@@ -1041,6 +1041,102 @@ describe("createChannelManager", () => {
     await manager.stop();
   });
 
+  it("handles /session history and renders lifecycle rows", async () => {
+    const { gatewayClient, handlers } = createMockGateway();
+    createGatewayClientMock.mockReturnValue(gatewayClient);
+    wireAuthFlow(gatewayClient, handlers);
+    const adapterFixture = createAdapter();
+
+    const manager = createChannelManager({
+      gatewayUrl: "ws://127.0.0.1:18800/ws",
+      token: "test-token",
+      adapters: [{ adapter: adapterFixture.adapter }],
+    });
+
+    await manager.start();
+    const context = adapterFixture.getContext();
+    expect(context).toBeDefined();
+
+    const prompt = context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-session-history",
+      senderId: "user-1",
+      text: "seed history session",
+    });
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith(expect.objectContaining({ type: "session_new" }));
+    });
+    handlers.onEvent?.({
+      type: "session_created",
+      sessionId: "gw-session-history-active",
+      runtimeId: "claude",
+      model: "claude-sonnet-4-6",
+      workspaceId: "default",
+      principalType: "user",
+      principalId: "user:telegram-test:user-1",
+      source: "api",
+    });
+    await prompt;
+
+    gatewayClient.send.mockClear();
+    await context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-session-history",
+      senderId: "user-1",
+      text: "/session history 5",
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: "auth_proof",
+        principalType: "user",
+        principalId: "user:telegram-test:user-1",
+      }));
+      expect(gatewayClient.send).toHaveBeenCalledWith({
+        type: "session_lifecycle_query",
+        sessionId: "gw-session-history-active",
+        limit: 5,
+      });
+    });
+
+    handlers.onEvent?.({
+      type: "session_lifecycle_result",
+      sessionId: "gw-session-history-active",
+      events: [
+        {
+          sessionId: "gw-session-history-active",
+          eventType: "OWNER_DISCONNECTED",
+          fromState: "live",
+          toState: "parked",
+          parkedReason: "owner_disconnected",
+          createdAt: "2026-03-04T01:00:00.000Z",
+          actorPrincipalType: "user",
+          actorPrincipalId: "user:telegram-test:user-1",
+        },
+        {
+          sessionId: "gw-session-history-active",
+          eventType: "SESSION_CREATED",
+          fromState: "live",
+          toState: "live",
+          createdAt: "2026-03-04T00:00:00.000Z",
+        },
+      ],
+    });
+
+    await vi.waitFor(() => {
+      expect(adapterFixture.sendMessage).toHaveBeenCalledWith({
+        conversationId: "chat-session-history",
+        text: [
+          "Session history for gw-session-history-active (2 events):",
+          "- 2026-03-04T01:00:00.000Z OWNER_DISCONNECTED live->parked parked=owner_disconnected actor=user:telegram-test:user-1",
+          "- 2026-03-04T00:00:00.000Z SESSION_CREATED live->live",
+        ].join("\n"),
+      });
+    });
+
+    await manager.stop();
+  });
+
   it("resumes conversation binding with /session resume", async () => {
     const { gatewayClient, handlers } = createMockGateway();
     createGatewayClientMock.mockReturnValue(gatewayClient);
