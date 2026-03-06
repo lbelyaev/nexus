@@ -97,6 +97,10 @@ export type ClientMessage =
       sessionId: string;
     }
   | {
+      type: "session_transfer_dismiss";
+      sessionId: string;
+    }
+  | {
       type: "memory_query";
       sessionId: string;
       action: MemoryQueryAction;
@@ -213,6 +217,18 @@ export type GatewayEvent =
       targetPrincipalType: PrincipalType;
       targetPrincipalId: string;
       expiresAt: string;
+    }
+  | {
+      type: "session_transfer_updated";
+      sessionId: string;
+      fromPrincipalType: PrincipalType;
+      fromPrincipalId: string;
+      targetPrincipalType: PrincipalType;
+      targetPrincipalId: string;
+      state: "requested" | "accepted" | "dismissed" | "expired" | "cancelled";
+      updatedAt: string;
+      expiresAt?: string;
+      reason?: string;
     }
   | {
       type: "session_transferred";
@@ -334,6 +350,7 @@ const CLIENT_MESSAGE_TYPES = new Set([
   "auth_proof",
   "session_transfer_request",
   "session_transfer_accept",
+  "session_transfer_dismiss",
   "memory_query",
   "usage_query",
 ]);
@@ -352,6 +369,7 @@ const GATEWAY_EVENT_TYPES = new Set([
   "auth_challenge",
   "auth_result",
   "session_transfer_requested",
+  "session_transfer_updated",
   "session_transferred",
   "runtime_health",
   "session_list",
@@ -506,6 +524,8 @@ export const isClientMessage = (value: unknown): value is ClientMessage => {
       );
     case "session_transfer_accept":
       return typeof obj.sessionId === "string";
+    case "session_transfer_dismiss":
+      return typeof obj.sessionId === "string";
     case "memory_query":
       return (
         typeof obj.sessionId === "string"
@@ -649,6 +669,27 @@ export const isGatewayEvent = (value: unknown): value is GatewayEvent => {
         && PRINCIPAL_TYPES.has(obj.targetPrincipalType as PrincipalType)
         && typeof obj.targetPrincipalId === "string"
         && typeof obj.expiresAt === "string"
+      );
+    case "session_transfer_updated":
+      return (
+        typeof obj.sessionId === "string"
+        && typeof obj.fromPrincipalType === "string"
+        && PRINCIPAL_TYPES.has(obj.fromPrincipalType as PrincipalType)
+        && typeof obj.fromPrincipalId === "string"
+        && typeof obj.targetPrincipalType === "string"
+        && PRINCIPAL_TYPES.has(obj.targetPrincipalType as PrincipalType)
+        && typeof obj.targetPrincipalId === "string"
+        && typeof obj.state === "string"
+        && (
+          obj.state === "requested"
+          || obj.state === "accepted"
+          || obj.state === "dismissed"
+          || obj.state === "expired"
+          || obj.state === "cancelled"
+        )
+        && typeof obj.updatedAt === "string"
+        && (obj.expiresAt === undefined || typeof obj.expiresAt === "string")
+        && (obj.reason === undefined || typeof obj.reason === "string")
       );
     case "session_transferred":
       return (

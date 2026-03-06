@@ -614,7 +614,7 @@ const ConnectedClient = ({
               return true;
             }
             session.dismissPendingSessionTransfer(sid);
-            appendSystem(`Dismissed transfer prompt for session ${sid}.`);
+            appendSystem(`Dismissing transfer for session ${sid}...`);
             return true;
           }
 
@@ -1353,7 +1353,7 @@ const ConnectedClient = ({
                 className="button-secondary"
                 onClick={() => {
                   session.dismissPendingSessionTransfer(currentTransfer.sessionId);
-                  appendSystem(`Dismissed transfer prompt for session ${currentTransfer.sessionId}.`);
+                  appendSystem(`Dismissing transfer for session ${currentTransfer.sessionId}...`);
                 }}
               >
                 Dismiss

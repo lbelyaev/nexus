@@ -1225,6 +1225,151 @@ describe("createRouter", () => {
     expect(target.events.some((event) => event.type === "transcript")).toBe(true);
   });
 
+  it("session_transfer_dismiss unblocks owner and clears pending transfer", async () => {
+    const owner = collectEvents();
+    const target = collectEvents();
+    router.registerConnection("conn-owner", owner.emit);
+    router.registerConnection("conn-target", target.emit);
+
+    const ownerChallenge = owner.events.find((event) => event.type === "auth_challenge");
+    const targetChallenge = target.events.find((event) => event.type === "auth_challenge");
+    if (!ownerChallenge || ownerChallenge.type !== "auth_challenge") throw new Error("owner auth_challenge missing");
+    if (!targetChallenge || targetChallenge.type !== "auth_challenge") throw new Error("target auth_challenge missing");
+
+    owner.events.length = 0;
+    target.events.length = 0;
+    router.handleMessage(createAuthProof({
+      challengeId: ownerChallenge.challengeId,
+      nonce: ownerChallenge.nonce,
+      principalId: "user:alice",
+    }), owner.emit, { connectionId: "conn-owner" });
+    router.handleMessage(createAuthProof({
+      challengeId: targetChallenge.challengeId,
+      nonce: targetChallenge.nonce,
+      principalId: "user:bob",
+    }), target.emit, { connectionId: "conn-target" });
+
+    owner.events.length = 0;
+    target.events.length = 0;
+    router.handleMessage({ type: "session_new" }, owner.emit, { connectionId: "conn-owner" });
+    await vi.waitFor(() => {
+      expect(owner.events.some((event) => event.type === "session_created")).toBe(true);
+    });
+    const created = owner.events.find((event) => event.type === "session_created");
+    if (!created || created.type !== "session_created") throw new Error("expected session_created");
+
+    owner.events.length = 0;
+    target.events.length = 0;
+    router.handleMessage({
+      type: "session_transfer_request",
+      sessionId: created.sessionId,
+      targetPrincipalId: "user:bob",
+      targetPrincipalType: "user",
+    }, owner.emit, { connectionId: "conn-owner" });
+    expect(target.events.some((event) => event.type === "session_transfer_requested")).toBe(true);
+
+    owner.events.length = 0;
+    target.events.length = 0;
+    router.handleMessage({
+      type: "session_transfer_dismiss",
+      sessionId: created.sessionId,
+    }, target.emit, { connectionId: "conn-target" });
+
+    const ownerDismiss = owner.events.find((event) => (
+      event.type === "session_transfer_updated" && event.state === "dismissed"
+    ));
+    const targetDismiss = target.events.find((event) => (
+      event.type === "session_transfer_updated" && event.state === "dismissed"
+    ));
+    expect(ownerDismiss).toBeDefined();
+    expect(targetDismiss).toBeDefined();
+
+    owner.events.length = 0;
+    router.handleMessage({
+      type: "prompt",
+      sessionId: created.sessionId,
+      text: "resume after dismiss",
+    }, owner.emit, { connectionId: "conn-owner" });
+    await vi.waitFor(() => {
+      expect((acpSession.prompt as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith("resume after dismiss", []);
+    });
+  });
+
+  it("expired transfer remains parked until owner prompt resumes", async () => {
+    const owner = collectEvents();
+    const target = collectEvents();
+    router.registerConnection("conn-owner", owner.emit);
+    router.registerConnection("conn-target", target.emit);
+
+    const ownerChallenge = owner.events.find((event) => event.type === "auth_challenge");
+    const targetChallenge = target.events.find((event) => event.type === "auth_challenge");
+    if (!ownerChallenge || ownerChallenge.type !== "auth_challenge") throw new Error("owner auth_challenge missing");
+    if (!targetChallenge || targetChallenge.type !== "auth_challenge") throw new Error("target auth_challenge missing");
+
+    owner.events.length = 0;
+    target.events.length = 0;
+    router.handleMessage(createAuthProof({
+      challengeId: ownerChallenge.challengeId,
+      nonce: ownerChallenge.nonce,
+      principalId: "user:alice",
+    }), owner.emit, { connectionId: "conn-owner" });
+    router.handleMessage(createAuthProof({
+      challengeId: targetChallenge.challengeId,
+      nonce: targetChallenge.nonce,
+      principalId: "user:bob",
+    }), target.emit, { connectionId: "conn-target" });
+
+    owner.events.length = 0;
+    target.events.length = 0;
+    router.handleMessage({ type: "session_new" }, owner.emit, { connectionId: "conn-owner" });
+    await vi.waitFor(() => {
+      expect(owner.events.some((event) => event.type === "session_created")).toBe(true);
+    });
+    const created = owner.events.find((event) => event.type === "session_created");
+    if (!created || created.type !== "session_created") throw new Error("expected session_created");
+
+    const nowSpy = vi.spyOn(Date, "now");
+    nowSpy.mockReturnValue(1_000_000);
+    router.handleMessage({
+      type: "session_transfer_request",
+      sessionId: created.sessionId,
+      targetPrincipalId: "user:bob",
+      targetPrincipalType: "user",
+      expiresInMs: 5_000,
+    }, owner.emit, { connectionId: "conn-owner" });
+
+    target.events.length = 0;
+    nowSpy.mockReturnValue(1_010_000);
+    router.handleMessage({
+      type: "session_transfer_accept",
+      sessionId: created.sessionId,
+    }, target.emit, { connectionId: "conn-target" });
+    nowSpy.mockRestore();
+
+    const expiredUpdate = target.events.find((event) => (
+      event.type === "session_transfer_updated" && event.state === "expired"
+    ));
+    expect(expiredUpdate).toBeDefined();
+    const expiredError = target.events.find((event) => event.type === "error");
+    expect(expiredError).toBeDefined();
+    if (expiredError?.type === "error") {
+      expect(expiredError.message).toMatch(/remains parked/i);
+    }
+
+    owner.events.length = 0;
+    router.handleMessage({
+      type: "prompt",
+      sessionId: created.sessionId,
+      text: "resume parked session",
+    }, owner.emit, { connectionId: "conn-owner" });
+    await vi.waitFor(() => {
+      expect((acpSession.prompt as ReturnType<typeof vi.fn>)).toHaveBeenCalledWith("resume parked session", []);
+    });
+    expect(owner.events.some((event) => (
+      event.type === "session_transfer_updated" && event.state === "cancelled"
+    ))).toBe(true);
+  });
+
   it("broadcasts session_transfer_requested to unverified channel multiplexer with matching owned principal session", async () => {
     let sessionCounter = 0;
     createAcpSessionMock.mockImplementation(async () => {

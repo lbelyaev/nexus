@@ -29,7 +29,17 @@ export interface SessionListRequestInput {
 
 export type UsageResultEvent = Extract<GatewayEvent, { type: "usage_result" }>;
 export type SessionTransferRequestedEvent = Extract<GatewayEvent, { type: "session_transfer_requested" }>;
+export type SessionTransferUpdatedEvent = Extract<GatewayEvent, { type: "session_transfer_updated" }>;
 export type SessionListEvent = Extract<GatewayEvent, { type: "session_list" }>;
+
+export interface PendingSessionTransfer {
+  sessionId: string;
+  fromPrincipalType: "user" | "service_account";
+  fromPrincipalId: string;
+  targetPrincipalType: "user" | "service_account";
+  targetPrincipalId: string;
+  expiresAt: string;
+}
 
 const createToolMatcher = (
   event: Extract<GatewayEvent, { type: "tool_end" }>,
@@ -55,6 +65,25 @@ const createToolMatcher = (
   return () => false;
 };
 
+const toPendingTransfer = (
+  event: SessionTransferRequestedEvent | SessionTransferUpdatedEvent,
+): PendingSessionTransfer | null => {
+  if (event.type === "session_transfer_updated" && event.state !== "requested") {
+    return null;
+  }
+  if (event.expiresAt === undefined) {
+    return null;
+  }
+  return {
+    sessionId: event.sessionId,
+    fromPrincipalType: event.fromPrincipalType,
+    fromPrincipalId: event.fromPrincipalId,
+    targetPrincipalType: event.targetPrincipalType,
+    targetPrincipalId: event.targetPrincipalId,
+    expiresAt: event.expiresAt,
+  };
+};
+
 export interface UseSessionResult {
   sessionId: string | null;
   sessionModel: string | null;
@@ -71,7 +100,7 @@ export interface UseSessionResult {
   authStatus: "unverified" | "verifying" | "verified" | "failed";
   authPrincipalType: "user" | "service_account" | null;
   authPrincipalId: string | null;
-  pendingSessionTransfers: SessionTransferRequestedEvent[];
+  pendingSessionTransfers: PendingSessionTransfer[];
   sessionList: SessionListEvent["sessions"];
   sessionListHasMore: boolean;
   sessionListNextCursor: string | null;
@@ -126,7 +155,7 @@ export const useSession = (
   const authStatusRef = useRef(authStatus);
   const authPrincipalTypeRef = useRef(authPrincipalType);
   const authPrincipalIdRef = useRef(authPrincipalId);
-  const [pendingSessionTransfers, setPendingSessionTransfers] = useState<SessionTransferRequestedEvent[]>([]);
+  const [pendingSessionTransfers, setPendingSessionTransfers] = useState<PendingSessionTransfer[]>([]);
   const [sessionList, setSessionList] = useState<SessionListEvent["sessions"]>([]);
   const [sessionListHasMore, setSessionListHasMore] = useState(false);
   const [sessionListNextCursor, setSessionListNextCursor] = useState<string | null>(null);
@@ -375,16 +404,37 @@ export const useSession = (
         ) {
           break;
         }
+        {
+          const pendingTransfer = toPendingTransfer(event);
+          if (!pendingTransfer) break;
+          setPendingSessionTransfers((prev) => {
+            const existingIndex = prev.findIndex((transfer) => transfer.sessionId === event.sessionId);
+            if (existingIndex >= 0) {
+              const next = [...prev];
+              next[existingIndex] = pendingTransfer;
+              return next;
+            }
+            return [...prev, pendingTransfer];
+          });
+        }
+        break;
+      case "session_transfer_updated": {
+        const pendingTransfer = toPendingTransfer(event);
+        if (!pendingTransfer) {
+          setPendingSessionTransfers((prev) => prev.filter((transfer) => transfer.sessionId !== event.sessionId));
+          break;
+        }
         setPendingSessionTransfers((prev) => {
           const existingIndex = prev.findIndex((transfer) => transfer.sessionId === event.sessionId);
           if (existingIndex >= 0) {
             const next = [...prev];
-            next[existingIndex] = event;
+            next[existingIndex] = pendingTransfer;
             return next;
           }
-          return [...prev, event];
+          return [...prev, pendingTransfer];
         });
         break;
+      }
       case "session_transferred": {
         setPendingSessionTransfers((prev) => prev.filter((transfer) => transfer.sessionId !== event.sessionId));
         const isTarget =
@@ -668,9 +718,12 @@ export const useSession = (
     (explicitSessionId?: string) => {
       const sid = explicitSessionId ?? pendingSessionTransfers[0]?.sessionId;
       if (!sid) return;
-      setPendingSessionTransfers((prev) => prev.filter((transfer) => transfer.sessionId !== sid));
+      sendMessage({
+        type: "session_transfer_dismiss",
+        sessionId: sid,
+      });
     },
-    [pendingSessionTransfers],
+    [pendingSessionTransfers, sendMessage],
   );
 
   const requestUsage = useCallback(

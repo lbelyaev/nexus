@@ -742,6 +742,77 @@ describe("useSession", () => {
     });
   });
 
+  it("dismissPendingSessionTransfer sends session_transfer_dismiss for selected transfer", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "auth_result",
+        ok: true,
+        principalType: "user",
+        principalId: "user:tui:abc",
+      });
+      result.current.handleEvent({
+        type: "session_transfer_requested",
+        sessionId: "sess-xfer",
+        fromPrincipalType: "user",
+        fromPrincipalId: "user:web:xyz",
+        targetPrincipalType: "user",
+        targetPrincipalId: "user:tui:abc",
+        expiresAt: "2026-01-01T00:00:00Z",
+      });
+    });
+
+    act(() => {
+      result.current.dismissPendingSessionTransfer();
+    });
+
+    expect(sendMessage).toHaveBeenCalledWith({
+      type: "session_transfer_dismiss",
+      sessionId: "sess-xfer",
+    });
+  });
+
+  it("session_transfer_updated clears pending transfer on terminal state", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "auth_result",
+        ok: true,
+        principalType: "user",
+        principalId: "user:tui:abc",
+      });
+      result.current.handleEvent({
+        type: "session_transfer_requested",
+        sessionId: "sess-xfer",
+        fromPrincipalType: "user",
+        fromPrincipalId: "user:web:xyz",
+        targetPrincipalType: "user",
+        targetPrincipalId: "user:tui:abc",
+        expiresAt: "2026-01-01T00:00:00Z",
+      });
+    });
+    expect(result.current.pendingSessionTransfers).toHaveLength(1);
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_transfer_updated",
+        sessionId: "sess-xfer",
+        fromPrincipalType: "user",
+        fromPrincipalId: "user:web:xyz",
+        targetPrincipalType: "user",
+        targetPrincipalId: "user:tui:abc",
+        state: "dismissed",
+        updatedAt: "2026-01-01T00:00:01Z",
+      });
+    });
+
+    expect(result.current.pendingSessionTransfers).toHaveLength(0);
+  });
+
   it("ignores transfer requests for a different authenticated principal", () => {
     const sendMessage = vi.fn();
     const { result } = renderHook(() => useSession(sendMessage));

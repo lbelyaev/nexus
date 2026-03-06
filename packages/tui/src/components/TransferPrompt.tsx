@@ -1,9 +1,9 @@
 import React from "react";
 import { Box, Text, useInput } from "ink";
-import type { SessionTransferRequestedEvent } from "@nexus/client-core";
+import type { PendingSessionTransfer } from "@nexus/client-core";
 
 export interface TransferPromptProps {
-  transfer: SessionTransferRequestedEvent | null;
+  transfer: PendingSessionTransfer | null;
   totalPending: number;
   onAccept: () => void;
   onDismiss: () => void;

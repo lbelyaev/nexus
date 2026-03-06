@@ -76,6 +76,10 @@ describe("isClientMessage", () => {
       type: "session_transfer_accept",
       sessionId: "s1",
     })).toBe(true);
+    expect(isClientMessage({
+      type: "session_transfer_dismiss",
+      sessionId: "s1",
+    })).toBe(true);
   });
 
   it("validates a memory_query message", () => {
@@ -181,6 +185,7 @@ describe("isClientMessage", () => {
       expiresInMs: 0,
     })).toBe(false);
     expect(isClientMessage({ type: "session_transfer_accept" })).toBe(false);
+    expect(isClientMessage({ type: "session_transfer_dismiss" })).toBe(false);
   });
 });
 
@@ -291,6 +296,17 @@ describe("isGatewayEvent", () => {
       expiresAt: "2026-01-01T00:01:00Z",
     })).toBe(true);
     expect(isGatewayEvent({
+      type: "session_transfer_updated",
+      sessionId: "s1",
+      fromPrincipalType: "user",
+      fromPrincipalId: "user:alice",
+      targetPrincipalType: "user",
+      targetPrincipalId: "user:bob",
+      state: "dismissed",
+      updatedAt: "2026-01-01T00:00:20Z",
+      reason: "target_dismissed",
+    })).toBe(true);
+    expect(isGatewayEvent({
       type: "session_transferred",
       sessionId: "s1",
       fromPrincipalType: "user",
@@ -299,6 +315,16 @@ describe("isGatewayEvent", () => {
       targetPrincipalId: "user:bob",
       transferredAt: "2026-01-01T00:00:30Z",
     })).toBe(true);
+    expect(isGatewayEvent({
+      type: "session_transfer_updated",
+      sessionId: "s1",
+      fromPrincipalType: "user",
+      fromPrincipalId: "user:alice",
+      targetPrincipalType: "user",
+      targetPrincipalId: "user:bob",
+      state: "unknown",
+      updatedAt: "2026-01-01T00:00:20Z",
+    })).toBe(false);
   });
 
   it("validates runtime_health", () => {

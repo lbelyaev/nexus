@@ -601,7 +601,7 @@ export const App = ({ url, token }: AppProps) => {
           return;
         }
         session.dismissPendingSessionTransfer(explicitSessionId);
-        setMessages((prev) => [...prev, { role: "system", text: `  Dismissed transfer prompt for session ${explicitSessionId}.` }]);
+        setMessages((prev) => [...prev, { role: "system", text: `  Dismissing transfer for session ${explicitSessionId}...` }]);
         return;
       }
 
@@ -1015,7 +1015,7 @@ export const App = ({ url, token }: AppProps) => {
         onDismiss={() => {
           if (!currentTransfer) return;
           session.dismissPendingSessionTransfer(currentTransfer.sessionId);
-          setMessages((prev) => [...prev, { role: "system", text: `  Dismissed transfer prompt for session ${currentTransfer.sessionId}.` }]);
+          setMessages((prev) => [...prev, { role: "system", text: `  Dismissing transfer for session ${currentTransfer.sessionId}...` }]);
         }}
       />
       <Input

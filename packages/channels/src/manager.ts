@@ -100,7 +100,16 @@ interface PendingSessionResume {
   previousSessionId?: string;
 }
 
-type PendingTransfer = Extract<GatewayEvent, { type: "session_transfer_requested" }>;
+type SessionTransferRequestedEvent = Extract<GatewayEvent, { type: "session_transfer_requested" }>;
+type SessionTransferUpdatedEvent = Extract<GatewayEvent, { type: "session_transfer_updated" }>;
+interface PendingTransfer {
+  sessionId: string;
+  fromPrincipalType: PrincipalType;
+  fromPrincipalId: string;
+  targetPrincipalType: PrincipalType;
+  targetPrincipalId: string;
+  expiresAt: string;
+}
 type AuthChallengeEvent = Extract<GatewayEvent, { type: "auth_challenge" }>;
 type AuthResultEvent = Extract<GatewayEvent, { type: "auth_result" }>;
 type UsageResultEvent = Extract<GatewayEvent, { type: "usage_result" }>;
@@ -178,6 +187,25 @@ const formatPrincipalDisplay = (
 const formatChannelError = (error: unknown): string => {
   if (error instanceof Error) return error.message;
   return String(error);
+};
+
+const toPendingTransfer = (
+  event: SessionTransferRequestedEvent | SessionTransferUpdatedEvent,
+): PendingTransfer | null => {
+  if (event.type === "session_transfer_updated" && event.state !== "requested") {
+    return null;
+  }
+  if (event.expiresAt === undefined) {
+    return null;
+  }
+  return {
+    sessionId: event.sessionId,
+    fromPrincipalType: event.fromPrincipalType,
+    fromPrincipalId: event.fromPrincipalId,
+    targetPrincipalType: event.targetPrincipalType,
+    targetPrincipalId: event.targetPrincipalId,
+    expiresAt: event.expiresAt,
+  };
 };
 
 const isGatewayDisconnectedMessage = (message: string): boolean =>
@@ -1363,11 +1391,34 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         await sendToConversation(message.adapterId, message.conversationId, `Usage: ${usagePrefix} dismiss [sessionId]`);
         return true;
       }
-      pendingTransfersBySession.delete(sessionId);
+      const pending = pendingTransfersBySession.get(sessionId);
+      if (
+        pending
+        && (
+          pending.targetPrincipalType !== resolvedPrincipal.principalType
+          || pending.targetPrincipalId !== resolvedPrincipal.principalId
+        )
+      ) {
+        await sendToConversation(
+          message.adapterId,
+          message.conversationId,
+          `Transfer ${sessionId} is targeted to ${formatPrincipalDisplay(pending.targetPrincipalType, pending.targetPrincipalId)}.`,
+        );
+        return true;
+      }
+      await ensureConnectionPrincipal(resolvedPrincipal.principalType, resolvedPrincipal.principalId);
+      gatewayClient.send({
+        type: "session_transfer_dismiss",
+        sessionId,
+      });
+      transferCommandRoutes.set(sessionId, {
+        adapterId: message.adapterId,
+        conversationId: message.conversationId,
+      });
       await sendToConversation(
         message.adapterId,
         message.conversationId,
-        `Dismissed transfer prompt for session ${sessionId}.`,
+        `Dismissing transfer for session ${sessionId}...`,
       );
       return true;
     }
@@ -1958,7 +2009,9 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         break;
       }
       case "session_transfer_requested": {
-        pendingTransfersBySession.set(event.sessionId, event);
+        const pendingTransfer = toPendingTransfer(event);
+        if (!pendingTransfer) break;
+        pendingTransfersBySession.set(event.sessionId, pendingTransfer);
         const bindings = Array.from(conversationBindings.values()).filter((binding) => (
           binding.principalType === event.targetPrincipalType
           && binding.principalId === event.targetPrincipalId
@@ -1985,6 +2038,28 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
                 `Use /session transfer accept ${event.sessionId} or /session transfer dismiss ${event.sessionId}`,
               ].join("\n");
           await sendToConversation(binding.adapterId, binding.conversationId, text, quickActions);
+        }
+        break;
+      }
+      case "session_transfer_updated": {
+        if (event.state === "requested") {
+          const pendingTransfer = toPendingTransfer(event);
+          if (!pendingTransfer) break;
+          pendingTransfersBySession.set(event.sessionId, pendingTransfer);
+          break;
+        }
+
+        pendingTransfersBySession.delete(event.sessionId);
+        const fallback = transferCommandRoutes.get(event.sessionId);
+        if (fallback) {
+          const stateLabel = event.state.replace(/_/g, " ");
+          const reasonSuffix = event.reason ? ` (${event.reason.replace(/_/g, " ")})` : "";
+          await sendToConversation(
+            fallback.adapterId,
+            fallback.conversationId,
+            `Transfer update for session ${event.sessionId}: ${stateLabel}${reasonSuffix}.`,
+          );
+          transferCommandRoutes.delete(event.sessionId);
         }
         break;
       }

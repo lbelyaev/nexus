@@ -1931,6 +1931,86 @@ describe("createChannelManager", () => {
     await manager.stop();
   });
 
+  it("forwards /session transfer dismiss to gateway and handles transfer update", async () => {
+    const { gatewayClient, handlers } = createMockGateway();
+    createGatewayClientMock.mockReturnValue(gatewayClient);
+    wireAuthFlow(gatewayClient, handlers);
+    const adapterFixture = createAdapter();
+
+    const manager = createChannelManager({
+      gatewayUrl: "ws://127.0.0.1:18800/ws",
+      token: "test-token",
+      adapters: [{ adapter: adapterFixture.adapter }],
+    });
+
+    await manager.start();
+    const context = adapterFixture.getContext();
+    expect(context).toBeDefined();
+
+    const prompt = context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-transfer-dismiss",
+      senderId: "user-1",
+      text: "seed session",
+    });
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith(expect.objectContaining({ type: "session_new" }));
+    });
+    handlers.onEvent?.({
+      type: "session_created",
+      sessionId: "gw-session-local",
+      runtimeId: "claude",
+      model: "claude-sonnet-4-6",
+      workspaceId: "default",
+    });
+    await prompt;
+
+    handlers.onEvent?.({
+      type: "session_transfer_requested",
+      sessionId: "gw-session-shared",
+      fromPrincipalType: "user",
+      fromPrincipalId: "user:web:user-1",
+      targetPrincipalType: "user",
+      targetPrincipalId: "user:telegram-test:user-1",
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+
+    await context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-transfer-dismiss",
+      senderId: "user-1",
+      text: "/session transfer dismiss gw-session-shared",
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith({
+        type: "session_transfer_dismiss",
+        sessionId: "gw-session-shared",
+      });
+    });
+
+    handlers.onEvent?.({
+      type: "session_transfer_updated",
+      sessionId: "gw-session-shared",
+      fromPrincipalType: "user",
+      fromPrincipalId: "user:web:user-1",
+      targetPrincipalType: "user",
+      targetPrincipalId: "user:telegram-test:user-1",
+      state: "dismissed",
+      updatedAt: new Date().toISOString(),
+      reason: "target_dismissed",
+    });
+
+    await vi.waitFor(() => {
+      expect(adapterFixture.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+        conversationId: "chat-transfer-dismiss",
+        text: "Transfer update for session gw-session-shared: dismissed (target dismissed).",
+      }));
+    });
+
+    await manager.stop();
+  });
+
   it("detaches source conversation session after transfer away", async () => {
     const { gatewayClient, handlers } = createMockGateway();
     createGatewayClientMock.mockReturnValue(gatewayClient);
