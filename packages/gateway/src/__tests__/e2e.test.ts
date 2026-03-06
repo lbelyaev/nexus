@@ -115,6 +115,46 @@ const waitForEvent = <T extends GatewayEvent["type"]>(
     check();
   });
 
+const waitForMatchingEvent = <T extends GatewayEvent["type"]>(
+  messages: string[],
+  type: T,
+  predicate: (event: Extract<GatewayEvent, { type: T }>) => boolean,
+  timeout = 2000,
+): Promise<Extract<GatewayEvent, { type: T }>> =>
+  new Promise((resolve, reject) => {
+    const start = Date.now();
+    const check = () => {
+      const deferred: string[] = [];
+      while (messages.length > 0) {
+        const next = messages.shift()!;
+        let parsed: GatewayEvent | null = null;
+        try {
+          parsed = JSON.parse(next) as GatewayEvent;
+        } catch {
+          deferred.push(next);
+          continue;
+        }
+        if (parsed.type === type && predicate(parsed as Extract<GatewayEvent, { type: T }>)) {
+          if (deferred.length > 0) {
+            messages.unshift(...deferred);
+          }
+          resolve(parsed as Extract<GatewayEvent, { type: T }>);
+          return;
+        }
+        deferred.push(next);
+      }
+      if (deferred.length > 0) {
+        messages.unshift(...deferred);
+      }
+      if (Date.now() - start > timeout) {
+        reject(new Error(`Timeout waiting for matching event: ${type}`));
+        return;
+      }
+      setTimeout(check, 10);
+    };
+    check();
+  });
+
 const sendAuthProof = async (
   ws: WebSocket,
   messages: string[],
@@ -436,6 +476,213 @@ describe("E2E: WS client -> Gateway -> mock ACP session -> events back", () => {
       await waitForClose(owner.ws);
       await waitForClose(target.ws);
     });
+
+    it("lets the owner resume a transfer-pending session by prompting", async () => {
+      const owner = await connectWs(port, TEST_TOKEN);
+      const target = await connectWs(port, TEST_TOKEN);
+
+      await sendAuthProof(owner.ws, owner.messages, "user:owner:resume-pending");
+      await sendAuthProof(target.ws, target.messages, "user:target:resume-pending");
+
+      owner.ws.send(JSON.stringify({ type: "session_new" }));
+      const created = await waitForEvent(owner.messages, "session_created");
+
+      owner.ws.send(JSON.stringify({
+        type: "session_transfer_request",
+        sessionId: created.sessionId,
+        targetPrincipalId: "user:target:resume-pending",
+      }));
+      const requestedForTarget = await waitForEvent(target.messages, "session_transfer_requested");
+      expect(requestedForTarget.sessionId).toBe(created.sessionId);
+      expect(stateStore.getSession(created.sessionId)?.parkedReason).toBe("transfer_pending");
+
+      owner.ws.send(JSON.stringify({
+        type: "prompt",
+        sessionId: created.sessionId,
+        text: "resume my own parked session",
+      }));
+
+      const ownerCancelled = await waitForMatchingEvent(
+        owner.messages,
+        "session_transfer_updated",
+        (event) => event.state === "cancelled",
+      );
+      const targetCancelled = await waitForMatchingEvent(
+        target.messages,
+        "session_transfer_updated",
+        (event) => event.state === "cancelled",
+      );
+      expect(ownerCancelled.state).toBe("cancelled");
+      expect(targetCancelled.state).toBe("cancelled");
+
+      const turnEnd = await waitForEvent(owner.messages, "turn_end");
+      expect(turnEnd.sessionId).toBe(created.sessionId);
+      expect(stateStore.getSessionTransfer(created.sessionId)).toBeNull();
+      expect(stateStore.getSession(created.sessionId)?.lifecycleState).toBe("live");
+      expect(stateStore.getSession(created.sessionId)?.principalId).toBe("user:owner:resume-pending");
+
+      owner.ws.close();
+      target.ws.close();
+      await waitForClose(owner.ws);
+      await waitForClose(target.ws);
+    });
+
+    it("lets the transfer target dismiss and return the session to the owner", async () => {
+      const owner = await connectWs(port, TEST_TOKEN);
+      const target = await connectWs(port, TEST_TOKEN);
+
+      await sendAuthProof(owner.ws, owner.messages, "user:owner:dismiss");
+      await sendAuthProof(target.ws, target.messages, "user:target:dismiss");
+
+      owner.ws.send(JSON.stringify({ type: "session_new" }));
+      const created = await waitForEvent(owner.messages, "session_created");
+
+      owner.ws.send(JSON.stringify({
+        type: "session_transfer_request",
+        sessionId: created.sessionId,
+        targetPrincipalId: "user:target:dismiss",
+      }));
+      await waitForEvent(target.messages, "session_transfer_requested");
+      expect(stateStore.getSession(created.sessionId)?.parkedReason).toBe("transfer_pending");
+
+      target.ws.send(JSON.stringify({
+        type: "session_transfer_dismiss",
+        sessionId: created.sessionId,
+      }));
+
+      const ownerDismissed = await waitForMatchingEvent(
+        owner.messages,
+        "session_transfer_updated",
+        (event) => event.state === "dismissed",
+      );
+      const targetDismissed = await waitForMatchingEvent(
+        target.messages,
+        "session_transfer_updated",
+        (event) => event.state === "dismissed",
+      );
+      expect(ownerDismissed.state).toBe("dismissed");
+      expect(targetDismissed.state).toBe("dismissed");
+      expect(stateStore.getSessionTransfer(created.sessionId)).toBeNull();
+      expect(stateStore.getSession(created.sessionId)?.lifecycleState).toBe("live");
+      expect(stateStore.getSession(created.sessionId)?.principalId).toBe("user:owner:dismiss");
+
+      owner.ws.send(JSON.stringify({
+        type: "prompt",
+        sessionId: created.sessionId,
+        text: "continue after dismiss",
+      }));
+      const turnEnd = await waitForEvent(owner.messages, "turn_end");
+      expect(turnEnd.sessionId).toBe(created.sessionId);
+
+      owner.ws.close();
+      target.ws.close();
+      await waitForClose(owner.ws);
+      await waitForClose(target.ws);
+    });
+
+    it("keeps an expired transfer parked until the owner resumes it", async () => {
+      const owner = await connectWs(port, TEST_TOKEN);
+      const target = await connectWs(port, TEST_TOKEN);
+
+      await sendAuthProof(owner.ws, owner.messages, "user:owner:expired");
+      await sendAuthProof(target.ws, target.messages, "user:target:expired");
+
+      owner.ws.send(JSON.stringify({ type: "session_new" }));
+      const created = await waitForEvent(owner.messages, "session_created");
+
+      const nowSpy = vi.spyOn(Date, "now");
+      try {
+        nowSpy.mockReturnValue(1_000_000);
+        owner.ws.send(JSON.stringify({
+          type: "session_transfer_request",
+          sessionId: created.sessionId,
+          targetPrincipalId: "user:target:expired",
+          expiresInMs: 5_000,
+        }));
+        await waitForEvent(target.messages, "session_transfer_requested");
+
+        nowSpy.mockReturnValue(1_010_000);
+        target.ws.send(JSON.stringify({
+          type: "session_transfer_accept",
+          sessionId: created.sessionId,
+        }));
+      } finally {
+        nowSpy.mockRestore();
+      }
+
+      const expiredUpdate = await waitForMatchingEvent(
+        target.messages,
+        "session_transfer_updated",
+        (event) => event.state === "expired",
+      );
+      expect(expiredUpdate.state).toBe("expired");
+      const expiredError = await waitForEvent(target.messages, "error");
+      expect(expiredError.message).toMatch(/remains parked/i);
+      expect(stateStore.getSession(created.sessionId)?.parkedReason).toBe("transfer_expired");
+
+      owner.ws.send(JSON.stringify({
+        type: "prompt",
+        sessionId: created.sessionId,
+        text: "resume after expiry",
+      }));
+
+      const cancelledUpdate = await waitForMatchingEvent(
+        owner.messages,
+        "session_transfer_updated",
+        (event) => event.state === "cancelled",
+      );
+      expect(cancelledUpdate.state).toBe("cancelled");
+      const turnEnd = await waitForEvent(owner.messages, "turn_end");
+      expect(turnEnd.sessionId).toBe(created.sessionId);
+      expect(stateStore.getSessionTransfer(created.sessionId)).toBeNull();
+      expect(stateStore.getSession(created.sessionId)?.lifecycleState).toBe("live");
+
+      owner.ws.close();
+      target.ws.close();
+      await waitForClose(owner.ws);
+      await waitForClose(target.ws);
+    });
+
+    it("rejects transfer accept and dismiss from a principal that is not the transfer target", async () => {
+      const owner = await connectWs(port, TEST_TOKEN);
+      const target = await connectWs(port, TEST_TOKEN);
+      const stranger = await connectWs(port, TEST_TOKEN);
+
+      await sendAuthProof(owner.ws, owner.messages, "user:owner:wrong-target");
+      await sendAuthProof(target.ws, target.messages, "user:target:wrong-target");
+      await sendAuthProof(stranger.ws, stranger.messages, "user:stranger:wrong-target");
+
+      owner.ws.send(JSON.stringify({ type: "session_new" }));
+      const created = await waitForEvent(owner.messages, "session_created");
+
+      owner.ws.send(JSON.stringify({
+        type: "session_transfer_request",
+        sessionId: created.sessionId,
+        targetPrincipalId: "user:target:wrong-target",
+      }));
+      await waitForEvent(target.messages, "session_transfer_requested");
+
+      stranger.ws.send(JSON.stringify({
+        type: "session_transfer_accept",
+        sessionId: created.sessionId,
+      }));
+      const acceptRejected = await waitForEvent(stranger.messages, "error");
+      expect(acceptRejected.message).toMatch(/does not match transfer target/i);
+
+      stranger.ws.send(JSON.stringify({
+        type: "session_transfer_dismiss",
+        sessionId: created.sessionId,
+      }));
+      const dismissRejected = await waitForEvent(stranger.messages, "error");
+      expect(dismissRejected.message).toMatch(/does not match transfer target/i);
+
+      owner.ws.close();
+      target.ws.close();
+      stranger.ws.close();
+      await waitForClose(owner.ws);
+      await waitForClose(target.ws);
+      await waitForClose(stranger.ws);
+    });
   });
 
   describe("restart recovery", () => {
@@ -622,6 +869,69 @@ describe("E2E: WS client -> Gateway -> mock ACP session -> events back", () => {
 
       conn.ws.close();
       await waitForClose(conn.ws);
+    });
+  });
+
+  describe("session authorization", () => {
+    it("rejects replay and lifecycle history queries from a non-owner principal", async () => {
+      const owner = await connectWs(port, TEST_TOKEN);
+      const other = await connectWs(port, TEST_TOKEN);
+
+      await sendAuthProof(owner.ws, owner.messages, "user:owner:authz");
+      await sendAuthProof(other.ws, other.messages, "user:other:authz");
+
+      owner.ws.send(JSON.stringify({ type: "session_new" }));
+      const created = await waitForEvent(owner.messages, "session_created");
+
+      owner.ws.send(JSON.stringify({
+        type: "prompt",
+        sessionId: created.sessionId,
+        text: "history for authz",
+      }));
+      await waitForEvent(owner.messages, "turn_end");
+
+      other.ws.send(JSON.stringify({
+        type: "session_replay",
+        sessionId: created.sessionId,
+      }));
+      const replayRejected = await waitForEvent(other.messages, "error");
+      expect(replayRejected.message).toMatch(/owned by another connection/i);
+
+      other.ws.send(JSON.stringify({
+        type: "session_lifecycle_query",
+        sessionId: created.sessionId,
+        limit: 5,
+      }));
+      const historyRejected = await waitForEvent(other.messages, "error");
+      expect(historyRejected.message).toMatch(/owned by another connection/i);
+
+      owner.ws.close();
+      other.ws.close();
+      await waitForClose(owner.ws);
+      await waitForClose(other.ws);
+    });
+
+    it("rejects takeover of a live session by another authenticated principal", async () => {
+      const owner = await connectWs(port, TEST_TOKEN);
+      const taker = await connectWs(port, TEST_TOKEN);
+
+      await sendAuthProof(owner.ws, owner.messages, "user:owner:live");
+      await sendAuthProof(taker.ws, taker.messages, "user:taker:live");
+
+      owner.ws.send(JSON.stringify({ type: "session_new" }));
+      const created = await waitForEvent(owner.messages, "session_created");
+
+      taker.ws.send(JSON.stringify({
+        type: "session_takeover",
+        sessionId: created.sessionId,
+      }));
+      const rejected = await waitForEvent(taker.messages, "error");
+      expect(rejected.message).toMatch(/not parked and cannot be taken over/i);
+
+      owner.ws.close();
+      taker.ws.close();
+      await waitForClose(owner.ws);
+      await waitForClose(taker.ws);
     });
   });
 });
