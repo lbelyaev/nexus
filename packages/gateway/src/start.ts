@@ -681,6 +681,7 @@ export const startGateway = async (configPath?: string) => {
     channelManager = createChannelManager({
       gatewayUrl: gatewayWsUrl,
       token: config.auth.token,
+      autoResumeOnUnboundPrompt: true,
       adapters: channelRegistrations,
       bindingStore: {
         getChannelBinding: (adapterId, conversationId) => stateStore.getChannelBinding(adapterId, conversationId),

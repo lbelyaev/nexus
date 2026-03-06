@@ -17,6 +17,7 @@ export interface ChannelManagerOptions {
   token: string;
   adapters: ChannelAdapterRegistration[];
   reconnectDelayMs?: number;
+  autoResumeOnUnboundPrompt?: boolean;
   logger?: LoggerLike;
   bindingStore?: {
     getChannelBinding: (adapterId: string, conversationId: string) => ChannelBindingRecord | null;
@@ -74,7 +75,8 @@ interface SessionMetadata {
   workspaceId?: string;
 }
 
-interface PendingSessionListRequest {
+interface PendingSessionListDisplayRequest {
+  kind: "display";
   adapterId: string;
   conversationId: string;
   principalType: PrincipalType;
@@ -83,6 +85,17 @@ interface PendingSessionListRequest {
   cursor?: string;
   activeSessionId?: string;
 }
+
+interface PendingSessionListProbeRequest {
+  kind: "probe";
+  principalType: PrincipalType;
+  principalId: string;
+  resolve: (sessions: SessionInfo[]) => void;
+  reject: (error: Error) => void;
+  timeout: ReturnType<typeof setTimeout>;
+}
+
+type PendingSessionListRequest = PendingSessionListDisplayRequest | PendingSessionListProbeRequest;
 
 interface SessionListPageState {
   principalType: PrincipalType;
@@ -98,6 +111,10 @@ interface PendingSessionResume {
   principalType: PrincipalType;
   principalId: string;
   previousSessionId?: string;
+  silent?: boolean;
+  resolve?: (sessionId: string) => void;
+  reject?: (error: Error) => void;
+  timeout?: ReturnType<typeof setTimeout>;
 }
 
 type SessionTransferRequestedEvent = Extract<GatewayEvent, { type: "session_transfer_requested" }>;
@@ -310,6 +327,9 @@ const STREAM_EDIT_FLUSH_MS = 350;
 const TYPING_PULSE_MS = 4_000;
 const AUTH_WAIT_TIMEOUT_MS = 10_000;
 const DEFAULT_SESSION_LIST_LIMIT = 10;
+const AUTO_RESUME_SESSION_LIST_LIMIT = 10;
+const AUTO_RESUME_LIST_TIMEOUT_MS = 1_500;
+const AUTO_RESUME_REPLAY_TIMEOUT_MS = 4_000;
 
 const compactApprovalTool = (tool: string): string => {
   const cleaned = tool.replace(/\s+/g, " ").trim();
@@ -368,6 +388,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     token,
     adapters,
     reconnectDelayMs = 1_500,
+    autoResumeOnUnboundPrompt = false,
     logger = createFallbackLogger(),
     bindingStore,
   } = options;
@@ -818,6 +839,19 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     Array.from(pendingApprovalsById.values()).filter((approval) => approval.sessionId === sessionId)
   );
 
+  const clearPendingSessionResume = (sessionId: string, error?: Error): PendingSessionResume | undefined => {
+    const pending = pendingSessionResumeBySession.get(sessionId);
+    if (!pending) return undefined;
+    pendingSessionResumeBySession.delete(sessionId);
+    if (pending.timeout) {
+      clearTimeout(pending.timeout);
+    }
+    if (error) {
+      pending.reject?.(error);
+    }
+    return pending;
+  };
+
   const sendApprovalPrompt = async (pending: PendingApproval, totalPendingForSession: number): Promise<void> => {
     const adapter = adapterById.get(pending.adapterId);
     const supportsQuickActions = adapter?.supportsQuickActions === true;
@@ -965,7 +999,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
   const clearSessionState = (sessionId: string): void => {
     sessionMetadataById.delete(sessionId);
     sessionInfoById.delete(sessionId);
-    pendingSessionResumeBySession.delete(sessionId);
+    clearPendingSessionResume(sessionId, new Error(`Session state cleared: ${sessionId}`));
     pendingTransfersBySession.delete(sessionId);
     transferCommandRoutes.delete(sessionId);
     streamBuffers.delete(sessionId);
@@ -1047,15 +1081,155 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     }
   };
 
+  const requestSessionListProbe = async (
+    principalType: PrincipalType,
+    principalId: string,
+  ): Promise<SessionInfo[]> => {
+    await ensureConnectionPrincipal(principalType, principalId);
+    return await new Promise<SessionInfo[]>((resolve, reject) => {
+      let request: PendingSessionListProbeRequest | null = null;
+      const timeout = setTimeout(() => {
+        const index = request ? pendingSessionListRequests.indexOf(request) : -1;
+        if (index >= 0) {
+          pendingSessionListRequests.splice(index, 1);
+        }
+        reject(new Error(`Timed out waiting for session list probe (${principalType}:${principalId}).`));
+      }, AUTO_RESUME_LIST_TIMEOUT_MS);
+      request = {
+        kind: "probe",
+        principalType,
+        principalId,
+        resolve: (sessions) => {
+          clearTimeout(timeout);
+          resolve(sessions);
+        },
+        reject: (error) => {
+          clearTimeout(timeout);
+          reject(error);
+        },
+        timeout,
+      };
+      pendingSessionListRequests.push(request);
+      try {
+        gatewayClient.send({
+          type: "session_list",
+          limit: AUTO_RESUME_SESSION_LIST_LIMIT,
+        });
+      } catch (error) {
+        const index = request ? pendingSessionListRequests.indexOf(request) : -1;
+        if (index >= 0) {
+          pendingSessionListRequests.splice(index, 1);
+        }
+        clearTimeout(timeout);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  };
+
+  const selectAutoResumeCandidate = (
+    sessions: SessionInfo[],
+    conversationKey: string,
+  ): SessionInfo | null => {
+    for (const session of sessions) {
+      if (session.lifecycleState === "closed") continue;
+      const boundConversationKey = sessionToConversation.get(session.id);
+      if (boundConversationKey && boundConversationKey !== conversationKey) continue;
+      return session;
+    }
+    return null;
+  };
+
+  const tryAutoResumeSession = async (
+    message: ChannelInboundMessage,
+    resolvedPrincipal: ReturnType<typeof resolveInboundPrincipal>,
+  ): Promise<string | null> => {
+    if (!autoResumeOnUnboundPrompt) return null;
+    const key = conversationKeyOf(message.adapterId, message.conversationId);
+    const { principalType, principalId } = resolvedPrincipal;
+
+    let sessions: SessionInfo[] = [];
+    try {
+      sessions = await requestSessionListProbe(principalType, principalId);
+    } catch (error) {
+      if (isGatewayDisconnectedError(error)) throw error;
+      logger.warn("channel_auto_resume_probe_failed", {
+        adapterId: message.adapterId,
+        conversationId: message.conversationId,
+        principalType,
+        principalId,
+        error: formatChannelError(error),
+      });
+      return null;
+    }
+
+    const candidate = selectAutoResumeCandidate(sessions, key);
+    if (!candidate) return null;
+    if (pendingSessionResumeBySession.has(candidate.id)) return null;
+
+    const resumedSessionId = await new Promise<string>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        clearPendingSessionResume(candidate.id, new Error(`Timed out auto-resuming session ${candidate.id}.`));
+      }, AUTO_RESUME_REPLAY_TIMEOUT_MS);
+      pendingSessionResumeBySession.set(candidate.id, {
+        adapterId: message.adapterId,
+        conversationId: message.conversationId,
+        principalType,
+        principalId,
+        silent: true,
+        resolve,
+        reject,
+        timeout,
+      });
+      try {
+        gatewayClient.send({
+          type: "session_replay",
+          sessionId: candidate.id,
+        });
+      } catch (error) {
+        clearPendingSessionResume(candidate.id, error instanceof Error ? error : new Error(String(error)));
+      }
+    }).catch((error: unknown) => {
+      if (isGatewayDisconnectedError(error)) throw error;
+      logger.warn("channel_auto_resume_replay_failed", {
+        adapterId: message.adapterId,
+        conversationId: message.conversationId,
+        principalType,
+        principalId,
+        sessionId: candidate.id,
+        error: formatChannelError(error),
+      });
+      return "";
+    });
+
+    if (!resumedSessionId) return null;
+    logger.info("channel_session_auto_resumed", {
+      adapterId: message.adapterId,
+      conversationId: message.conversationId,
+      sessionId: resumedSessionId,
+      principalType,
+      principalId,
+    });
+    return resumedSessionId;
+  };
+
   const ensureSession = async (
     message: ChannelInboundMessage,
     resolvedPrincipal = resolveInboundPrincipal(message),
+    options?: {
+      allowAutoResume?: boolean;
+    },
   ): Promise<string> => {
     const key = conversationKeyOf(message.adapterId, message.conversationId);
     const existing = conversationBindings.get(key);
     if (existing) return existing.sessionId;
     const persisted = loadPersistedBinding(message);
     if (persisted) return persisted.sessionId;
+    if (options?.allowAutoResume !== false) {
+      const resumedSessionId = await tryAutoResumeSession(message, resolvedPrincipal);
+      if (resumedSessionId) {
+        return resumedSessionId;
+      }
+    }
 
     let createdSessionId = "";
     await enqueueSessionCreation(async () => {
@@ -1459,7 +1633,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
       if (binding) {
         clearSessionState(binding.sessionId);
       }
-      await ensureSession(message, resolvedPrincipal);
+      await ensureSession(message, resolvedPrincipal, { allowAutoResume: false });
       return true;
     }
 
@@ -1531,6 +1705,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         }
         await ensureConnectionPrincipal(resolvedPrincipal.principalType, resolvedPrincipal.principalId);
         pendingSessionListRequests.push({
+          kind: "display",
           adapterId: message.adapterId,
           conversationId: message.conversationId,
           principalType: resolvedPrincipal.principalType,
@@ -2171,6 +2346,11 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         }
         const pending = pendingSessionListRequests.shift();
         if (!pending) break;
+        if (pending.kind === "probe") {
+          clearTimeout(pending.timeout);
+          pending.resolve(event.sessions);
+          break;
+        }
         const conversationKey = conversationKeyOf(pending.adapterId, pending.conversationId);
         sessionListStateByConversation.set(conversationKey, {
           principalType: pending.principalType,
@@ -2191,9 +2371,8 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         break;
       }
       case "transcript": {
-        const pending = pendingSessionResumeBySession.get(event.sessionId);
+        const pending = clearPendingSessionResume(event.sessionId);
         if (!pending) break;
-        pendingSessionResumeBySession.delete(event.sessionId);
         const info = sessionInfoById.get(event.sessionId);
         if (info) {
           const previous = sessionMetadataById.get(event.sessionId);
@@ -2211,20 +2390,23 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
           pending.principalId,
           sessionMetadataById.get(event.sessionId),
         );
-        await sendToConversation(
-          pending.adapterId,
-          pending.conversationId,
-          formatSessionBoundary("Session resumed", [
-            ...(pending.previousSessionId && pending.previousSessionId !== event.sessionId
-              ? [`previous=${pending.previousSessionId}`]
-              : []),
-            `current=${event.sessionId}`,
-            `runtime=${rebound.runtimeId ?? "default"}`,
-            `model=${rebound.model ?? "runtime-default"}`,
-            `workspace=${rebound.workspaceId ?? "default"}`,
-            `transcript_messages=${event.messages.length}`,
-          ]),
-        );
+        if (!pending.silent) {
+          await sendToConversation(
+            pending.adapterId,
+            pending.conversationId,
+            formatSessionBoundary("Session resumed", [
+              ...(pending.previousSessionId && pending.previousSessionId !== event.sessionId
+                ? [`previous=${pending.previousSessionId}`]
+                : []),
+              `current=${event.sessionId}`,
+              `runtime=${rebound.runtimeId ?? "default"}`,
+              `model=${rebound.model ?? "runtime-default"}`,
+              `workspace=${rebound.workspaceId ?? "default"}`,
+              `transcript_messages=${event.messages.length}`,
+            ]),
+          );
+        }
+        pending.resolve?.(event.sessionId);
         break;
       }
       case "usage_result":
@@ -2276,14 +2458,17 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         const conversationKey = sessionToConversation.get(event.sessionId);
         let binding = conversationKey ? conversationBindings.get(conversationKey) : undefined;
         if (!binding) {
-          const pendingResume = pendingSessionResumeBySession.get(event.sessionId);
+          const pendingResume = clearPendingSessionResume(event.sessionId);
           if (pendingResume) {
-            await sendToConversation(
-              pendingResume.adapterId,
-              pendingResume.conversationId,
-              formatUserFacingError(event.message),
-            );
-            pendingSessionResumeBySession.delete(event.sessionId);
+            const error = new Error(event.message);
+            pendingResume.reject?.(error);
+            if (!pendingResume.silent) {
+              await sendToConversation(
+                pendingResume.adapterId,
+                pendingResume.conversationId,
+                formatUserFacingError(event.message),
+              );
+            }
             return;
           }
           const fallback = transferCommandRoutes.get(event.sessionId);
@@ -2447,9 +2632,17 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
 
   gatewayClient.onClose(() => {
     logger.warn("channel_gateway_closed");
-    pendingSessionListRequests.length = 0;
+    while (pendingSessionListRequests.length > 0) {
+      const pending = pendingSessionListRequests.shift();
+      if (pending?.kind === "probe") {
+        clearTimeout(pending.timeout);
+        pending.reject(new Error("Gateway connection closed before session list probe completed."));
+      }
+    }
     sessionListStateByConversation.clear();
-    pendingSessionResumeBySession.clear();
+    for (const [sessionId] of pendingSessionResumeBySession) {
+      clearPendingSessionResume(sessionId, new Error("Gateway connection closed before session replay completed."));
+    }
     for (const sessionId of Array.from(runningTurns)) {
       stopTyping(sessionId);
     }
@@ -2486,9 +2679,17 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     },
     stop: async () => {
       running = false;
-      pendingSessionListRequests.length = 0;
+      while (pendingSessionListRequests.length > 0) {
+        const pending = pendingSessionListRequests.shift();
+        if (pending?.kind === "probe") {
+          clearTimeout(pending.timeout);
+          pending.reject(new Error("Channel manager stopped before session list probe completed."));
+        }
+      }
       sessionListStateByConversation.clear();
-      pendingSessionResumeBySession.clear();
+      for (const [sessionId] of pendingSessionResumeBySession) {
+        clearPendingSessionResume(sessionId, new Error("Channel manager stopped before session replay completed."));
+      }
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;

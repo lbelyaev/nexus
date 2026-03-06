@@ -1166,6 +1166,174 @@ describe("createChannelManager", () => {
     await manager.stop();
   });
 
+  it("auto-resumes an unbound conversation when enabled", async () => {
+    const { gatewayClient, handlers } = createMockGateway();
+    createGatewayClientMock.mockReturnValue(gatewayClient);
+    wireAuthFlow(gatewayClient, handlers);
+    const adapterFixture = createAdapter();
+
+    const manager = createChannelManager({
+      gatewayUrl: "ws://127.0.0.1:18800/ws",
+      token: "test-token",
+      autoResumeOnUnboundPrompt: true,
+      adapters: [{ adapter: adapterFixture.adapter }],
+    });
+
+    await manager.start();
+    const context = adapterFixture.getContext();
+    expect(context).toBeDefined();
+
+    const inboundPromise = context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-auto-resume",
+      senderId: "user-1",
+      text: "resume me",
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith({
+        type: "session_list",
+        limit: 10,
+      });
+    });
+
+    handlers.onEvent?.({
+      type: "session_list",
+      sessions: [{
+        id: "gw-session-candidate",
+        status: "idle",
+        lifecycleState: "parked",
+        parkedReason: "owner_disconnected",
+        model: "claude-sonnet-4-6",
+        workspaceId: "default",
+        principalType: "user",
+        principalId: "user:telegram-test:user-1",
+        createdAt: "2026-01-01T00:00:00Z",
+        lastActivityAt: "2026-01-01T00:10:00Z",
+      }],
+      hasMore: false,
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith({
+        type: "session_replay",
+        sessionId: "gw-session-candidate",
+      });
+    });
+
+    handlers.onEvent?.({
+      type: "transcript",
+      sessionId: "gw-session-candidate",
+      messages: [],
+    });
+
+    await inboundPromise;
+
+    expect(
+      gatewayClient.send.mock.calls.filter(
+        ([payload]) => (payload as { type?: string }).type === "session_new",
+      ),
+    ).toHaveLength(0);
+    expect(gatewayClient.send).toHaveBeenCalledWith({
+      type: "prompt",
+      sessionId: "gw-session-candidate",
+      text: "resume me",
+      images: undefined,
+    });
+
+    await manager.stop();
+  });
+
+  it("falls back to session_new when auto-resume replay fails", async () => {
+    const { gatewayClient, handlers } = createMockGateway();
+    createGatewayClientMock.mockReturnValue(gatewayClient);
+    wireAuthFlow(gatewayClient, handlers);
+    const adapterFixture = createAdapter();
+
+    const manager = createChannelManager({
+      gatewayUrl: "ws://127.0.0.1:18800/ws",
+      token: "test-token",
+      autoResumeOnUnboundPrompt: true,
+      adapters: [{ adapter: adapterFixture.adapter }],
+    });
+
+    await manager.start();
+    const context = adapterFixture.getContext();
+    expect(context).toBeDefined();
+
+    const inboundPromise = context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-auto-resume-fallback",
+      senderId: "user-1",
+      text: "fallback please",
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith({
+        type: "session_list",
+        limit: 10,
+      });
+    });
+
+    handlers.onEvent?.({
+      type: "session_list",
+      sessions: [{
+        id: "gw-session-stale",
+        status: "idle",
+        lifecycleState: "parked",
+        parkedReason: "runtime_timeout",
+        model: "claude-sonnet-4-6",
+        workspaceId: "default",
+        principalType: "user",
+        principalId: "user:telegram-test:user-1",
+        createdAt: "2026-01-01T00:00:00Z",
+        lastActivityAt: "2026-01-01T00:10:00Z",
+      }],
+      hasMore: false,
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith({
+        type: "session_replay",
+        sessionId: "gw-session-stale",
+      });
+    });
+
+    handlers.onEvent?.({
+      type: "error",
+      sessionId: "gw-session-stale",
+      message: "Session not found: gw-session-stale",
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: "session_new",
+      }));
+    });
+
+    handlers.onEvent?.({
+      type: "session_created",
+      sessionId: "gw-session-fresh",
+      runtimeId: "claude",
+      model: "claude-sonnet-4-6",
+      workspaceId: "default",
+      principalType: "user",
+      principalId: "user:telegram-test:user-1",
+      source: "api",
+    });
+
+    await inboundPromise;
+
+    expect(gatewayClient.send).toHaveBeenCalledWith({
+      type: "prompt",
+      sessionId: "gw-session-fresh",
+      text: "fallback please",
+      images: undefined,
+    });
+
+    await manager.stop();
+  });
+
   it("sends routed runtime/model/workspace on session creation", async () => {
     const { gatewayClient, handlers } = createMockGateway();
     createGatewayClientMock.mockReturnValue(gatewayClient);
