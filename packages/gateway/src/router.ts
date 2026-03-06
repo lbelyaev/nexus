@@ -11,9 +11,10 @@ import type {
   RuntimeHealthStatus,
   SessionLifecycleEventType,
   SessionLifecycleState,
+  SessionParkedReason,
   UsageSummary,
 } from "@nexus/types";
-import { estimateTokens } from "@nexus/types";
+import { estimateTokens, getSessionLifecycleNextState } from "@nexus/types";
 import { createHash, createPublicKey, randomBytes, verify } from "node:crypto";
 import type { SessionTransferRecord, StateStore } from "@nexus/state";
 import type { AcpSession } from "@nexus/acp-bridge";
@@ -98,6 +99,8 @@ interface SessionTransferRequest {
   createdAtMs: number;
   updatedAtMs: number;
 }
+
+type LifecycleActorRelation = "session_owner" | "transfer_source" | "transfer_target";
 
 interface ActivePromptTurn {
   executionId: string;
@@ -647,6 +650,7 @@ export const createRouter = (deps: RouterDeps): Router => {
     persistTransfer(transfer);
     applyLifecycleEvent(transfer.sessionId, "TRANSFER_EXPIRED", {
       parkedReason: "transfer_expired",
+      allowedParkedReasons: ["transfer_pending", "transfer_expired"],
       reason,
       actorPrincipalType: transfer.fromPrincipalType,
       actorPrincipalId: transfer.fromPrincipalId,
@@ -744,18 +748,147 @@ export const createRouter = (deps: RouterDeps): Router => {
     options?: {
       at?: string;
       reason?: string;
-      parkedReason?: "transfer_pending" | "transfer_expired" | "runtime_timeout" | "owner_disconnected" | "manual";
+      parkedReason?: SessionParkedReason;
       actorPrincipalType?: PrincipalType;
       actorPrincipalId?: string;
+      actorRelation?: LifecycleActorRelation;
+      allowedParkedReasons?: readonly SessionParkedReason[];
+      stateErrorMessage?: string;
+      authorizationErrorMessage?: string;
       metadata?: string;
       notifyEmit?: EventEmitter;
     },
-  ): void => {
+  ): boolean => {
+    const current = stateStore.getSession(sessionId);
+    if (!current) {
+      options?.notifyEmit?.({
+        type: "error",
+        sessionId,
+        message: options?.stateErrorMessage ?? `Session not found: ${sessionId}`,
+      });
+      log.warn("session_lifecycle_apply_failed", {
+        sessionId,
+        eventType,
+        reason: options?.reason ?? null,
+        error: "Session not found",
+      });
+      return false;
+    }
+
+    const currentState: SessionLifecycleState = current.lifecycleState ?? (
+      current.status === "active" ? "live" : "parked"
+    );
+    const nextState = getSessionLifecycleNextState(currentState, eventType);
+    if (!nextState) {
+      options?.notifyEmit?.({
+        type: "error",
+        sessionId,
+        message: options?.stateErrorMessage ?? `Session cannot apply ${eventType} while ${currentState}.`,
+      });
+      log.warn("session_lifecycle_apply_failed", {
+        sessionId,
+        eventType,
+        reason: options?.reason ?? null,
+        error: `Invalid lifecycle transition: ${currentState} -> ${eventType}`,
+      });
+      return false;
+    }
+
+    if (options?.allowedParkedReasons) {
+      if (currentState !== "parked") {
+        options.notifyEmit?.({
+          type: "error",
+          sessionId,
+          message: options.stateErrorMessage ?? `Session cannot apply ${eventType} while ${currentState}.`,
+        });
+        log.warn("session_lifecycle_apply_failed", {
+          sessionId,
+          eventType,
+          reason: options?.reason ?? null,
+          error: `Expected parked state, found ${currentState}`,
+        });
+        return false;
+      }
+      const currentParkedReason = current.parkedReason ?? "manual";
+      if (!options.allowedParkedReasons.includes(currentParkedReason)) {
+        options.notifyEmit?.({
+          type: "error",
+          sessionId,
+          message: options.stateErrorMessage ?? `Session cannot apply ${eventType} while parked for ${currentParkedReason}.`,
+        });
+        log.warn("session_lifecycle_apply_failed", {
+          sessionId,
+          eventType,
+          reason: options?.reason ?? null,
+          error: `Invalid parked reason for ${eventType}: ${currentParkedReason}`,
+        });
+        return false;
+      }
+    }
+
+    if (options?.actorRelation) {
+      const { actorPrincipalType, actorPrincipalId } = options;
+      if (!actorPrincipalType || !actorPrincipalId) {
+        log.warn("session_lifecycle_apply_failed", {
+          sessionId,
+          eventType,
+          reason: options?.reason ?? null,
+          error: `Missing actor principal for ${options.actorRelation}`,
+        });
+        return false;
+      }
+
+      let expectedPrincipalType: PrincipalType | null = null;
+      let expectedPrincipalId: string | null = null;
+      if (options.actorRelation === "session_owner") {
+        expectedPrincipalType = current.principalType;
+        expectedPrincipalId = current.principalId;
+      } else {
+        const transfer = sessionTransfers.get(sessionId);
+        if (!transfer) {
+          options.notifyEmit?.({
+            type: "error",
+            sessionId,
+            message: options.authorizationErrorMessage ?? `No pending transfer for lifecycle event ${eventType}.`,
+          });
+          log.warn("session_lifecycle_apply_failed", {
+            sessionId,
+            eventType,
+            reason: options?.reason ?? null,
+            error: `Missing transfer for ${options.actorRelation}`,
+          });
+          return false;
+        }
+        expectedPrincipalType =
+          options.actorRelation === "transfer_source"
+            ? transfer.fromPrincipalType
+            : transfer.targetPrincipalType;
+        expectedPrincipalId =
+          options.actorRelation === "transfer_source"
+            ? transfer.fromPrincipalId
+            : transfer.targetPrincipalId;
+      }
+
+      if (
+        actorPrincipalType !== expectedPrincipalType
+        || actorPrincipalId !== expectedPrincipalId
+      ) {
+        options.notifyEmit?.({
+          type: "error",
+          sessionId,
+          message: options.authorizationErrorMessage ?? `Authenticated principal is not allowed to apply ${eventType}.`,
+        });
+        log.warn("session_lifecycle_apply_failed", {
+          sessionId,
+          eventType,
+          reason: options?.reason ?? null,
+          error: `Actor mismatch for ${options.actorRelation}: ${actorPrincipalType}:${actorPrincipalId}`,
+        });
+        return false;
+      }
+    }
+
     try {
-      const previous = stateStore.getSession(sessionId);
-      const previousState: SessionLifecycleState = previous?.lifecycleState ?? (
-        previous?.status === "active" ? "live" : "parked"
-      );
       const updated = stateStore.applySessionLifecycleEvent(sessionId, {
         eventType,
         ...(options?.at ? { at: options.at } : {}),
@@ -772,8 +905,8 @@ export const createRouter = (deps: RouterDeps): Router => {
         type: "session_lifecycle",
         sessionId,
         eventType,
-        fromState: previousState,
-        toState: nextState,
+        fromState: currentState,
+        toState: updated.lifecycleState ?? nextState,
         at: options?.at ?? updated.lifecycleUpdatedAt ?? new Date().toISOString(),
         ...(options?.reason ? { reason: options.reason } : {}),
         ...(updated.parkedReason ? { parkedReason: updated.parkedReason } : {}),
@@ -787,6 +920,7 @@ export const createRouter = (deps: RouterDeps): Router => {
       for (const target of targets) {
         target(lifecycleEvent);
       }
+      return true;
     } catch (error) {
       log.warn("session_lifecycle_apply_failed", {
         sessionId,
@@ -794,6 +928,12 @@ export const createRouter = (deps: RouterDeps): Router => {
         reason: options?.reason ?? null,
         error: error instanceof Error ? error.message : String(error),
       });
+      options?.notifyEmit?.({
+        type: "error",
+        sessionId,
+        message: options?.stateErrorMessage ?? `Failed to apply ${eventType}.`,
+      });
+      return false;
     }
   };
 
@@ -1514,13 +1654,18 @@ export const createRouter = (deps: RouterDeps): Router => {
       updatedAtMs: nowMs,
     };
     persistTransfer(transfer);
-    applyLifecycleEvent(msg.sessionId, "TRANSFER_REQUESTED", {
+    if (!applyLifecycleEvent(msg.sessionId, "TRANSFER_REQUESTED", {
       parkedReason: "transfer_pending",
       reason: "transfer_requested",
+      actorRelation: "session_owner",
       actorPrincipalType: transfer.fromPrincipalType,
       actorPrincipalId: transfer.fromPrincipalId,
       notifyEmit: emit,
-    });
+      authorizationErrorMessage: "Authenticated principal does not own this session.",
+    })) {
+      deleteTransfer(msg.sessionId);
+      return;
+    }
 
     const requestedEvent: GatewayEvent = {
       type: "session_transfer_requested",
@@ -1604,14 +1749,20 @@ export const createRouter = (deps: RouterDeps): Router => {
       return;
     }
 
-    sessionOwners.set(msg.sessionId, emit);
-    deleteTransfer(msg.sessionId);
-    applyLifecycleEvent(msg.sessionId, "TRANSFER_ACCEPTED", {
+    if (!applyLifecycleEvent(msg.sessionId, "TRANSFER_ACCEPTED", {
       reason: "transfer_accepted",
+      actorRelation: "transfer_target",
+      allowedParkedReasons: ["transfer_pending"],
       actorPrincipalType: principal.principalType,
       actorPrincipalId: principal.principalId,
       notifyEmit: emit,
-    });
+      stateErrorMessage: "Pending transfer is no longer active.",
+      authorizationErrorMessage: "Connection principal does not match transfer target.",
+    })) {
+      return;
+    }
+    sessionOwners.set(msg.sessionId, emit);
+    deleteTransfer(msg.sessionId);
     emitTransferUpdated(transfer, "accepted", emit);
     sessionPrincipals.set(msg.sessionId, {
       principalType: principal.principalType,
@@ -1706,13 +1857,19 @@ export const createRouter = (deps: RouterDeps): Router => {
       return;
     }
 
-    deleteTransfer(msg.sessionId);
-    applyLifecycleEvent(msg.sessionId, "TRANSFER_DISMISSED", {
+    if (!applyLifecycleEvent(msg.sessionId, "TRANSFER_DISMISSED", {
       reason: transfer.state === "expired" ? "target_dismissed_after_expiry" : "target_dismissed",
+      actorRelation: "transfer_target",
+      allowedParkedReasons: ["transfer_pending", "transfer_expired"],
       actorPrincipalType: principal.principalType,
       actorPrincipalId: principal.principalId,
       notifyEmit: emit,
-    });
+      stateErrorMessage: "Pending transfer is no longer dismissible.",
+      authorizationErrorMessage: "Connection principal does not match transfer target.",
+    })) {
+      return;
+    }
+    deleteTransfer(msg.sessionId);
     emitTransferUpdated(transfer, "dismissed", emit, transfer.state === "expired" ? "target_dismissed_after_expiry" : "target_dismissed");
     log.info("session_transfer_dismissed", {
       connectionId,
@@ -1764,13 +1921,19 @@ export const createRouter = (deps: RouterDeps): Router => {
         });
         return;
       }
-      deleteTransfer(msg.sessionId);
-      applyLifecycleEvent(msg.sessionId, "OWNER_RESUMED", {
+      if (!applyLifecycleEvent(msg.sessionId, "OWNER_RESUMED", {
         reason: resolvedTransfer.state === "expired" ? "owner_resumed_after_expiry" : "owner_resumed",
+        actorRelation: "transfer_source",
+        allowedParkedReasons: ["transfer_pending", "transfer_expired"],
         actorPrincipalType: resolvedTransfer.fromPrincipalType,
         actorPrincipalId: resolvedTransfer.fromPrincipalId,
         notifyEmit: emit,
-      });
+        stateErrorMessage: "Session is parked due to pending transfer; only owner can resume.",
+        authorizationErrorMessage: "Session is parked due to pending transfer; only owner can resume.",
+      })) {
+        return;
+      }
+      deleteTransfer(msg.sessionId);
       emitTransferUpdated(
         resolvedTransfer,
         "cancelled",
@@ -1788,12 +1951,18 @@ export const createRouter = (deps: RouterDeps): Router => {
     } else {
       const persisted = stateStore.getSession(msg.sessionId);
       if (persisted?.lifecycleState === "parked") {
-        applyLifecycleEvent(msg.sessionId, "OWNER_RESUMED", {
+        if (!applyLifecycleEvent(msg.sessionId, "OWNER_RESUMED", {
           reason: "owner_prompt_resumed",
+          actorRelation: "session_owner",
+          allowedParkedReasons: ["owner_disconnected", "runtime_timeout", "manual"],
           actorPrincipalType: principal.principalType,
           actorPrincipalId: principal.principalId,
           notifyEmit: emit,
-        });
+          stateErrorMessage: "Session is not resumable from its current parked state.",
+          authorizationErrorMessage: "Authenticated principal does not own this session.",
+        })) {
+          return;
+        }
       }
     }
 
@@ -2544,6 +2713,16 @@ export const createRouter = (deps: RouterDeps): Router => {
       return;
     }
 
+    const persisted = stateStore.getSession(msg.sessionId);
+    if (persisted?.lifecycleState !== "parked") {
+      emit({
+        type: "error",
+        sessionId: msg.sessionId,
+        message: "Session is not parked and cannot be taken over.",
+      });
+      return;
+    }
+
     const ownership = ensureSessionOwner(sessionOwners, msg.sessionId, emit, {
       canClaimWhenUnowned: true,
     });
@@ -2574,14 +2753,17 @@ export const createRouter = (deps: RouterDeps): Router => {
       principal.principalId,
     );
 
-    const persisted = stateStore.getSession(msg.sessionId);
-    if (persisted?.lifecycleState === "parked") {
-      applyLifecycleEvent(msg.sessionId, "TAKEOVER", {
-        reason: "session_takeover",
-        actorPrincipalType: principal.principalType,
-        actorPrincipalId: principal.principalId,
-        notifyEmit: emit,
-      });
+    if (!applyLifecycleEvent(msg.sessionId, "TAKEOVER", {
+      reason: "session_takeover",
+      actorRelation: "session_owner",
+      allowedParkedReasons: ["owner_disconnected", "runtime_timeout", "manual", "transfer_expired"],
+      actorPrincipalType: principal.principalType,
+      actorPrincipalId: principal.principalId,
+      notifyEmit: emit,
+      stateErrorMessage: "Session is not parked and cannot be taken over.",
+      authorizationErrorMessage: "Authenticated principal does not own this session.",
+    })) {
+      return;
     }
     touchSession(msg.sessionId);
     const messages = stateStore.getTranscript(msg.sessionId);

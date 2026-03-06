@@ -1624,6 +1624,48 @@ describe("createRouter", () => {
     ))).toBe(true);
   });
 
+  it("session_takeover rejects non-parked sessions", async () => {
+    const seed = collectEvents();
+    router.handleMessage({
+      type: "session_new",
+      principalType: "user",
+      principalId: "user:alice",
+      source: "interactive",
+    }, seed.emit);
+
+    await vi.waitFor(() => {
+      expect(seed.events.some((event) => event.type === "session_created")).toBe(true);
+    });
+    const created = seed.events.find((event) => event.type === "session_created");
+    if (!created || created.type !== "session_created") throw new Error("expected session_created");
+
+    const owner = collectEvents();
+    router.registerConnection("conn-owner", owner.emit);
+    const ownerChallenge = owner.events.find((event) => event.type === "auth_challenge");
+    if (!ownerChallenge || ownerChallenge.type !== "auth_challenge") throw new Error("owner auth_challenge missing");
+
+    owner.events.length = 0;
+    router.handleMessage(createAuthProof({
+      challengeId: ownerChallenge.challengeId,
+      nonce: ownerChallenge.nonce,
+      principalId: "user:alice",
+    }), owner.emit, { connectionId: "conn-owner" });
+
+    owner.events.length = 0;
+    router.handleMessage({
+      type: "session_takeover",
+      sessionId: created.sessionId,
+    }, owner.emit, { connectionId: "conn-owner" });
+
+    expect(owner.events).toEqual([
+      {
+        type: "error",
+        sessionId: created.sessionId,
+        message: "Session is not parked and cannot be taken over.",
+      },
+    ]);
+  });
+
   it("rejects ownerless replay claims from different authenticated principal", async () => {
     const owner = collectEvents();
     const other = collectEvents();
