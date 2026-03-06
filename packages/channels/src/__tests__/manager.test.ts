@@ -333,6 +333,12 @@ describe("createChannelManager", () => {
       workspaceId: "default",
     });
     await inboundPromise;
+    handlers.onEvent?.({
+      type: "turn_end",
+      sessionId: "gw-session-invalidate",
+      stopReason: "end_turn",
+    });
+    adapterFixture.sendMessage.mockClear();
 
     handlers.onEvent?.({
       type: "session_invalidated",
@@ -344,9 +350,92 @@ describe("createChannelManager", () => {
     await vi.waitFor(() => {
       expect(adapterFixture.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
         conversationId: "chat-invalidate",
-        text: expect.stringContaining("Session runtime restarted"),
+        text: "Session runtime restarted. Transcript and memory are still available.",
       }));
     });
+
+    await manager.stop();
+  });
+
+  it("silently retries a pending prompt after runtime restart", async () => {
+    const { gatewayClient, handlers } = createMockGateway();
+    createGatewayClientMock.mockReturnValue(gatewayClient);
+    const adapterFixture = createAdapter();
+
+    const manager = createChannelManager({
+      gatewayUrl: "ws://127.0.0.1:18800/ws",
+      token: "test-token",
+      adapters: [{ adapter: adapterFixture.adapter }],
+    });
+
+    await manager.start();
+    const context = adapterFixture.getContext();
+    expect(context).toBeDefined();
+
+    const inboundPromise = context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-invalidate-retry",
+      senderId: "user-1",
+      text: "hello",
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith(expect.objectContaining({ type: "session_new" }));
+    });
+
+    handlers.onEvent?.({
+      type: "session_created",
+      sessionId: "gw-session-invalidate-retry",
+      runtimeId: "claude",
+      model: "claude-sonnet-4-6",
+      workspaceId: "default",
+    });
+    await inboundPromise;
+
+    gatewayClient.send.mockClear();
+    adapterFixture.sendMessage.mockClear();
+
+    void context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-invalidate-retry",
+      senderId: "user-1",
+      text: "retry me",
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith({
+        type: "prompt",
+        sessionId: "gw-session-invalidate-retry",
+        text: "retry me",
+        images: undefined,
+      });
+    });
+
+    handlers.onEvent?.({
+      type: "session_invalidated",
+      sessionId: "gw-session-invalidate-retry",
+      reason: "runtime_state_lost",
+      message: "Session runtime state was lost after restart and cold-restored.",
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledTimes(2);
+      expect(gatewayClient.send).toHaveBeenLastCalledWith({
+        type: "prompt",
+        sessionId: "gw-session-invalidate-retry",
+        text: "retry me",
+        images: undefined,
+      });
+    });
+
+    expect(adapterFixture.sendMessage).not.toHaveBeenCalledWith(expect.objectContaining({
+      conversationId: "chat-invalidate-retry",
+      text: "Session runtime restarted. Transcript and memory are still available.",
+    }));
+    expect(adapterFixture.sendMessage).not.toHaveBeenCalledWith(expect.objectContaining({
+      conversationId: "chat-invalidate-retry",
+      text: "Retrying your last message once after runtime restart...",
+    }));
 
     await manager.stop();
   });

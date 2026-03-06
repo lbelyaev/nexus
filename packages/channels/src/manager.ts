@@ -1346,17 +1346,6 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
       throw new Error(`Failed to create session for ${key}`);
     }
 
-    await sendToConversation(
-      resolved.adapterId,
-      resolved.conversationId,
-      formatSessionBoundary("Session started", [
-        `session=${resolved.sessionId}`,
-        `runtime=${resolved.runtimeId ?? "default"}`,
-        `model=${resolved.model ?? "runtime-default"}`,
-        `workspace=${resolved.workspaceId ?? "default"}`,
-      ]),
-    );
-
     return resolved.sessionId;
   };
 
@@ -2428,11 +2417,13 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
           await sendToConversation(
             binding.adapterId,
             binding.conversationId,
-            formatSessionBoundary("Session attached to this conversation", [
-              ...(replacedSessionId && replacedSessionId !== event.sessionId ? [`previous=${replacedSessionId}`] : []),
-              `current=${event.sessionId}`,
-              `from=${formatPrincipalDisplay(event.fromPrincipalType, event.fromPrincipalId)}`,
-            ]),
+            [
+              `Session attached: ${event.sessionId}.`,
+              ...(replacedSessionId && replacedSessionId !== event.sessionId
+                ? [`Previous session: ${replacedSessionId}.`]
+                : []),
+              `From ${formatPrincipalDisplay(event.fromPrincipalType, event.fromPrincipalId)}.`,
+            ].join(" "),
           );
         }
         break;
@@ -2503,16 +2494,12 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
           await sendToConversation(
             pending.adapterId,
             pending.conversationId,
-            formatSessionBoundary("Session resumed", [
+            [
+              `Session resumed: ${event.sessionId}.`,
               ...(pending.previousSessionId && pending.previousSessionId !== event.sessionId
-                ? [`previous=${pending.previousSessionId}`]
+                ? [`Previous session: ${pending.previousSessionId}.`]
                 : []),
-              `current=${event.sessionId}`,
-              `runtime=${rebound.runtimeId ?? "default"}`,
-              `model=${rebound.model ?? "runtime-default"}`,
-              `workspace=${rebound.workspaceId ?? "default"}`,
-              `transcript_messages=${event.messages.length}`,
-            ]),
+            ].join(" "),
           );
         }
         pending.resolve?.(event.sessionId);
@@ -2542,22 +2529,15 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         if (!binding) break;
         const conversationKey = conversationKeyOf(binding.adapterId, binding.conversationId);
         const hasQueuedReconnectPrompt = (queuedPromptsByConversation.get(conversationKey)?.length ?? 0) > 0;
-        if (!hasQueuedReconnectPrompt) {
+        const shouldRetryPendingPrompt = Boolean(pending && pending.retryCount < 1);
+        if (!hasQueuedReconnectPrompt && !shouldRetryPendingPrompt) {
           await sendToConversation(
             binding.adapterId,
             binding.conversationId,
-            formatSessionBoundary("Session runtime restarted", [
-              `session=${event.sessionId}`,
-              "Runtime context was reset. Transcript and memory are still available.",
-            ]),
+            "Session runtime restarted. Transcript and memory are still available.",
           );
         }
-        if (pending && pending.retryCount < 1) {
-          await sendToConversation(
-            binding.adapterId,
-            binding.conversationId,
-            "Retrying your last message once after runtime restart...",
-          );
+        if (shouldRetryPendingPrompt && pending) {
           await sendPrompt(pending.message, pending.retryCount + 1);
         }
         break;
