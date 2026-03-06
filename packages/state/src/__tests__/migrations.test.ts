@@ -170,6 +170,42 @@ describe("initDatabase", () => {
     expect(() => initDatabase(db)).not.toThrow();
   });
 
+  it("upgrades a legacy sessions table before creating indexes on new columns", () => {
+    db.exec(`
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY,
+        runtimeId TEXT NOT NULL,
+        acpSessionId TEXT NOT NULL,
+        status TEXT NOT NULL,
+        createdAt TEXT NOT NULL,
+        lastActivityAt TEXT NOT NULL,
+        tokenInput INTEGER NOT NULL DEFAULT 0,
+        tokenOutput INTEGER NOT NULL DEFAULT 0,
+        model TEXT NOT NULL
+      );
+    `);
+
+    expect(() => initDatabase(db)).not.toThrow();
+
+    const columns = db
+      .prepare("PRAGMA table_info(sessions)")
+      .all() as Array<{ name: string }>;
+    const columnNames = columns.map((column) => column.name);
+    expect(columnNames).toContain("principalType");
+    expect(columnNames).toContain("principalId");
+    expect(columnNames).toContain("lifecycleState");
+    expect(columnNames).toContain("workspaceId");
+
+    const indexes = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL AND tbl_name = 'sessions'",
+      )
+      .all() as Array<{ name: string }>;
+    const indexNames = indexes.map((index) => index.name);
+    expect(indexNames).toContain("idx_sessions_lifecycleState");
+    expect(indexNames).toContain("idx_sessions_principal_lastActivity_id");
+  });
+
   it("creates indexes for sessions, audit, transcript, and memory", () => {
     initDatabase(db);
 

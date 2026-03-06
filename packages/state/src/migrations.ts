@@ -41,8 +41,6 @@ export const initDatabase = (db: DatabaseAdapter): void => {
     CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
     CREATE INDEX IF NOT EXISTS idx_sessions_lastActivity_id
       ON sessions(lastActivityAt DESC, id DESC);
-    CREATE INDEX IF NOT EXISTS idx_sessions_principal_lastActivity_id
-      ON sessions(principalType, principalId, lastActivityAt DESC, id DESC);
 
     CREATE TABLE IF NOT EXISTS transcript_messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -151,10 +149,6 @@ export const initDatabase = (db: DatabaseAdapter): void => {
       ON executions(sessionId, idempotencyKey);
     CREATE INDEX IF NOT EXISTS idx_channel_bindings_sessionId
       ON channel_bindings(sessionId);
-    CREATE INDEX IF NOT EXISTS idx_channel_bindings_principal
-      ON channel_bindings(principalType, principalId, updatedAt DESC);
-    CREATE INDEX IF NOT EXISTS idx_sessions_lifecycleState
-      ON sessions(lifecycleState);
     CREATE INDEX IF NOT EXISTS idx_session_lifecycle_events_session_createdAt
       ON session_lifecycle_events(sessionId, createdAt DESC, id DESC);
     CREATE INDEX IF NOT EXISTS idx_session_lifecycle_events_eventType_createdAt
