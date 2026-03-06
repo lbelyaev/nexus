@@ -56,7 +56,9 @@ const wireAuthFlow = (
   handlers: GatewayHandlers,
 ) => {
   let challengeCounter = 1;
+  const baseSend = gatewayClient.send.getMockImplementation();
   gatewayClient.send.mockImplementation((payload: unknown) => {
+    baseSend?.(payload);
     const message = payload as {
       type?: string;
       principalType?: "user" | "service_account";
@@ -185,8 +187,21 @@ describe("createChannelManager", () => {
   });
 
   it("restores persisted conversation bindings and reuses session after restart", async () => {
-    const { gatewayClient } = createMockGateway();
+    const { gatewayClient, handlers } = createMockGateway();
     createGatewayClientMock.mockReturnValue(gatewayClient);
+    wireAuthFlow(gatewayClient, handlers);
+    const baseSend = gatewayClient.send.getMockImplementation();
+    gatewayClient.send.mockImplementation((payload: unknown) => {
+      baseSend?.(payload);
+      const message = payload as { type?: string; sessionId?: string };
+      if (message.type === "session_lifecycle_query" && message.sessionId === "gw-session-persisted") {
+        handlers.onEvent?.({
+          type: "session_lifecycle_result",
+          sessionId: "gw-session-persisted",
+          events: [],
+        });
+      }
+    });
     const adapterFixture = createAdapter();
     const bindingStore = {
       getChannelBinding: vi.fn(() => ({
@@ -228,6 +243,11 @@ describe("createChannelManager", () => {
 
     expect(bindingStore.getChannelBinding).toHaveBeenCalledWith("telegram-test", "chat-persisted");
     expect(gatewayClient.send).toHaveBeenCalledWith({
+      type: "session_lifecycle_query",
+      sessionId: "gw-session-persisted",
+      limit: 1,
+    });
+    expect(gatewayClient.send).toHaveBeenCalledWith({
       type: "prompt",
       sessionId: "gw-session-persisted",
       text: "continue",
@@ -246,6 +266,120 @@ describe("createChannelManager", () => {
       text: "/new",
     });
     expect(bindingStore.deleteChannelBinding).toHaveBeenCalledWith("telegram-test", "chat-persisted");
+
+    await manager.stop();
+  });
+
+  it("drops stale persisted bindings and auto-resumes the latest resumable session", async () => {
+    const { gatewayClient, handlers } = createMockGateway();
+    createGatewayClientMock.mockReturnValue(gatewayClient);
+    wireAuthFlow(gatewayClient, handlers);
+    const baseSend = gatewayClient.send.getMockImplementation();
+    gatewayClient.send.mockImplementation((payload: unknown) => {
+      baseSend?.(payload);
+      const message = payload as { type?: string; sessionId?: string; limit?: number };
+      if (message.type === "session_lifecycle_query" && message.sessionId === "gw-session-stale") {
+        handlers.onEvent?.({
+          type: "error",
+          sessionId: "gw-session-stale",
+          message: "Session is owned by another connection",
+        });
+        return;
+      }
+      if (message.type === "session_list" && message.limit === 10) {
+        handlers.onEvent?.({
+          type: "session_list",
+          sessions: [
+            {
+              id: "gw-session-fresh",
+              status: "active",
+              lifecycleState: "parked",
+              parkedReason: "owner_disconnected",
+              model: "claude-sonnet-4-6",
+              workspaceId: "default",
+              principalType: "user",
+              principalId: "user:telegram-test:user-1",
+              source: "api",
+              createdAt: "2026-03-01T00:00:00.000Z",
+              lastActivityAt: "2026-03-04T01:00:00.000Z",
+            },
+          ],
+        });
+        return;
+      }
+      if (message.type === "session_replay" && message.sessionId === "gw-session-fresh") {
+        handlers.onEvent?.({
+          type: "transcript",
+          sessionId: "gw-session-fresh",
+          messages: [],
+        });
+      }
+    });
+    const adapterFixture = createAdapter();
+    const bindingStore = {
+      getChannelBinding: vi.fn(() => ({
+        adapterId: "telegram-test",
+        conversationId: "chat-stale",
+        sessionId: "gw-session-stale",
+        principalType: "user" as const,
+        principalId: "user:telegram-test:user-1",
+        runtimeId: "claude",
+        model: "claude-sonnet-4-6",
+        workspaceId: "default",
+        typingIndicator: true,
+        streamingMode: "off" as const,
+        steeringMode: "off" as const,
+        createdAt: "2026-01-01T00:00:00Z",
+        updatedAt: "2026-01-01T00:05:00Z",
+      })),
+      upsertChannelBinding: vi.fn(),
+      deleteChannelBinding: vi.fn(),
+    };
+
+    const manager = createChannelManager({
+      gatewayUrl: "ws://127.0.0.1:18800/ws",
+      token: "test-token",
+      adapters: [{ adapter: adapterFixture.adapter }],
+      bindingStore,
+      autoResumeOnUnboundPrompt: true,
+    });
+
+    await manager.start();
+    const context = adapterFixture.getContext();
+    expect(context).toBeDefined();
+
+    await context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-stale",
+      senderId: "user-1",
+      text: "continue from latest",
+    });
+
+    expect(gatewayClient.send).toHaveBeenCalledWith({
+      type: "session_lifecycle_query",
+      sessionId: "gw-session-stale",
+      limit: 1,
+    });
+    expect(gatewayClient.send).toHaveBeenCalledWith({
+      type: "session_list",
+      limit: 10,
+    });
+    expect(gatewayClient.send).toHaveBeenCalledWith({
+      type: "session_replay",
+      sessionId: "gw-session-fresh",
+    });
+    expect(gatewayClient.send).toHaveBeenCalledWith({
+      type: "prompt",
+      sessionId: "gw-session-fresh",
+      text: "continue from latest",
+      images: undefined,
+    });
+    expect(bindingStore.deleteChannelBinding).toHaveBeenCalledWith("telegram-test", "chat-stale");
+    expect(
+      gatewayClient.send.mock.calls.filter(
+        ([payload]) => (payload as { type?: string }).type === "session_new",
+      ),
+    ).toHaveLength(0);
 
     await manager.stop();
   });

@@ -114,10 +114,23 @@ interface SessionListPageState {
 }
 
 interface PendingSessionLifecycleRequest {
+  kind: "display";
   adapterId: string;
   conversationId: string;
   sessionId: string;
 }
+
+interface PendingSessionLifecycleProbeRequest {
+  kind: "probe";
+  sessionId: string;
+  resolve: () => void;
+  reject: (error: Error) => void;
+  timeout: ReturnType<typeof setTimeout>;
+}
+
+type PendingSessionLifecycleRequestEntry =
+  | PendingSessionLifecycleRequest
+  | PendingSessionLifecycleProbeRequest;
 
 interface PendingSessionResume {
   adapterId: string;
@@ -470,7 +483,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
   const pendingTransfersBySession = new Map<string, PendingTransfer>();
   const transferCommandRoutes = new Map<string, { adapterId: string; conversationId: string }>();
   const pendingSessionListRequests: PendingSessionListRequest[] = [];
-  const pendingSessionLifecycleRequests: PendingSessionLifecycleRequest[] = [];
+  const pendingSessionLifecycleRequests: PendingSessionLifecycleRequestEntry[] = [];
   const sessionListStateByConversation = new Map<string, SessionListPageState>();
   const pendingSessionResumeBySession = new Map<string, PendingSessionResume>();
   const sessionInfoById = new Map<string, SessionInfo>();
@@ -525,7 +538,10 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     }
   };
 
-  const loadPersistedBinding = (message: ChannelInboundMessage): ConversationBinding | null => {
+  const loadPersistedBinding = (
+    message: ChannelInboundMessage,
+    options?: { attach?: boolean },
+  ): ConversationBinding | null => {
     if (!bindingStore) return null;
     try {
       const persisted = bindingStore.getChannelBinding(message.adapterId, message.conversationId);
@@ -545,21 +561,23 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         createdAt: persisted.createdAt,
         updatedAt: persisted.updatedAt,
       };
-      const key = conversationKeyOf(message.adapterId, message.conversationId);
-      conversationBindings.set(key, binding);
-      sessionToConversation.set(binding.sessionId, key);
-      if (binding.runtimeId || binding.model || binding.workspaceId) {
-        sessionMetadataById.set(binding.sessionId, {
-          runtimeId: binding.runtimeId,
-          model: binding.model,
-          workspaceId: binding.workspaceId,
+      if (options?.attach !== false) {
+        const key = conversationKeyOf(message.adapterId, message.conversationId);
+        conversationBindings.set(key, binding);
+        sessionToConversation.set(binding.sessionId, key);
+        if (binding.runtimeId || binding.model || binding.workspaceId) {
+          sessionMetadataById.set(binding.sessionId, {
+            runtimeId: binding.runtimeId,
+            model: binding.model,
+            workspaceId: binding.workspaceId,
+          });
+        }
+        logger.info("channel_session_binding_restored", {
+          adapterId: binding.adapterId,
+          conversationId: binding.conversationId,
+          sessionId: binding.sessionId,
         });
       }
-      logger.info("channel_session_binding_restored", {
-        adapterId: binding.adapterId,
-        conversationId: binding.conversationId,
-        sessionId: binding.sessionId,
-      });
       return binding;
     } catch (error) {
       logger.warn("channel_binding_restore_failed", {
@@ -909,6 +927,16 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     return pending;
   };
 
+  const rejectPendingSessionLifecycleProbes = (error: Error): void => {
+    for (let index = pendingSessionLifecycleRequests.length - 1; index >= 0; index -= 1) {
+      const pending = pendingSessionLifecycleRequests[index];
+      if (!pending || pending.kind !== "probe") continue;
+      pendingSessionLifecycleRequests.splice(index, 1);
+      clearTimeout(pending.timeout);
+      pending.reject(error);
+    }
+  };
+
   const sendApprovalPrompt = async (pending: PendingApproval, totalPendingForSession: number): Promise<void> => {
     const adapter = adapterById.get(pending.adapterId);
     const supportsQuickActions = adapter?.supportsQuickActions === true;
@@ -1183,6 +1211,52 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     });
   };
 
+  const requestSessionLifecycleProbe = async (
+    sessionId: string,
+    principalType: PrincipalType,
+    principalId: string,
+  ): Promise<void> => {
+    await ensureConnectionPrincipal(principalType, principalId);
+    return await new Promise<void>((resolve, reject) => {
+      let request: PendingSessionLifecycleProbeRequest | null = null;
+      const timeout = setTimeout(() => {
+        const index = request ? pendingSessionLifecycleRequests.indexOf(request) : -1;
+        if (index >= 0) {
+          pendingSessionLifecycleRequests.splice(index, 1);
+        }
+        reject(new Error(`Timed out waiting for session lifecycle probe (${sessionId}).`));
+      }, AUTO_RESUME_REPLAY_TIMEOUT_MS);
+      request = {
+        kind: "probe",
+        sessionId,
+        resolve: () => {
+          clearTimeout(timeout);
+          resolve();
+        },
+        reject: (error) => {
+          clearTimeout(timeout);
+          reject(error);
+        },
+        timeout,
+      };
+      pendingSessionLifecycleRequests.push(request);
+      try {
+        gatewayClient.send({
+          type: "session_lifecycle_query",
+          sessionId,
+          limit: 1,
+        });
+      } catch (error) {
+        const index = request ? pendingSessionLifecycleRequests.indexOf(request) : -1;
+        if (index >= 0) {
+          pendingSessionLifecycleRequests.splice(index, 1);
+        }
+        clearTimeout(timeout);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  };
+
   const selectAutoResumeCandidate = (
     sessions: SessionInfo[],
     conversationKey: string,
@@ -1269,6 +1343,83 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     return resumedSessionId;
   };
 
+  const deletePersistedBinding = (binding: ConversationBinding): void => {
+    sessionMetadataById.delete(binding.sessionId);
+    sessionInfoById.delete(binding.sessionId);
+    try {
+      bindingStore?.deleteChannelBinding(binding.adapterId, binding.conversationId);
+    } catch (error) {
+      logger.warn("channel_binding_delete_failed", {
+        adapterId: binding.adapterId,
+        conversationId: binding.conversationId,
+        sessionId: binding.sessionId,
+        error: formatChannelError(error),
+      });
+    }
+  };
+
+  const reconcilePersistedBinding = async (
+    message: ChannelInboundMessage,
+    resolvedPrincipal: ReturnType<typeof resolveInboundPrincipal>,
+  ): Promise<ConversationBinding | null> => {
+    const persisted = loadPersistedBinding(message, { attach: false });
+    if (!persisted) return null;
+    if (
+      persisted.principalType !== resolvedPrincipal.principalType
+      || persisted.principalId !== resolvedPrincipal.principalId
+    ) {
+      logger.info("channel_binding_principal_mismatch", {
+        adapterId: message.adapterId,
+        conversationId: message.conversationId,
+        sessionId: persisted.sessionId,
+        bindingPrincipalId: persisted.principalId,
+        senderPrincipalId: resolvedPrincipal.principalId,
+      });
+      deletePersistedBinding(persisted);
+      return null;
+    }
+
+    try {
+      await requestSessionLifecycleProbe(
+        persisted.sessionId,
+        resolvedPrincipal.principalType,
+        resolvedPrincipal.principalId,
+      );
+    } catch (error) {
+      if (isGatewayDisconnectedError(error)) throw error;
+      logger.info("channel_binding_reconcile_failed", {
+        adapterId: message.adapterId,
+        conversationId: message.conversationId,
+        sessionId: persisted.sessionId,
+        principalId: resolvedPrincipal.principalId,
+        error: formatChannelError(error),
+      });
+      deletePersistedBinding(persisted);
+      return null;
+    }
+
+    if (persisted.runtimeId || persisted.model || persisted.workspaceId) {
+      sessionMetadataById.set(persisted.sessionId, {
+        runtimeId: persisted.runtimeId,
+        model: persisted.model,
+        workspaceId: persisted.workspaceId,
+      });
+    }
+    logger.info("channel_session_binding_restored", {
+      adapterId: persisted.adapterId,
+      conversationId: persisted.conversationId,
+      sessionId: persisted.sessionId,
+    });
+    return rebindConversationToSession(
+      message.adapterId,
+      message.conversationId,
+      persisted.sessionId,
+      persisted.principalType,
+      persisted.principalId,
+      sessionMetadataById.get(persisted.sessionId),
+    );
+  };
+
   const ensureSession = async (
     message: ChannelInboundMessage,
     resolvedPrincipal = resolveInboundPrincipal(message),
@@ -1279,7 +1430,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     const key = conversationKeyOf(message.adapterId, message.conversationId);
     const existing = conversationBindings.get(key);
     if (existing) return existing.sessionId;
-    const persisted = loadPersistedBinding(message);
+    const persisted = await reconcilePersistedBinding(message, resolvedPrincipal);
     if (persisted) return persisted.sessionId;
     if (options?.allowAutoResume !== false) {
       const resumedSessionId = await tryAutoResumeSession(message, resolvedPrincipal);
@@ -1684,19 +1835,20 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     }
 
     if (command === "status") {
+      const resolvedBinding = binding ?? await reconcilePersistedBinding(message, resolvedPrincipal);
       await sendToConversation(
         message.adapterId,
         message.conversationId,
-        binding
+        resolvedBinding
           ? [
-              `Session: ${binding.sessionId}`,
-              `Principal: ${binding.principalId}`,
+              `Session: ${resolvedBinding.sessionId}`,
+              `Principal: ${resolvedBinding.principalId}`,
               `Source: api`,
-              `Runtime: ${binding.runtimeId ?? "default"}`,
-              `Model: ${binding.model ?? "runtime-default"}`,
-              `Workspace: ${binding.workspaceId ?? "default"}`,
-              `Steering: ${binding.steeringMode}`,
-              `Running: ${runningTurns.has(binding.sessionId) ? "yes" : "no"}`,
+              `Runtime: ${resolvedBinding.runtimeId ?? "default"}`,
+              `Model: ${resolvedBinding.model ?? "runtime-default"}`,
+              `Workspace: ${resolvedBinding.workspaceId ?? "default"}`,
+              `Steering: ${resolvedBinding.steeringMode}`,
+              `Running: ${runningTurns.has(resolvedBinding.sessionId) ? "yes" : "no"}`,
               `Pending transfers: ${Array.from(pendingTransfersBySession.values()).filter((transfer) => (
                 transfer.targetPrincipalType === resolvedPrincipal.principalType
                 && transfer.targetPrincipalId === resolvedPrincipal.principalId
@@ -1793,6 +1945,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         }
         await ensureConnectionPrincipal(resolvedPrincipal.principalType, resolvedPrincipal.principalId);
         pendingSessionLifecycleRequests.push({
+          kind: "display",
           adapterId: message.adapterId,
           conversationId: message.conversationId,
           sessionId,
@@ -2463,6 +2616,11 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         if (pendingIndex < 0) break;
         const [pending] = pendingSessionLifecycleRequests.splice(pendingIndex, 1);
         if (!pending) break;
+        if (pending.kind === "probe") {
+          clearTimeout(pending.timeout);
+          pending.resolve();
+          break;
+        }
         await sendToConversation(
           pending.adapterId,
           pending.conversationId,
@@ -2547,6 +2705,21 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         const conversationKey = sessionToConversation.get(event.sessionId);
         let binding = conversationKey ? conversationBindings.get(conversationKey) : undefined;
         if (!binding) {
+          const pendingLifecycleIndex = pendingSessionLifecycleRequests.findIndex((entry) => entry.sessionId === event.sessionId);
+          if (pendingLifecycleIndex >= 0) {
+            const [pendingLifecycle] = pendingSessionLifecycleRequests.splice(pendingLifecycleIndex, 1);
+            if (pendingLifecycle?.kind === "probe") {
+              clearTimeout(pendingLifecycle.timeout);
+              pendingLifecycle.reject(new Error(event.message));
+            } else if (pendingLifecycle) {
+              await sendToConversation(
+                pendingLifecycle.adapterId,
+                pendingLifecycle.conversationId,
+                formatUserFacingError(event.message),
+              );
+            }
+            return;
+          }
           const pendingResume = clearPendingSessionResume(event.sessionId);
           if (pendingResume) {
             const error = new Error(event.message);
@@ -2728,6 +2901,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         pending.reject(new Error("Gateway connection closed before session list probe completed."));
       }
     }
+    rejectPendingSessionLifecycleProbes(new Error("Gateway connection closed before session lifecycle probe completed."));
     pendingSessionLifecycleRequests.length = 0;
     sessionListStateByConversation.clear();
     for (const [sessionId] of pendingSessionResumeBySession) {
@@ -2776,6 +2950,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
           pending.reject(new Error("Channel manager stopped before session list probe completed."));
         }
       }
+      rejectPendingSessionLifecycleProbes(new Error("Channel manager stopped before session lifecycle probe completed."));
       pendingSessionLifecycleRequests.length = 0;
       sessionListStateByConversation.clear();
       for (const [sessionId] of pendingSessionResumeBySession) {
