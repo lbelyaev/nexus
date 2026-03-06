@@ -15,7 +15,7 @@ import type {
 } from "@nexus/types";
 import { estimateTokens } from "@nexus/types";
 import { createHash, createPublicKey, randomBytes, verify } from "node:crypto";
-import type { StateStore } from "@nexus/state";
+import type { SessionTransferRecord, StateStore } from "@nexus/state";
 import type { AcpSession } from "@nexus/acp-bridge";
 import type { MemoryProvider } from "@nexus/memory";
 import { createLogger } from "./logger.js";
@@ -88,13 +88,14 @@ interface AuthChallenge {
 
 interface SessionTransferRequest {
   sessionId: string;
-  requesterConnectionId: string;
+  requesterConnectionId?: string;
   fromPrincipalType: PrincipalType;
   fromPrincipalId: string;
   targetPrincipalType: PrincipalType;
   targetPrincipalId: string;
   expiresAtMs: number;
   state: "requested" | "expired";
+  createdAtMs: number;
   updatedAtMs: number;
 }
 
@@ -343,6 +344,44 @@ export const createRouter = (deps: RouterDeps): Router => {
   const sessionTransfers = new Map<string, SessionTransferRequest>();
   const runtimeHealth = new Map<string, RuntimeHealthInfo>(Object.entries(initialRuntimeHealth));
   const log = createLogger("gateway.router");
+
+  const toPersistedTransfer = (
+    transfer: SessionTransferRequest,
+  ): SessionTransferRecord => ({
+    sessionId: transfer.sessionId,
+    fromPrincipalType: transfer.fromPrincipalType,
+    fromPrincipalId: transfer.fromPrincipalId,
+    targetPrincipalType: transfer.targetPrincipalType,
+    targetPrincipalId: transfer.targetPrincipalId,
+    expiresAt: new Date(transfer.expiresAtMs).toISOString(),
+    state: transfer.state,
+    createdAt: new Date(transfer.createdAtMs).toISOString(),
+    updatedAt: new Date(transfer.updatedAtMs).toISOString(),
+  });
+
+  const persistTransfer = (transfer: SessionTransferRequest): void => {
+    stateStore.upsertSessionTransfer(toPersistedTransfer(transfer));
+    sessionTransfers.set(transfer.sessionId, transfer);
+  };
+
+  const deleteTransfer = (sessionId: string): void => {
+    sessionTransfers.delete(sessionId);
+    stateStore.deleteSessionTransfer(sessionId);
+  };
+
+  for (const persistedTransfer of stateStore.listSessionTransfers()) {
+    sessionTransfers.set(persistedTransfer.sessionId, {
+      sessionId: persistedTransfer.sessionId,
+      fromPrincipalType: persistedTransfer.fromPrincipalType,
+      fromPrincipalId: persistedTransfer.fromPrincipalId,
+      targetPrincipalType: persistedTransfer.targetPrincipalType,
+      targetPrincipalId: persistedTransfer.targetPrincipalId,
+      expiresAtMs: new Date(persistedTransfer.expiresAt).getTime(),
+      state: persistedTransfer.state,
+      createdAtMs: new Date(persistedTransfer.createdAt).getTime(),
+      updatedAtMs: new Date(persistedTransfer.updatedAt).getTime(),
+    });
+  }
 
   const emitRuntimeHealth = (emit: EventEmitter, runtime: RuntimeHealthInfo): void => {
     emit({
@@ -605,7 +644,7 @@ export const createRouter = (deps: RouterDeps): Router => {
     }
     transfer.state = "expired";
     transfer.updatedAtMs = Date.now();
-    sessionTransfers.set(transfer.sessionId, transfer);
+    persistTransfer(transfer);
     applyLifecycleEvent(transfer.sessionId, "TRANSFER_EXPIRED", {
       parkedReason: "transfer_expired",
       reason,
@@ -762,6 +801,9 @@ export const createRouter = (deps: RouterDeps): Router => {
     sessionId: string,
     emit: EventEmitter,
     context?: RouterMessageContext,
+    options?: {
+      allowTransferTarget?: boolean;
+    },
   ): Promise<boolean> => {
     if (sessions.has(sessionId)) return Promise.resolve(true);
     const pending = pendingSessionHydrations.get(sessionId);
@@ -799,6 +841,21 @@ export const createRouter = (deps: RouterDeps): Router => {
         if (isLocalInteractiveSession) {
           principalType = connectionPrincipal.principalType;
           principalId = connectionPrincipal.principalId;
+        } else if (options?.allowTransferTarget) {
+          const pendingTransfer = sessionTransfers.get(sessionId);
+          const isTransferTarget =
+            pendingTransfer
+            && pendingTransfer.state === "requested"
+            && connectionPrincipal.principalType === pendingTransfer.targetPrincipalType
+            && connectionPrincipal.principalId === pendingTransfer.targetPrincipalId;
+          if (!isTransferTarget) {
+            emit({
+              type: "error",
+              sessionId,
+              message: "Authenticated principal does not own this session.",
+            });
+            return false;
+          }
         } else if (
           connectionPrincipal.principalType !== sessionRecord.principalType
           || connectionPrincipal.principalId !== sessionRecord.principalId
@@ -838,26 +895,14 @@ export const createRouter = (deps: RouterDeps): Router => {
         });
         sessionPolicyContexts.set(sessionId, policyContext);
         sessionLastActivityMs.set(sessionId, Date.now());
-        const resumedAt = new Date().toISOString();
-        if (sessionRecord.lifecycleState === "parked") {
-          applyLifecycleEvent(sessionId, "OWNER_RESUMED", {
-            at: resumedAt,
-            reason: "runtime_rehydrated",
-            actorPrincipalType: principalType,
-            actorPrincipalId: principalId,
-            notifyEmit: emit,
-          });
-        }
         stateStore.updateSession(sessionId, {
           runtimeId: restored.runtimeId,
           acpSessionId: restored.acpSessionId,
-          status: "active",
           model: restored.model,
           principalType,
           principalId,
           source,
           workspaceId,
-          lastActivityAt: resumedAt,
         });
         emit({
           type: "session_invalidated",
@@ -1013,7 +1058,7 @@ export const createRouter = (deps: RouterDeps): Router => {
     sessionInFlightTurns.delete(sessionId);
     sessionIdempotency.delete(sessionId);
     sessionActivePromptTurns.delete(sessionId);
-    sessionTransfers.delete(sessionId);
+    deleteTransfer(sessionId);
     clearSessionPendingApprovals(sessionId);
 
     try {
@@ -1453,7 +1498,8 @@ export const createRouter = (deps: RouterDeps): Router => {
       TRANSFER_MIN_TTL_MS,
       Math.min(TRANSFER_MAX_TTL_MS, Math.floor(msg.expiresInMs ?? TRANSFER_DEFAULT_TTL_MS)),
     );
-    const expiresAtMs = Date.now() + expiresInMs;
+    const nowMs = Date.now();
+    const expiresAtMs = nowMs + expiresInMs;
 
     const transfer: SessionTransferRequest = {
       sessionId: msg.sessionId,
@@ -1464,9 +1510,10 @@ export const createRouter = (deps: RouterDeps): Router => {
       targetPrincipalId,
       expiresAtMs,
       state: "requested",
-      updatedAtMs: Date.now(),
+      createdAtMs: nowMs,
+      updatedAtMs: nowMs,
     };
-    sessionTransfers.set(msg.sessionId, transfer);
+    persistTransfer(transfer);
     applyLifecycleEvent(msg.sessionId, "TRANSFER_REQUESTED", {
       parkedReason: "transfer_pending",
       reason: "transfer_requested",
@@ -1506,10 +1553,11 @@ export const createRouter = (deps: RouterDeps): Router => {
   ): void => {
     const session = sessions.get(msg.sessionId);
     if (!session) {
-      emit({
-        type: "error",
-        sessionId: msg.sessionId,
-        message: `Session not found: ${msg.sessionId}`,
+      void hydrateSessionIfPersisted(msg.sessionId, emit, context, {
+        allowTransferTarget: true,
+      }).then((hydrated) => {
+        if (!hydrated) return;
+        handleSessionTransferAccept(msg, emit, context);
       });
       return;
     }
@@ -1544,24 +1592,6 @@ export const createRouter = (deps: RouterDeps): Router => {
       return;
     }
 
-    const transferOwner = sessionOwners.get(msg.sessionId);
-    const transferOwnerConnectionId = transferOwner ? emitterConnectionIds.get(transferOwner) : undefined;
-    const transferOwnerPrincipal = resolvePrincipal(transferOwnerConnectionId);
-    if (
-      !transferOwner
-      || !transferOwnerPrincipal?.verified
-      || transferOwnerPrincipal.principalType !== transfer.fromPrincipalType
-      || transferOwnerPrincipal.principalId !== transfer.fromPrincipalId
-    ) {
-      setTransferExpired(transfer, emit, "owner_unavailable");
-      emit({
-        type: "error",
-        sessionId: msg.sessionId,
-        message: "Pending transfer owner is unavailable; session remains parked.",
-      });
-      return;
-    }
-
     if (
       principal.principalType !== transfer.targetPrincipalType
       || principal.principalId !== transfer.targetPrincipalId
@@ -1575,7 +1605,7 @@ export const createRouter = (deps: RouterDeps): Router => {
     }
 
     sessionOwners.set(msg.sessionId, emit);
-    sessionTransfers.delete(msg.sessionId);
+    deleteTransfer(msg.sessionId);
     applyLifecycleEvent(msg.sessionId, "TRANSFER_ACCEPTED", {
       reason: "transfer_accepted",
       actorPrincipalType: principal.principalType,
@@ -1635,10 +1665,11 @@ export const createRouter = (deps: RouterDeps): Router => {
   ): void => {
     const session = sessions.get(msg.sessionId);
     if (!session) {
-      emit({
-        type: "error",
-        sessionId: msg.sessionId,
-        message: `Session not found: ${msg.sessionId}`,
+      void hydrateSessionIfPersisted(msg.sessionId, emit, context, {
+        allowTransferTarget: true,
+      }).then((hydrated) => {
+        if (!hydrated) return;
+        handleSessionTransferDismiss(msg, emit, context);
       });
       return;
     }
@@ -1675,7 +1706,7 @@ export const createRouter = (deps: RouterDeps): Router => {
       return;
     }
 
-    sessionTransfers.delete(msg.sessionId);
+    deleteTransfer(msg.sessionId);
     applyLifecycleEvent(msg.sessionId, "TRANSFER_DISMISSED", {
       reason: transfer.state === "expired" ? "target_dismissed_after_expiry" : "target_dismissed",
       actorPrincipalType: principal.principalType,
@@ -1733,7 +1764,7 @@ export const createRouter = (deps: RouterDeps): Router => {
         });
         return;
       }
-      sessionTransfers.delete(msg.sessionId);
+      deleteTransfer(msg.sessionId);
       applyLifecycleEvent(msg.sessionId, "OWNER_RESUMED", {
         reason: resolvedTransfer.state === "expired" ? "owner_resumed_after_expiry" : "owner_resumed",
         actorPrincipalType: resolvedTransfer.fromPrincipalType,
@@ -2532,7 +2563,7 @@ export const createRouter = (deps: RouterDeps): Router => {
         });
         return;
       }
-      sessionTransfers.delete(msg.sessionId);
+      deleteTransfer(msg.sessionId);
       emitTransferUpdated(resolved, "cancelled", emit, "takeover_cancelled_expired_transfer");
     }
 
@@ -2879,15 +2910,14 @@ export const createRouter = (deps: RouterDeps): Router => {
       if (owner === emit) {
         sessionOwners.delete(sessionId);
         released.push(sessionId);
-        applyLifecycleEvent(sessionId, "OWNER_DISCONNECTED", {
-          parkedReason: "owner_disconnected",
-          reason: "owner_disconnected",
-        });
+        const pendingTransfer = sessionTransfers.get(sessionId);
+        if (!pendingTransfer) {
+          applyLifecycleEvent(sessionId, "OWNER_DISCONNECTED", {
+            parkedReason: "owner_disconnected",
+            reason: "owner_disconnected",
+          });
+        }
       }
-    }
-    for (const transfer of sessionTransfers.values()) {
-      if (transfer.requesterConnectionId !== connectionId) continue;
-      setTransferExpired(transfer, undefined, "requester_disconnected");
     }
 
     if (released.length > 0) {

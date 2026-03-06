@@ -1336,6 +1336,63 @@ describe("createRouter", () => {
     });
   });
 
+  it("requested transfer survives owner disconnect and can still be accepted", async () => {
+    const owner = collectEvents();
+    const target = collectEvents();
+    router.registerConnection("conn-owner", owner.emit);
+    router.registerConnection("conn-target", target.emit);
+
+    const ownerChallenge = owner.events.find((event) => event.type === "auth_challenge");
+    const targetChallenge = target.events.find((event) => event.type === "auth_challenge");
+    if (!ownerChallenge || ownerChallenge.type !== "auth_challenge") throw new Error("owner auth_challenge missing");
+    if (!targetChallenge || targetChallenge.type !== "auth_challenge") throw new Error("target auth_challenge missing");
+
+    owner.events.length = 0;
+    target.events.length = 0;
+    router.handleMessage(createAuthProof({
+      challengeId: ownerChallenge.challengeId,
+      nonce: ownerChallenge.nonce,
+      principalId: "user:alice",
+    }), owner.emit, { connectionId: "conn-owner" });
+    router.handleMessage(createAuthProof({
+      challengeId: targetChallenge.challengeId,
+      nonce: targetChallenge.nonce,
+      principalId: "user:bob",
+    }), target.emit, { connectionId: "conn-target" });
+
+    owner.events.length = 0;
+    target.events.length = 0;
+    router.handleMessage({ type: "session_new" }, owner.emit, { connectionId: "conn-owner" });
+    await vi.waitFor(() => {
+      expect(owner.events.some((event) => event.type === "session_created")).toBe(true);
+    });
+    const created = owner.events.find((event) => event.type === "session_created");
+    if (!created || created.type !== "session_created") throw new Error("expected session_created");
+
+    owner.events.length = 0;
+    target.events.length = 0;
+    router.handleMessage({
+      type: "session_transfer_request",
+      sessionId: created.sessionId,
+      targetPrincipalId: "user:bob",
+      targetPrincipalType: "user",
+    }, owner.emit, { connectionId: "conn-owner" });
+
+    expect(stateStore.getSessionTransfer(created.sessionId)?.state).toBe("requested");
+    router.unregisterConnection("conn-owner", owner.emit);
+    expect(stateStore.getSessionTransfer(created.sessionId)?.state).toBe("requested");
+
+    target.events.length = 0;
+    router.handleMessage({
+      type: "session_transfer_accept",
+      sessionId: created.sessionId,
+    }, target.emit, { connectionId: "conn-target" });
+
+    expect(target.events.some((event) => event.type === "session_transferred")).toBe(true);
+    expect(stateStore.getSessionTransfer(created.sessionId)).toBeNull();
+    expect(stateStore.getSession(created.sessionId)?.principalId).toBe("user:bob");
+  });
+
   it("expired transfer remains parked until owner prompt resumes", async () => {
     const owner = collectEvents();
     const target = collectEvents();
@@ -1409,6 +1466,108 @@ describe("createRouter", () => {
     expect(owner.events.some((event) => (
       event.type === "session_transfer_updated" && event.state === "cancelled"
     ))).toBe(true);
+  });
+
+  it("rehydrates persisted transfer and accepts it after router restart", async () => {
+    const owner = collectEvents();
+    const target = collectEvents();
+    router.registerConnection("conn-owner", owner.emit);
+    router.registerConnection("conn-target", target.emit);
+
+    const ownerChallenge = owner.events.find((event) => event.type === "auth_challenge");
+    const targetChallenge = target.events.find((event) => event.type === "auth_challenge");
+    if (!ownerChallenge || ownerChallenge.type !== "auth_challenge") throw new Error("owner auth_challenge missing");
+    if (!targetChallenge || targetChallenge.type !== "auth_challenge") throw new Error("target auth_challenge missing");
+
+    owner.events.length = 0;
+    target.events.length = 0;
+    router.handleMessage(createAuthProof({
+      challengeId: ownerChallenge.challengeId,
+      nonce: ownerChallenge.nonce,
+      principalId: "user:alice",
+    }), owner.emit, { connectionId: "conn-owner" });
+    router.handleMessage(createAuthProof({
+      challengeId: targetChallenge.challengeId,
+      nonce: targetChallenge.nonce,
+      principalId: "user:bob",
+    }), target.emit, { connectionId: "conn-target" });
+
+    owner.events.length = 0;
+    target.events.length = 0;
+    router.handleMessage({ type: "session_new" }, owner.emit, { connectionId: "conn-owner" });
+    await vi.waitFor(() => {
+      expect(owner.events.some((event) => event.type === "session_created")).toBe(true);
+    });
+    const created = owner.events.find((event) => event.type === "session_created");
+    if (!created || created.type !== "session_created") throw new Error("expected session_created");
+
+    owner.events.length = 0;
+    target.events.length = 0;
+    router.handleMessage({
+      type: "session_transfer_request",
+      sessionId: created.sessionId,
+      targetPrincipalId: "user:bob",
+      targetPrincipalType: "user",
+    }, owner.emit, { connectionId: "conn-owner" });
+
+    expect(stateStore.getSessionTransfer(created.sessionId)?.state).toBe("requested");
+
+    const restartedSession = {
+      ...mockAcpSession(),
+      id: created.sessionId,
+      acpSessionId: "acp-restored-transfer",
+    };
+    createAcpSessionMock = vi.fn(async () => restartedSession);
+    router = createRouter({
+      createAcpSession: createAcpSessionMock,
+      stateStore,
+      policyConfig,
+      memoryProvider,
+      defaultWorkspaceId: "default",
+    });
+
+    const targetAfterRestart = collectEvents();
+    router.registerConnection("conn-target-restarted", targetAfterRestart.emit);
+    const targetRestartChallenge = targetAfterRestart.events.find((event) => event.type === "auth_challenge");
+    if (!targetRestartChallenge || targetRestartChallenge.type !== "auth_challenge") {
+      throw new Error("restart target auth_challenge missing");
+    }
+
+    targetAfterRestart.events.length = 0;
+    router.handleMessage(createAuthProof({
+      challengeId: targetRestartChallenge.challengeId,
+      nonce: targetRestartChallenge.nonce,
+      principalId: "user:bob",
+    }), targetAfterRestart.emit, { connectionId: "conn-target-restarted" });
+    targetAfterRestart.events.length = 0;
+
+    router.handleMessage({
+      type: "session_transfer_accept",
+      sessionId: created.sessionId,
+    }, targetAfterRestart.emit, { connectionId: "conn-target-restarted" });
+
+    await vi.waitFor(() => {
+      expect(createAcpSessionMock).toHaveBeenCalledWith(
+        "default",
+        "claude",
+        targetAfterRestart.emit,
+        {
+          principalType: "user",
+          principalId: "user:alice",
+          source: "interactive",
+          workspaceId: "default",
+        },
+        { gatewaySessionId: created.sessionId },
+      );
+    });
+    await vi.waitFor(() => {
+      expect(targetAfterRestart.events.some((event) => event.type === "session_transferred")).toBe(true);
+    });
+
+    expect(targetAfterRestart.events.some((event) => event.type === "session_invalidated")).toBe(true);
+    expect(stateStore.getSessionTransfer(created.sessionId)).toBeNull();
+    expect(stateStore.getSession(created.sessionId)?.principalId).toBe("user:bob");
+    expect(stateStore.getSession(created.sessionId)?.lifecycleState).toBe("live");
   });
 
   it("session_takeover replays parked session for authenticated owner and emits TAKEOVER lifecycle", async () => {

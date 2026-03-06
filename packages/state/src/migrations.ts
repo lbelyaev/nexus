@@ -125,6 +125,18 @@ export const initDatabase = (db: DatabaseAdapter): void => {
       createdAt TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS session_transfers (
+      sessionId TEXT PRIMARY KEY,
+      fromPrincipalType TEXT NOT NULL,
+      fromPrincipalId TEXT NOT NULL,
+      targetPrincipalType TEXT NOT NULL,
+      targetPrincipalId TEXT NOT NULL,
+      expiresAt TEXT NOT NULL,
+      state TEXT NOT NULL,
+      createdAt TEXT NOT NULL,
+      updatedAt TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_memory_items_session_kind_createdAt
       ON memory_items(sessionId, kind, createdAt DESC);
     CREATE INDEX IF NOT EXISTS idx_memory_items_session_lastAccessedAt
@@ -147,6 +159,10 @@ export const initDatabase = (db: DatabaseAdapter): void => {
       ON session_lifecycle_events(sessionId, createdAt DESC, id DESC);
     CREATE INDEX IF NOT EXISTS idx_session_lifecycle_events_eventType_createdAt
       ON session_lifecycle_events(eventType, createdAt DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_session_transfers_target_updatedAt
+      ON session_transfers(targetPrincipalType, targetPrincipalId, updatedAt DESC);
+    CREATE INDEX IF NOT EXISTS idx_session_transfers_state_expiresAt
+      ON session_transfers(state, expiresAt ASC);
   `);
 
   if (!hasColumn(db, "sessions", "workspaceId")) {
