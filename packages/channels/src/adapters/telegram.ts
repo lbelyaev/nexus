@@ -93,6 +93,8 @@ interface TelegramFileResponse {
 }
 
 const TELEGRAM_CALLBACK_PREFIX = "nx:";
+const TELEGRAM_STREAM_EDIT_MAX = 3800;
+const TELEGRAM_STREAM_TRUNCATION_SUFFIX = "\n\n...";
 const DEFAULT_TELEGRAM_COMMANDS: Array<{ command: string; description: string }> = [
   { command: "help", description: "Show available Nexus commands." },
   { command: "commands", description: "List slash commands." },
@@ -147,6 +149,11 @@ const markdownToTelegramHtml = (text: string): string => {
 const isEntityParseError = (error: unknown): boolean => {
   const message = error instanceof Error ? error.message : String(error);
   return /can't parse entities|parse entities|parse_mode|entity/i.test(message);
+};
+
+const isMessageTooLongError = (error: unknown): boolean => {
+  const message = error instanceof Error ? error.message : String(error);
+  return /message[_ ]too[_ ]long|message is too long/i.test(message);
 };
 
 const toCallbackData = (command: string): string | undefined => {
@@ -221,6 +228,12 @@ const splitMessage = (text: string, max: number = 3800): string[] => {
   }
   if (remaining.length > 0) chunks.push(remaining);
   return chunks;
+};
+
+const truncateStreamingPreview = (text: string, max: number = TELEGRAM_STREAM_EDIT_MAX): string => {
+  if (text.length <= max) return text;
+  const headLength = Math.max(0, max - TELEGRAM_STREAM_TRUNCATION_SUFFIX.length);
+  return `${text.slice(0, headLength)}${TELEGRAM_STREAM_TRUNCATION_SUFFIX}`;
 };
 
 export const createTelegramAdapter = (options: TelegramAdapterOptions): ChannelAdapter => {
@@ -432,6 +445,50 @@ export const createTelegramAdapter = (options: TelegramAdapterOptions): ChannelA
     }
   };
 
+  const sendChunkedText = async (
+    conversationId: string,
+    text: string,
+    quickActions?: ChannelQuickAction[],
+  ): Promise<void> => {
+    const chunks = splitMessage(text);
+    for (const [index, chunk] of chunks.entries()) {
+      await sendText(
+        conversationId,
+        chunk,
+        index === 0 ? quickActions : undefined,
+      );
+    }
+  };
+
+  const replaceStreamingPreviewWithChunkedFinal = async (
+    conversationId: string,
+    streamId: string,
+    messageId: number | undefined,
+    text: string,
+    reason: "too_long" | "edit_failed",
+  ): Promise<void> => {
+    ctx?.log.warn("telegram_streaming_chunked_final_fallback", {
+      adapterId: id,
+      conversationId,
+      streamId,
+      reason,
+    });
+    if (messageId) {
+      await apiCall("deleteMessage", {
+        chat_id: conversationId,
+        message_id: messageId,
+      }).catch(async () => {
+        await apiCall("editMessageText", {
+          chat_id: conversationId,
+          message_id: messageId,
+          text: "Response continued below.",
+          disable_web_page_preview: false,
+        }).catch(() => undefined);
+      });
+    }
+    await sendChunkedText(conversationId, text);
+  };
+
   const setTyping = async (state: ChannelTypingState): Promise<void> => {
     if (!state.active) return;
     await apiCall("sendChatAction", {
@@ -447,11 +504,21 @@ export const createTelegramAdapter = (options: TelegramAdapterOptions): ChannelA
       .then(async () => {
         if (!state.text && !state.done) return;
         const currentMessageId = streamingMessageIds.get(state.streamId);
+        const previewText = state.text ? truncateStreamingPreview(state.text) : "";
+        const shouldChunkFinalText = state.done && state.text.length > TELEGRAM_STREAM_EDIT_MAX;
         if (!currentMessageId) {
           if (!state.text) return;
+          if (shouldChunkFinalText) {
+            await sendChunkedText(state.conversationId, state.text);
+            return;
+          }
+          if (state.done) {
+            await sendText(state.conversationId, state.text);
+            return;
+          }
           const created = await apiCall<TelegramMessageResponse>("sendMessage", {
             chat_id: state.conversationId,
-            text: state.text,
+            text: previewText,
             disable_web_page_preview: false,
           });
           streamingMessageIds.set(state.streamId, created.message_id);
@@ -469,6 +536,17 @@ export const createTelegramAdapter = (options: TelegramAdapterOptions): ChannelA
         }
 
         if (state.done) {
+          if (shouldChunkFinalText) {
+            await replaceStreamingPreviewWithChunkedFinal(
+              state.conversationId,
+              state.streamId,
+              currentMessageId,
+              state.text,
+              "too_long",
+            );
+            streamingMessageIds.delete(state.streamId);
+            return;
+          }
           try {
             await apiCall("editMessageText", {
               chat_id: state.conversationId,
@@ -478,24 +556,46 @@ export const createTelegramAdapter = (options: TelegramAdapterOptions): ChannelA
               disable_web_page_preview: false,
             });
           } catch (error) {
-            if (!isEntityParseError(error)) throw error;
-            ctx?.log.warn("telegram_parse_mode_fallback_plain_edit", {
-              adapterId: id,
-              conversationId: state.conversationId,
-              streamId: state.streamId,
-            });
-            await apiCall("editMessageText", {
-              chat_id: state.conversationId,
-              message_id: currentMessageId,
-              text: state.text,
-              disable_web_page_preview: false,
-            });
+            if (isEntityParseError(error)) {
+              ctx?.log.warn("telegram_parse_mode_fallback_plain_edit", {
+                adapterId: id,
+                conversationId: state.conversationId,
+                streamId: state.streamId,
+              });
+              try {
+                await apiCall("editMessageText", {
+                  chat_id: state.conversationId,
+                  message_id: currentMessageId,
+                  text: state.text,
+                  disable_web_page_preview: false,
+                });
+              } catch (plainError) {
+                if (!isMessageTooLongError(plainError)) throw plainError;
+                await replaceStreamingPreviewWithChunkedFinal(
+                  state.conversationId,
+                  state.streamId,
+                  currentMessageId,
+                  state.text,
+                  "too_long",
+                );
+              }
+            } else if (isMessageTooLongError(error)) {
+              await replaceStreamingPreviewWithChunkedFinal(
+                state.conversationId,
+                state.streamId,
+                currentMessageId,
+                state.text,
+                "too_long",
+              );
+            } else {
+              throw error;
+            }
           }
         } else {
           await apiCall("editMessageText", {
             chat_id: state.conversationId,
             message_id: currentMessageId,
-            text: state.text,
+            text: previewText,
             disable_web_page_preview: false,
           });
         }
@@ -556,14 +656,7 @@ export const createTelegramAdapter = (options: TelegramAdapterOptions): ChannelA
       ctx = null;
     },
     sendMessage: async (message: ChannelOutboundMessage) => {
-      const chunks = splitMessage(message.text);
-      for (const [index, chunk] of chunks.entries()) {
-        await sendText(
-          message.conversationId,
-          chunk,
-          index === 0 ? message.quickActions : undefined,
-        );
-      }
+      await sendChunkedText(message.conversationId, message.text, message.quickActions);
     },
     setTyping,
     upsertStreamingMessage,

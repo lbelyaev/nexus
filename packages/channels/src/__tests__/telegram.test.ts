@@ -88,6 +88,67 @@ describe("createTelegramAdapter", () => {
     expect(thirdPayload.text).toBe("Hello <b>world</b>");
   });
 
+  it("clips live streaming previews to stay under Telegram edit limits", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ message_id: 44 }))
+      .mockResolvedValueOnce(jsonResponse(true));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const adapter = createTelegramAdapter({ botToken: "token" });
+    const longText = "a".repeat(4000);
+    await adapter.upsertStreamingMessage?.({
+      conversationId: "chat-clip",
+      streamId: "stream-clip",
+      text: longText,
+      done: false,
+    });
+    await adapter.upsertStreamingMessage?.({
+      conversationId: "chat-clip",
+      streamId: "stream-clip",
+      text: longText,
+      done: false,
+    });
+
+    const firstPayload = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    const secondPayload = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body));
+    expect(firstPayload.text).toHaveLength(3800);
+    expect(secondPayload.text).toHaveLength(3800);
+    expect(firstPayload.text.endsWith("\n\n...")).toBe(true);
+    expect(secondPayload.text.endsWith("\n\n...")).toBe(true);
+  });
+
+  it("falls back to chunked final messages when a streamed response is too long", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ message_id: 55 }))
+      .mockResolvedValueOnce(jsonResponse(true))
+      .mockResolvedValueOnce(jsonResponse({ message_id: 56 }))
+      .mockResolvedValueOnce(jsonResponse({ message_id: 57 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const adapter = createTelegramAdapter({ botToken: "token" });
+    const finalText = "b".repeat(5000);
+    await adapter.upsertStreamingMessage?.({
+      conversationId: "chat-long-final",
+      streamId: "stream-long-final",
+      text: "short preview",
+      done: false,
+    });
+    await adapter.upsertStreamingMessage?.({
+      conversationId: "chat-long-final",
+      streamId: "stream-long-final",
+      text: finalText,
+      done: true,
+    });
+
+    const methods = fetchMock.mock.calls.map((call) => String(call[0]).split("/").at(-1));
+    expect(methods).toEqual(["sendMessage", "deleteMessage", "sendMessage", "sendMessage"]);
+    const firstChunkPayload = JSON.parse(String(fetchMock.mock.calls[2]?.[1]?.body));
+    const secondChunkPayload = JSON.parse(String(fetchMock.mock.calls[3]?.[1]?.body));
+    expect(`${firstChunkPayload.text}${secondChunkPayload.text}`).toBe(finalText);
+    expect(firstChunkPayload.parse_mode).toBe("HTML");
+    expect(secondChunkPayload.parse_mode).toBe("HTML");
+  });
+
   it("adds inline keyboard buttons for quick actions", async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ message_id: 77 }));
     vi.stubGlobal("fetch", fetchMock);
