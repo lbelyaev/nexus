@@ -1134,12 +1134,6 @@ const ConnectedClient = ({
     setSessionNameDraft("");
   }, [appendSystem, session, sessionNameDraft]);
 
-  const handleSessionHistoryRequest = useCallback((sessionId: string) => {
-    pendingSessionHistorySessionIdRef.current = sessionId;
-    appendSystem(`Fetching session history for ${sessionId}...`);
-    session.requestSessionLifecycle(sessionId);
-  }, [appendSystem, session]);
-
   const handleResumeListedSession = useCallback((candidate: SessionInfo) => {
     const state = formatSessionState(candidate);
     if (state === "live" && candidate.id !== session.sessionId) {
@@ -1231,7 +1225,7 @@ const ConnectedClient = ({
 
   return (
     <div className={sessionDrawerOpen ? "grid h-full min-h-0 gap-3 lg:grid-cols-[320px_minmax(0,1fr)]" : "grid h-full min-h-0 gap-3 lg:grid-cols-[72px_minmax(0,1fr)]"}>
-      <aside className={`panel min-h-0 overflow-hidden transition-all duration-200 ${sessionDrawerOpen ? "p-4" : "p-2"}`}>
+      <aside className={`panel flex min-h-0 flex-col overflow-hidden transition-all duration-200 ${sessionDrawerOpen ? "p-4" : "p-2"}`}>
         <div className={`flex items-center ${sessionDrawerOpen ? "justify-between" : "justify-center"}`}>
           {sessionDrawerOpen ? (
             <div>
@@ -1263,7 +1257,8 @@ const ConnectedClient = ({
               </button>
             </div>
 
-            <div className="mt-4 space-y-3 overflow-y-auto pr-1">
+            <div className="mt-4 min-h-0 flex-1 overflow-y-auto pr-1">
+              <div className="space-y-3">
               {visibleSessions.length === 0 ? (
                 <div className="rounded-2xl border border-white/8 bg-ink-950/55 px-3 py-4 text-sm text-ink-100/60">
                   No sessions loaded yet.
@@ -1345,15 +1340,6 @@ const ConnectedClient = ({
                         </div>
 
                         <div className="mt-3 flex flex-wrap gap-2">
-                          {canResume ? (
-                            <button
-                              type="button"
-                              className="button-secondary px-2.5 py-1.5 text-xs"
-                              onClick={() => handleResumeListedSession(candidate)}
-                            >
-                              Resume
-                            </button>
-                          ) : null}
                           {canTakeover ? (
                             <button
                               type="button"
@@ -1363,20 +1349,13 @@ const ConnectedClient = ({
                               Takeover
                             </button>
                           ) : null}
-                          <button
-                            type="button"
-                            className="button-secondary px-2.5 py-1.5 text-xs"
-                            onClick={() => handleSessionHistoryRequest(candidate.id)}
-                          >
-                            History
-                          </button>
                           {canClose ? (
                             <button
                               type="button"
                               className="button-secondary px-2.5 py-1.5 text-xs"
                               onClick={() => handleCloseListedSession(candidate)}
                             >
-                              Close
+                              Delete
                             </button>
                           ) : null}
                         </div>
@@ -1385,6 +1364,7 @@ const ConnectedClient = ({
                   </article>
                 );
               })}
+              </div>
             </div>
           </>
         ) : (
