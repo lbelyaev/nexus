@@ -148,6 +148,18 @@ describe("SessionStore", () => {
     expect(updated?.tokenUsage).toEqual({ input: 100, output: 50 });
   });
 
+  it("createSession and updateSession persist displayName", () => {
+    store.createSession(makeSession({ displayName: "Initial title" }));
+    expect(store.getSession("sess-1")?.displayName).toBe("Initial title");
+
+    store.updateSession("sess-1", { displayName: "Renamed session" });
+    expect(store.getSession("sess-1")?.displayName).toBe("Renamed session");
+    expect(store.listSessions()[0]?.displayName).toBe("Renamed session");
+
+    store.updateSession("sess-1", { displayName: null });
+    expect(store.getSession("sess-1")?.displayName).toBeUndefined();
+  });
+
   it("updateSession throws for non-existent session ID", () => {
     expect(() => store.updateSession("no-such-id", { status: "idle" })).toThrow();
   });

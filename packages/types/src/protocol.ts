@@ -25,6 +25,7 @@ export interface SessionInfo {
   lifecycleVersion?: number;
   model: string;
   workspaceId?: string;
+  displayName?: string;
   principalType?: PrincipalType;
   principalId?: string;
   source?: PromptSource;
@@ -95,6 +96,11 @@ export type ClientMessage =
       type: "session_lifecycle_query";
       sessionId: string;
       limit?: number;
+    }
+  | {
+      type: "session_rename";
+      sessionId: string;
+      displayName: string | null;
     }
   | { type: "session_replay"; sessionId: string }
   | { type: "session_takeover"; sessionId: string }
@@ -202,6 +208,7 @@ export type GatewayEvent =
       model: string;
       runtimeId?: string;
       workspaceId?: string;
+      displayName?: string;
       principalType?: PrincipalType;
       principalId?: string;
       source?: PromptSource;
@@ -209,6 +216,11 @@ export type GatewayEvent =
       modelAliases?: Record<string, string>;
       modelCatalog?: Record<string, string[]>;
       runtimeDefaults?: Record<string, string>;
+    }
+  | {
+      type: "session_updated";
+      sessionId: string;
+      displayName: string | null;
     }
   | {
       type: "session_invalidated";
@@ -387,6 +399,7 @@ const CLIENT_MESSAGE_TYPES = new Set([
   "session_new",
   "session_list",
   "session_lifecycle_query",
+  "session_rename",
   "session_replay",
   "session_takeover",
   "auth_proof",
@@ -406,6 +419,7 @@ const GATEWAY_EVENT_TYPES = new Set([
   "turn_end",
   "error",
   "session_created",
+  "session_updated",
   "session_invalidated",
   "session_closed",
   "auth_challenge",
@@ -552,6 +566,11 @@ export const isClientMessage = (value: unknown): value is ClientMessage => {
           || (typeof obj.limit === "number" && Number.isFinite(obj.limit) && obj.limit > 0)
         )
       );
+    case "session_rename":
+      return (
+        typeof obj.sessionId === "string"
+        && (obj.displayName === null || typeof obj.displayName === "string")
+      );
     case "session_replay":
       return typeof obj.sessionId === "string";
     case "session_takeover":
@@ -679,6 +698,7 @@ export const isGatewayEvent = (value: unknown): value is GatewayEvent => {
         && typeof obj.model === "string"
         && (obj.runtimeId === undefined || typeof obj.runtimeId === "string")
         && (obj.workspaceId === undefined || typeof obj.workspaceId === "string")
+        && (obj.displayName === undefined || typeof obj.displayName === "string")
         && (obj.principalType === undefined || (typeof obj.principalType === "string" && PRINCIPAL_TYPES.has(obj.principalType as PrincipalType)))
         && (obj.principalId === undefined || typeof obj.principalId === "string")
         && (obj.source === undefined || (typeof obj.source === "string" && PROMPT_SOURCES.has(obj.source as PromptSource)))
@@ -686,6 +706,11 @@ export const isGatewayEvent = (value: unknown): value is GatewayEvent => {
         && (obj.modelAliases === undefined || isStringRecord(obj.modelAliases))
         && (obj.modelCatalog === undefined || isStringArrayRecord(obj.modelCatalog))
         && (obj.runtimeDefaults === undefined || isStringRecord(obj.runtimeDefaults))
+      );
+    case "session_updated":
+      return (
+        typeof obj.sessionId === "string"
+        && (obj.displayName === null || typeof obj.displayName === "string")
       );
     case "session_invalidated":
       return (

@@ -55,6 +55,11 @@ describe("isClientMessage", () => {
     expect(isClientMessage({ type: "session_lifecycle_query", sessionId: "s1", limit: 25 })).toBe(true);
   });
 
+  it("validates a session_rename message", () => {
+    expect(isClientMessage({ type: "session_rename", sessionId: "s1", displayName: "Websocket cleanup" })).toBe(true);
+    expect(isClientMessage({ type: "session_rename", sessionId: "s1", displayName: null })).toBe(true);
+  });
+
   it("validates a session_replay message", () => {
     expect(isClientMessage({ type: "session_replay", sessionId: "s1" })).toBe(true);
   });
@@ -150,6 +155,11 @@ describe("isClientMessage", () => {
   it("rejects invalid session_lifecycle_query message", () => {
     expect(isClientMessage({ type: "session_lifecycle_query", sessionId: 123 })).toBe(false);
     expect(isClientMessage({ type: "session_lifecycle_query", sessionId: "s1", limit: 0 })).toBe(false);
+  });
+
+  it("rejects invalid session_rename message", () => {
+    expect(isClientMessage({ type: "session_rename", sessionId: "s1" })).toBe(false);
+    expect(isClientMessage({ type: "session_rename", sessionId: "s1", displayName: 123 })).toBe(false);
   });
 
   it("rejects session_replay with missing sessionId", () => {
@@ -264,6 +274,7 @@ describe("isGatewayEvent", () => {
     expect(isGatewayEvent({ type: "session_created", sessionId: "s1", model: "claude-4" })).toBe(true);
     expect(isGatewayEvent({ type: "session_created", sessionId: "s1", model: "sonnet", runtimeId: "claude" })).toBe(true);
     expect(isGatewayEvent({ type: "session_created", sessionId: "s1", model: "sonnet", runtimeId: "claude", workspaceId: "acme" })).toBe(true);
+    expect(isGatewayEvent({ type: "session_created", sessionId: "s1", model: "sonnet", displayName: "Gateway hardening" })).toBe(true);
     expect(isGatewayEvent({
       type: "session_created",
       sessionId: "s1",
@@ -274,6 +285,11 @@ describe("isGatewayEvent", () => {
       modelCatalog: { codex: ["gpt-5.2-codex", "gpt-5.3-codex"] },
       runtimeDefaults: { codex: "gpt-5.2-codex" },
     })).toBe(true);
+  });
+
+  it("validates session_updated", () => {
+    expect(isGatewayEvent({ type: "session_updated", sessionId: "s1", displayName: "FSM cleanup" })).toBe(true);
+    expect(isGatewayEvent({ type: "session_updated", sessionId: "s1", displayName: null })).toBe(true);
   });
 
   it("validates session_lifecycle", () => {

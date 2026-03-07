@@ -32,9 +32,10 @@ export interface ApplySessionLifecycleEventInput {
   metadata?: string;
 }
 
-export type SessionPatch = Partial<Omit<SessionRecord, "id" | "parkedReason" | "parkedAt">> & {
+export type SessionPatch = Partial<Omit<SessionRecord, "id" | "parkedReason" | "parkedAt" | "displayName">> & {
   parkedReason?: SessionParkedReason | null;
   parkedAt?: string | null;
+  displayName?: string | null;
 };
 
 export interface SessionStore {
@@ -54,6 +55,7 @@ interface SessionRow {
   principalType: SessionRecord["principalType"];
   principalId: string;
   source: SessionRecord["source"];
+  displayName?: string | null;
   runtimeId: string;
   acpSessionId: string;
   status: string;
@@ -107,6 +109,7 @@ const rowToRecord = (row: SessionRow): SessionRecord => {
     principalType: row.principalType,
     principalId: row.principalId,
     source: row.source,
+    ...(row.displayName ? { displayName: row.displayName } : {}),
     runtimeId: row.runtimeId,
     acpSessionId: row.acpSessionId,
     status: row.status as SessionRecord["status"],
@@ -142,6 +145,7 @@ const rowToInfo = (row: SessionRow): SessionInfo => {
     lifecycleVersion,
     model: row.model,
     workspaceId: row.workspaceId,
+    ...(row.displayName ? { displayName: row.displayName } : {}),
     principalType: row.principalType,
     principalId: row.principalId,
     source: row.source,
@@ -193,6 +197,7 @@ export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
       principalType,
       principalId,
       source,
+      displayName,
       runtimeId,
       acpSessionId,
       status,
@@ -213,6 +218,7 @@ export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
       @principalType,
       @principalId,
       @source,
+      @displayName,
       @runtimeId,
       @acpSessionId,
       @status,
@@ -308,6 +314,7 @@ export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
       principalType: session.principalType,
       principalId: session.principalId,
       source: session.source,
+      displayName: session.displayName ?? null,
       runtimeId: session.runtimeId,
       acpSessionId: session.acpSessionId,
       status: session.status,
@@ -412,6 +419,10 @@ export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
     if (normalizedPatch.runtimeId !== undefined) {
       setClauses.push("runtimeId = @runtimeId");
       params.runtimeId = normalizedPatch.runtimeId;
+    }
+    if (normalizedPatch.displayName !== undefined) {
+      setClauses.push("displayName = @displayName");
+      params.displayName = normalizedPatch.displayName;
     }
     if (normalizedPatch.principalType !== undefined) {
       setClauses.push("principalType = @principalType");

@@ -1085,6 +1085,76 @@ describe("createRouter", () => {
     expect(events[0].message).toMatch(/does not own this session/i);
   });
 
+  it("session_rename persists displayName and emits session_updated", async () => {
+    stateStore.createSession({
+      id: "sess-rename",
+      workspaceId: "default",
+      principalType: "user",
+      principalId: "user:web:user-1",
+      source: "interactive",
+      runtimeId: "claude",
+      acpSessionId: "acp-rename",
+      status: "active",
+      createdAt: "2026-03-01T00:00:00.000Z",
+      lastActivityAt: "2026-03-01T00:01:00.000Z",
+      tokenUsage: { input: 1, output: 2 },
+      model: "claude",
+    });
+
+    const { emit, events } = collectEvents();
+    router.registerConnection("conn-rename", emit);
+    const challenge = events.find((event): event is Extract<GatewayEvent, { type: "auth_challenge" }> => event.type === "auth_challenge");
+    if (!challenge) throw new Error("expected auth_challenge");
+
+    events.length = 0;
+    router.handleMessage(createAuthProof({
+      challengeId: challenge.challengeId,
+      nonce: challenge.nonce,
+      principalId: "user:web:user-1",
+    }), emit, { connectionId: "conn-rename" });
+    await vi.waitFor(() => {
+      expect(events.some((event) => event.type === "auth_result" && event.ok)).toBe(true);
+    });
+
+    events.length = 0;
+    router.handleMessage({
+      type: "session_rename",
+      sessionId: "sess-rename",
+      displayName: "Gateway rename path",
+    }, emit, { connectionId: "conn-rename" });
+
+    expect(events).toHaveLength(1);
+    expect(events[0].type).toBe("session_updated");
+    if (events[0].type !== "session_updated") throw new Error("expected session_updated");
+    expect(events[0].displayName).toBe("Gateway rename path");
+    expect(stateStore.getSession("sess-rename")?.displayName).toBe("Gateway rename path");
+  });
+
+  it("prompt auto-derives a displayName on first user prompt", async () => {
+    const { emit, events } = collectEvents();
+    router.handleMessage({ type: "session_new" }, emit);
+
+    await vi.waitFor(() => {
+      expect(events.some((event) => event.type === "session_created")).toBe(true);
+    });
+    const created = events.find((event) => event.type === "session_created");
+    if (!created || created.type !== "session_created") throw new Error("expected session_created");
+
+    events.length = 0;
+    router.handleMessage({
+      type: "prompt",
+      sessionId: created.sessionId,
+      text: "Investigate websocket drift in the parked transfer flow and summarize likely causes",
+    }, emit);
+
+    await vi.waitFor(() => {
+      expect(events.some((event) => event.type === "session_updated")).toBe(true);
+    });
+    const updated = events.find((event): event is Extract<GatewayEvent, { type: "session_updated" }> => event.type === "session_updated");
+    expect(updated?.displayName).toBe("Investigate websocket drift in the parked tra...");
+    expect(stateStore.getSession(created.sessionId)?.displayName).toBe("Investigate websocket drift in the parked tra...");
+  });
+
   it("cancel calls acpSession.cancel()", async () => {
     const { emit, events } = collectEvents();
     router.handleMessage({ type: "session_new" }, emit);

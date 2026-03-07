@@ -10,6 +10,7 @@ export interface SessionRecord {
   principalType: PrincipalType;
   principalId: string;
   source: PromptSource;
+  displayName?: string;
   runtimeId: string;
   acpSessionId: string;
   status: "active" | "idle";
@@ -101,6 +102,7 @@ export const isSessionRecord = (value: unknown): value is SessionRecord => {
     (obj.principalType === "user" || obj.principalType === "service_account") &&
     typeof obj.principalId === "string" &&
     (obj.source === "interactive" || obj.source === "schedule" || obj.source === "hook" || obj.source === "api") &&
+    (obj.displayName === undefined || typeof obj.displayName === "string") &&
     typeof obj.runtimeId === "string" &&
     typeof obj.acpSessionId === "string" &&
     typeof obj.status === "string" &&

@@ -123,6 +123,8 @@ const TRANSFER_DEFAULT_TTL_MS = 60_000;
 const CONSUMED_AUTH_CHALLENGE_TTL_MS = 15 * 60 * 1000;
 const DEFAULT_SESSION_LIST_LIMIT = 20;
 const MAX_SESSION_LIST_LIMIT = 100;
+const SESSION_DISPLAY_NAME_MAX_LEN = 64;
+const SESSION_AUTO_DISPLAY_NAME_MAX_LEN = 48;
 
 const normalizePublicKey = (publicKey: string): string => {
   const trimmed = publicKey.trim();
@@ -197,6 +199,24 @@ const safeStringify = (value: unknown): string => {
   } catch (error) {
     return `[unserializable:${error instanceof Error ? error.message : String(error)}]`;
   }
+};
+
+const normalizeSessionDisplayName = (
+  value: string | null | undefined,
+  maxLength = SESSION_DISPLAY_NAME_MAX_LEN,
+): string | null => {
+  const cleaned = value?.replace(/\s+/g, " ").trim();
+  if (!cleaned) return null;
+  if (cleaned.length <= maxLength) return cleaned;
+  return `${cleaned.slice(0, Math.max(1, maxLength - 3)).trimEnd()}...`;
+};
+
+const deriveSessionDisplayName = (promptText: string): string | null => {
+  const normalized = normalizeSessionDisplayName(promptText, SESSION_AUTO_DISPLAY_NAME_MAX_LEN);
+  if (!normalized) return null;
+  const words = normalized.split(" ");
+  const candidate = words.length > 8 ? words.slice(0, 8).join(" ") : normalized;
+  return normalizeSessionDisplayName(candidate, SESSION_AUTO_DISPLAY_NAME_MAX_LEN);
 };
 
 const emitSessionOwnershipError = (
@@ -478,6 +498,24 @@ export const createRouter = (deps: RouterDeps): Router => {
     return false;
   };
 
+  const ensureSessionPrincipalAccess = (
+    sessionId: string,
+    emit: EventEmitter,
+    context?: RouterMessageContext,
+    errorMessage = "Authenticated principal does not own this session.",
+  ): boolean => {
+    const connectionId = context?.connectionId ?? emitterConnectionIds.get(emit);
+    if (canConnectionClaimSession(sessionId, connectionId)) {
+      return true;
+    }
+    emit({
+      type: "error",
+      sessionId,
+      message: errorMessage,
+    });
+    return false;
+  };
+
   const rebindLocalOwnedSessionsToPrincipal = (
     connectionId: string,
     principalType: PrincipalType,
@@ -644,6 +682,54 @@ export const createRouter = (deps: RouterDeps): Router => {
       ...(reason ? { reason } : {}),
     };
     emitTransferEventToParties(transfer, event, preferredEmit);
+  };
+
+  const emitSessionEventToInterestedConnections = (
+    sessionId: string,
+    event: GatewayEvent,
+    preferredEmit?: EventEmitter,
+  ): void => {
+    const delivered = new Set<EventEmitter>();
+    const emitOnce = (candidate?: EventEmitter): void => {
+      if (!candidate || delivered.has(candidate)) return;
+      candidate(event);
+      delivered.add(candidate);
+    };
+
+    emitOnce(preferredEmit);
+    emitOnce(sessionOwners.get(sessionId));
+
+    const sessionPrincipal = resolveSessionPrincipal(sessionId);
+    if (!sessionPrincipal) return;
+
+    for (const [connectionId, activeEmit] of activeConnections) {
+      if (delivered.has(activeEmit)) continue;
+      const principal = resolvePrincipal(connectionId);
+      if (principal?.verified) {
+        if (
+          principal.principalType === sessionPrincipal.principalType
+          && principal.principalId === sessionPrincipal.principalId
+        ) {
+          emitOnce(activeEmit);
+        }
+        continue;
+      }
+      if (emitterOwnsSessionForPrincipal(activeEmit, sessionPrincipal.principalType, sessionPrincipal.principalId)) {
+        emitOnce(activeEmit);
+      }
+    }
+  };
+
+  const emitSessionUpdated = (
+    sessionId: string,
+    displayName: string | null,
+    preferredEmit?: EventEmitter,
+  ): void => {
+    emitSessionEventToInterestedConnections(sessionId, {
+      type: "session_updated",
+      sessionId,
+      displayName,
+    }, preferredEmit);
   };
 
   const setTransferExpired = (
@@ -2083,6 +2169,21 @@ export const createRouter = (deps: RouterDeps): Router => {
       return;
     }
 
+    const persistedSession = stateStore.getSession(msg.sessionId);
+    if (!persistedSession?.displayName) {
+      const derivedDisplayName = deriveSessionDisplayName(msg.text);
+      if (derivedDisplayName) {
+        try {
+          stateStore.updateSession(msg.sessionId, {
+            displayName: derivedDisplayName,
+          });
+          emitSessionUpdated(msg.sessionId, derivedDisplayName, emit);
+        } catch {
+          // Ignore naming races if the session disappeared during prompt handling.
+        }
+      }
+    }
+
     log.info("prompt_received", {
       connectionId,
       sessionId: msg.sessionId,
@@ -2544,6 +2645,41 @@ export const createRouter = (deps: RouterDeps): Router => {
       type: "session_lifecycle_result",
       sessionId: msg.sessionId,
       events: stateStore.listSessionLifecycleEvents(msg.sessionId, requestedLimit),
+    });
+  };
+
+  const handleSessionRename = (
+    msg: Extract<ClientMessage, { type: "session_rename" }>,
+    emit: EventEmitter,
+    context?: RouterMessageContext,
+  ): void => {
+    const existing = stateStore.getSession(msg.sessionId);
+    if (!existing) {
+      emit({
+        type: "error",
+        sessionId: msg.sessionId,
+        message: `Session not found: ${msg.sessionId}`,
+      });
+      return;
+    }
+    if (!ensureSessionPrincipalAccess(msg.sessionId, emit, context)) {
+      return;
+    }
+
+    const nextDisplayName = normalizeSessionDisplayName(msg.displayName);
+    const currentDisplayName = existing.displayName ?? null;
+    if (currentDisplayName === nextDisplayName) {
+      return;
+    }
+
+    stateStore.updateSession(msg.sessionId, {
+      displayName: nextDisplayName,
+    });
+    emitSessionUpdated(msg.sessionId, nextDisplayName, emit);
+    log.info("session_renamed", {
+      connectionId: context?.connectionId ?? emitterConnectionIds.get(emit) ?? null,
+      sessionId: msg.sessionId,
+      displayName: nextDisplayName,
     });
   };
 
@@ -3265,6 +3401,8 @@ export const createRouter = (deps: RouterDeps): Router => {
         return handleSessionList(msg, emit, context);
       case "session_lifecycle_query":
         return handleSessionLifecycleQuery(msg, emit, context);
+      case "session_rename":
+        return handleSessionRename(msg, emit, context);
       case "cancel":
         return handleCancel(msg, emit, context);
       case "session_close":

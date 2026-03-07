@@ -3,6 +3,7 @@ import type {
   ClientMessage,
   GatewayEvent,
   PromptImageInput,
+  SessionInfo,
   TranscriptMessage,
 } from "@nexus/types";
 
@@ -46,6 +47,18 @@ export interface PendingSessionTransfer {
   targetPrincipalId: string;
   expiresAt: string;
 }
+
+const sortSessionList = (sessions: SessionInfo[]): SessionInfo[] => (
+  [...sessions].sort((left, right) => {
+    const byActivity = right.lastActivityAt.localeCompare(left.lastActivityAt);
+    if (byActivity !== 0) return byActivity;
+    return right.id.localeCompare(left.id);
+  })
+);
+
+const upsertSessionListEntry = (sessions: SessionInfo[], entry: SessionInfo): SessionInfo[] => (
+  sortSessionList([entry, ...sessions.filter((session) => session.id !== entry.id)])
+);
 
 const createToolMatcher = (
   event: Extract<GatewayEvent, { type: "tool_end" }>,
@@ -92,6 +105,7 @@ const toPendingTransfer = (
 
 export interface UseSessionResult {
   sessionId: string | null;
+  sessionDisplayName: string | null;
   sessionModel: string | null;
   sessionRuntimeId: string | null;
   sessionWorkspaceId: string | null;
@@ -126,6 +140,7 @@ export interface UseSessionResult {
   requestReplay: (sessionId: string) => void;
   requestSessionList: (request?: SessionListRequestInput) => void;
   requestSessionLifecycle: (sessionId?: string, limit?: number) => void;
+  renameSession: (sessionId: string, displayName: string | null) => void;
   resumeSession: (sessionId: string) => void;
   takeoverSession: (sessionId: string) => void;
   requestSessionTransfer: (
@@ -144,6 +159,7 @@ export const useSession = (
   sendMessage: (msg: ClientMessage) => void,
 ): UseSessionResult => {
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sessionDisplayName, setSessionDisplayName] = useState<string | null>(null);
   const [sessionModel, setSessionModel] = useState<string | null>(null);
   const [sessionRuntimeId, setSessionRuntimeId] = useState<string | null>(null);
   const [sessionWorkspaceId, setSessionWorkspaceId] = useState<string | null>(null);
@@ -273,6 +289,7 @@ export const useSession = (
         setToolCalls([]);
         setError(null);
         setSessionId(event.sessionId);
+        setSessionDisplayName(event.displayName ?? null);
         setSessionModel(event.model);
         setSessionRuntimeId(event.runtimeId ?? null);
         setSessionWorkspaceId(event.workspaceId ?? "default");
@@ -305,6 +322,22 @@ export const useSession = (
         setModelCatalog(event.modelCatalog ?? {});
         setRuntimeDefaults(event.runtimeDefaults ?? {});
         setPendingSessionTransfers([]);
+        {
+          const now = new Date().toISOString();
+          setSessionList((prev) => upsertSessionListEntry(prev, {
+            id: event.sessionId,
+            status: "active",
+            lifecycleState: "live",
+            model: event.model,
+            workspaceId: event.workspaceId ?? "default",
+            ...(event.displayName ? { displayName: event.displayName } : {}),
+            principalType: event.principalType ?? "user",
+            principalId: event.principalId ?? "user:local",
+            source: event.source ?? "interactive",
+            createdAt: now,
+            lastActivityAt: now,
+          }));
+        }
         break;
       case "session_closed":
         if (event.sessionId === sessionId) {
@@ -317,6 +350,7 @@ export const useSession = (
             flushTimerRef.current = null;
           }
           setSessionId(null);
+          setSessionDisplayName(null);
           setSessionModel(null);
           setSessionRuntimeId(null);
           setSessionWorkspaceId(null);
@@ -334,6 +368,29 @@ export const useSession = (
           setError(null);
         }
         setPendingSessionTransfers((prev) => prev.filter((transfer) => transfer.sessionId !== event.sessionId));
+        setSessionList((prev) => prev.map((candidate) => (
+          candidate.id === event.sessionId
+            ? {
+                ...candidate,
+                status: "idle",
+                lifecycleState: "closed",
+              }
+            : candidate
+        )));
+        break;
+      case "session_updated":
+        if (event.sessionId === sessionId) {
+          setSessionDisplayName(event.displayName);
+        }
+        setSessionList((prev) => {
+          const existing = prev.find((candidate) => candidate.id === event.sessionId);
+          if (!existing) return prev;
+          return upsertSessionListEntry(prev, {
+            ...existing,
+            ...(event.displayName ? { displayName: event.displayName } : {}),
+            ...(event.displayName === null ? { displayName: undefined } : {}),
+          });
+        });
         break;
       case "session_invalidated":
         if (event.sessionId !== sessionId) break;
@@ -461,6 +518,7 @@ export const useSession = (
           && event.fromPrincipalType === authPrincipalTypeRef.current;
 
         if (isTarget) {
+          const knownSession = sessionListRef.current.find((candidate) => candidate.id === event.sessionId);
           queuedSteerRef.current = null;
           ignoreCancelledTurnEndRef.current = false;
           textBufferRef.current = "";
@@ -475,6 +533,7 @@ export const useSession = (
           setActiveTools([]);
           setToolCalls([]);
           setError(null);
+          setSessionDisplayName(knownSession?.displayName ?? null);
           setSessionId(event.sessionId);
           sessionPrincipalTypeRef.current = event.targetPrincipalType;
           sessionPrincipalIdRef.current = event.targetPrincipalId;
@@ -494,6 +553,7 @@ export const useSession = (
             flushTimerRef.current = null;
           }
           setSessionId(null);
+          setSessionDisplayName(null);
           setSessionModel(null);
           setSessionRuntimeId(null);
           setSessionWorkspaceId(null);
@@ -509,6 +569,12 @@ export const useSession = (
           setActiveTools([]);
           setToolCalls([]);
         }
+        setSessionList((prev) => {
+          if (isSource) {
+            return prev.filter((candidate) => candidate.id !== event.sessionId);
+          }
+          return prev;
+        });
         break;
       }
       case "text_delta":
@@ -583,6 +649,7 @@ export const useSession = (
         {
           const match = sessionListRef.current.find((session) => session.id === event.sessionId);
           if (match) {
+            setSessionDisplayName(match.displayName ?? null);
             setSessionModel(match.model);
             setSessionWorkspaceId(match.workspaceId ?? "default");
             if (match.principalType) {
@@ -604,6 +671,12 @@ export const useSession = (
         setSessionList(event.sessions);
         setSessionListHasMore(event.hasMore ?? false);
         setSessionListNextCursor(event.nextCursor ?? null);
+        if (sessionId) {
+          const current = event.sessions.find((session) => session.id === sessionId);
+          if (current) {
+            setSessionDisplayName(current.displayName ?? null);
+          }
+        }
         break;
       case "session_lifecycle_result":
         setSessionLifecycleHistory(event.events);
@@ -698,6 +771,20 @@ export const useSession = (
     [sendMessage, sessionId],
   );
 
+  const renameSession = useCallback(
+    (sid: string, displayName: string | null) => {
+      const normalizedSessionId = sid.trim();
+      if (!normalizedSessionId) return;
+      const normalizedDisplayName = typeof displayName === "string" ? displayName.trim() : null;
+      sendMessage({
+        type: "session_rename",
+        sessionId: normalizedSessionId,
+        displayName: normalizedDisplayName && normalizedDisplayName.length > 0 ? normalizedDisplayName : null,
+      });
+    },
+    [sendMessage],
+  );
+
   const resumeSession = useCallback(
     (sid: string) => {
       const normalized = sid.trim();
@@ -787,6 +874,7 @@ export const useSession = (
 
   return {
     sessionId,
+    sessionDisplayName,
     sessionModel,
     sessionRuntimeId,
     sessionWorkspaceId,
@@ -821,6 +909,7 @@ export const useSession = (
     requestReplay,
     requestSessionList,
     requestSessionLifecycle,
+    renameSession,
     resumeSession,
     takeoverSession,
     requestSessionTransfer,

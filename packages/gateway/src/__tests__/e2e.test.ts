@@ -261,12 +261,10 @@ describe("E2E: WS client -> Gateway -> mock ACP session -> events back", () => {
       ws.send(
         JSON.stringify({ type: "prompt", sessionId, text: "hello world" }),
       );
-      const promptResponseRaw = await waitForMessage(messages);
-      const promptResponse = JSON.parse(promptResponseRaw) as GatewayEvent;
+      const promptResponse = await waitForEvent(messages, "turn_end");
 
       // Router emits turn_end when the mock prompt resolves
       expect(promptResponse.type).toBe("turn_end");
-      if (promptResponse.type !== "turn_end") throw new Error("unreachable");
       expect(promptResponse.sessionId).toBe(sessionId);
 
       // 4. Verify lastActivityAt was updated in state store
@@ -366,8 +364,7 @@ describe("E2E: WS client -> Gateway -> mock ACP session -> events back", () => {
         sessionId: created.sessionId,
         text: "remember this line",
       }));
-      const promptRaw = await waitForMessage(first.messages);
-      const promptEvent = JSON.parse(promptRaw) as GatewayEvent;
+      const promptEvent = await waitForEvent(first.messages, "turn_end");
       expect(promptEvent.type).toBe("turn_end");
 
       first.ws.close();

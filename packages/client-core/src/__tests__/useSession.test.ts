@@ -25,6 +25,7 @@ describe("useSession", () => {
     const { result } = renderHook(() => useSession(sendMessage));
 
     expect(result.current.sessionId).toBeNull();
+    expect(result.current.sessionDisplayName).toBeNull();
     expect(result.current.sessionModel).toBeNull();
     expect(result.current.sessionRuntimeId).toBeNull();
     expect(result.current.sessionWorkspaceId).toBeNull();
@@ -53,10 +54,12 @@ describe("useSession", () => {
         type: "session_created",
         sessionId: "sess-123",
         model: "claude-4",
+        displayName: "Prompt triage",
       });
     });
 
     expect(result.current.sessionId).toBe("sess-123");
+    expect(result.current.sessionDisplayName).toBe("Prompt triage");
     expect(result.current.sessionModel).toBe("claude-4");
     expect(result.current.sessionRuntimeId).toBeNull();
     expect(result.current.sessionWorkspaceId).toBe("default");
@@ -181,6 +184,40 @@ describe("useSession", () => {
       sessionId: "sess-1",
       text: "new question",
     });
+  });
+
+  it("renameSession sends session_rename and updates local display name from session_updated", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_created",
+        sessionId: "sess-1",
+        model: "claude-4",
+      });
+    });
+
+    act(() => {
+      result.current.renameSession("sess-1", "Gateway polish");
+    });
+
+    expect(sendMessage).toHaveBeenCalledWith({
+      type: "session_rename",
+      sessionId: "sess-1",
+      displayName: "Gateway polish",
+    });
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_updated",
+        sessionId: "sess-1",
+        displayName: "Gateway polish",
+      });
+    });
+
+    expect(result.current.sessionDisplayName).toBe("Gateway polish");
+    expect(result.current.sessionList[0]?.displayName).toBe("Gateway polish");
   });
 
   it("sets isStreaming false on turn_end", () => {

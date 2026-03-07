@@ -13,6 +13,7 @@ export const initDatabase = (db: DatabaseAdapter): void => {
       principalType TEXT NOT NULL DEFAULT 'user',
       principalId TEXT NOT NULL DEFAULT 'user:local',
       source TEXT NOT NULL DEFAULT 'interactive',
+      displayName TEXT,
       runtimeId TEXT NOT NULL,
       acpSessionId TEXT NOT NULL,
       status TEXT NOT NULL,
@@ -170,6 +171,9 @@ export const initDatabase = (db: DatabaseAdapter): void => {
   }
   if (!hasColumn(db, "sessions", "source")) {
     db.exec("ALTER TABLE sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'interactive';");
+  }
+  if (!hasColumn(db, "sessions", "displayName")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN displayName TEXT;");
   }
   if (!hasColumn(db, "sessions", "lifecycleState")) {
     db.exec("ALTER TABLE sessions ADD COLUMN lifecycleState TEXT NOT NULL DEFAULT 'live';");

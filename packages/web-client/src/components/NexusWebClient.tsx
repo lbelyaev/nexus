@@ -9,7 +9,7 @@ import {
   type UseApprovalResult,
   type UseSessionResult,
 } from "@nexus/client-core";
-import type { GatewayEvent } from "@nexus/types";
+import type { GatewayEvent, SessionInfo } from "@nexus/types";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { mergeContiguousMessages, type ChatMessage } from "../lib/chatMerge";
@@ -39,6 +39,60 @@ const compact = (text: string, max: number = 120): string => {
   const cleaned = text.replace(/\s+/g, " ").trim();
   if (cleaned.length <= max) return cleaned;
   return `${cleaned.slice(0, max - 3)}...`;
+};
+
+const SESSION_DRAWER_LIMIT = 50;
+
+const formatSessionTitle = (session: SessionInfo): string => (
+  session.displayName?.trim() || `Session ${session.id.slice(-6)}`
+);
+
+const formatSessionState = (session: SessionInfo): "live" | "parked" | "closed" => (
+  session.lifecycleState ?? (session.status === "active" ? "live" : "parked")
+);
+
+const getSessionStatusPresentation = (
+  session: SessionInfo,
+  activeSessionId: string | null,
+): { dotClass: string; label: string; hint: string } => {
+  if (session.id === activeSessionId) {
+    return {
+      dotClass: "bg-sky-400 shadow-[0_0_0_4px_rgba(56,189,248,0.16)]",
+      label: "Current",
+      hint: "live in this client",
+    };
+  }
+  const state = formatSessionState(session);
+  if (state === "parked") {
+    return {
+      dotClass: "bg-rose-400 shadow-[0_0_0_4px_rgba(251,113,133,0.14)]",
+      label: "Suspended",
+      hint: session.parkedReason ?? "parked",
+    };
+  }
+  if (state === "closed") {
+    return {
+      dotClass: "bg-slate-500 shadow-[0_0_0_4px_rgba(100,116,139,0.14)]",
+      label: "Closed",
+      hint: "closed",
+    };
+  }
+  return {
+    dotClass: "bg-amber-400 shadow-[0_0_0_4px_rgba(251,191,36,0.14)]",
+    label: "Elsewhere",
+    hint: "live on another client",
+  };
+};
+
+const formatSessionTimestamp = (value: string): string => {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
 };
 
 const normalizePrincipalIdInput = (
@@ -199,7 +253,7 @@ const formatSessionListResult = (
     ...shown.map((session) => ({
       id: makeId(),
       role: "system" as const,
-      text: `- ${session.id}${session.id === activeSessionId ? " (current)" : ""} lifecycle=${formatLifecycle(session)} workspace=${session.workspaceId ?? "default"} model=${session.model} last=${session.lastActivityAt} next=${formatNextAction(session)}`,
+      text: `- ${formatSessionTitle(session)} [${session.id}]${session.id === activeSessionId ? " (current)" : ""} lifecycle=${formatLifecycle(session)} workspace=${session.workspaceId ?? "default"} model=${session.model} last=${session.lastActivityAt} next=${formatNextAction(session)}`,
     })),
     ...(hasMore ? [{ id: makeId(), role: "system" as const, text: "More sessions available. Use /session list next." }] : []),
     { id: makeId(), role: "system" as const, text: "Use /session resume <sessionId> to attach a listed session." },
@@ -287,6 +341,9 @@ const ConnectedClient = ({
   const [aliasTarget, setAliasTarget] = useState("");
   const [usageSearch, setUsageSearch] = useState("");
   const [initializingDotCount, setInitializingDotCount] = useState(1);
+  const [sessionDrawerOpen, setSessionDrawerOpen] = useState(true);
+  const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
+  const [sessionNameDraft, setSessionNameDraft] = useState("");
 
   const creatingSessionRef = useRef(false);
   const prevStreamingRef = useRef(false);
@@ -394,6 +451,21 @@ const ConnectedClient = ({
     preferredWorkspaceId,
     session.authStatus,
     session.sessionId,
+    status,
+  ]);
+
+  useEffect(() => {
+    if (!sessionDrawerOpen) return;
+    if (status !== "connected") return;
+    if (session.authStatus === "unverified" || session.authStatus === "verifying") return;
+    session.requestSessionList({ limit: SESSION_DRAWER_LIMIT });
+  }, [
+    session.authPrincipalId,
+    session.authPrincipalType,
+    session.authStatus,
+    session.sessionId,
+    sessionDrawerOpen,
+    session.requestSessionList,
     status,
   ]);
 
@@ -1055,6 +1127,39 @@ const ConnectedClient = ({
     appendSystem(`Closing session ${session.sessionId}...`);
   }, [appendSystem, session]);
 
+  const handleRenameSubmit = useCallback((sessionId: string) => {
+    session.renameSession(sessionId, sessionNameDraft.trim() || null);
+    appendSystem(`Updating session name for ${sessionId}...`);
+    setEditingSessionId(null);
+    setSessionNameDraft("");
+  }, [appendSystem, session, sessionNameDraft]);
+
+  const handleSessionHistoryRequest = useCallback((sessionId: string) => {
+    pendingSessionHistorySessionIdRef.current = sessionId;
+    appendSystem(`Fetching session history for ${sessionId}...`);
+    session.requestSessionLifecycle(sessionId);
+  }, [appendSystem, session]);
+
+  const handleResumeListedSession = useCallback((candidate: SessionInfo) => {
+    const state = formatSessionState(candidate);
+    if (state === "live" && candidate.id !== session.sessionId) {
+      appendSystem(`Session ${candidate.id} is already live on another client.`);
+      return;
+    }
+    session.resumeSession(candidate.id);
+    appendSystem(`Resuming session ${candidate.id}...`);
+  }, [appendSystem, session]);
+
+  const handleTakeoverListedSession = useCallback((candidate: SessionInfo) => {
+    session.takeoverSession(candidate.id);
+    appendSystem(`Taking over session ${candidate.id}...`);
+  }, [appendSystem, session]);
+
+  const handleCloseListedSession = useCallback((candidate: SessionInfo) => {
+    sendMessage({ type: "session_close", sessionId: candidate.id });
+    appendSystem(`Closing session ${candidate.id}...`);
+  }, [appendSystem, sendMessage]);
+
   const handleAddAlias = useCallback(() => {
     const alias = aliasName.trim().toLowerCase();
     const target = aliasTarget.trim();
@@ -1076,6 +1181,10 @@ const ConnectedClient = ({
       && transfer.targetPrincipalType === authType;
   });
   const currentTransfer = pendingTransfers[0] ?? null;
+  const visibleSessions = useMemo(
+    () => session.sessionList.slice(0, SESSION_DRAWER_LIMIT),
+    [session.sessionList],
+  );
 
   const handleApprove = useCallback(() => {
     if (!currentApproval) return;
@@ -1121,7 +1230,188 @@ const ConnectedClient = ({
   }, [isSessionInitializing]);
 
   return (
-    <div className={showSessionControlPanel ? "grid h-full min-h-0 gap-3 lg:grid-cols-[320px_minmax(0,1fr)]" : "h-full"}>
+    <div className={sessionDrawerOpen ? "grid h-full min-h-0 gap-3 lg:grid-cols-[320px_minmax(0,1fr)]" : "grid h-full min-h-0 gap-3 lg:grid-cols-[72px_minmax(0,1fr)]"}>
+      <aside className={`panel min-h-0 overflow-hidden transition-all duration-200 ${sessionDrawerOpen ? "p-4" : "p-2"}`}>
+        <div className={`flex items-center ${sessionDrawerOpen ? "justify-between" : "justify-center"}`}>
+          {sessionDrawerOpen ? (
+            <div>
+              <div className="text-[10px] uppercase tracking-[0.24em] text-ink-100/45">Sessions</div>
+              <h2 className="panel-title mt-1">Navigator</h2>
+            </div>
+          ) : null}
+          <button
+            type="button"
+            className="button-secondary px-2 py-1 text-xs"
+            onClick={() => setSessionDrawerOpen((open) => !open)}
+            aria-label={sessionDrawerOpen ? "Collapse session drawer" : "Expand session drawer"}
+            title={sessionDrawerOpen ? "Collapse session drawer" : "Expand session drawer"}
+          >
+            {sessionDrawerOpen ? "Hide" : "Sessions"}
+          </button>
+        </div>
+
+        {sessionDrawerOpen ? (
+          <>
+            <div className="mt-3 flex items-center justify-between text-xs text-ink-100/65">
+              <span>{visibleSessions.length} session{visibleSessions.length === 1 ? "" : "s"}</span>
+              <button
+                type="button"
+                className="button-secondary px-2 py-1 text-[11px]"
+                onClick={() => session.requestSessionList({ limit: SESSION_DRAWER_LIMIT })}
+              >
+                Refresh
+              </button>
+            </div>
+
+            <div className="mt-4 space-y-3 overflow-y-auto pr-1">
+              {visibleSessions.length === 0 ? (
+                <div className="rounded-2xl border border-white/8 bg-ink-950/55 px-3 py-4 text-sm text-ink-100/60">
+                  No sessions loaded yet.
+                </div>
+              ) : visibleSessions.map((candidate) => {
+                const presentation = getSessionStatusPresentation(candidate, session.sessionId);
+                const state = formatSessionState(candidate);
+                const isCurrent = candidate.id === session.sessionId;
+                const isEditing = editingSessionId === candidate.id;
+                const canResume = state === "parked" && candidate.parkedReason !== "transfer_pending";
+                const canTakeover = state === "parked";
+                const canClose = state !== "closed";
+
+                return (
+                  <article
+                    key={candidate.id}
+                    className={`rounded-2xl border px-3 py-3 ${
+                      isCurrent
+                        ? "border-sky-400/45 bg-sky-500/10"
+                        : "border-white/8 bg-ink-950/55"
+                    }`}
+                  >
+                    <div className="flex items-start gap-3">
+                      <span className={`mt-1 h-2.5 w-2.5 rounded-full ${presentation.dotClass}`} aria-hidden />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <div className="truncate text-sm font-semibold text-white">
+                              {formatSessionTitle(candidate)}
+                            </div>
+                            <div className="mt-1 text-[11px] uppercase tracking-[0.18em] text-ink-100/45">
+                              {presentation.label}
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            className="text-xs text-ink-100/55 hover:text-ink-100"
+                            onClick={() => {
+                              setEditingSessionId(candidate.id);
+                              setSessionNameDraft(candidate.displayName ?? "");
+                            }}
+                          >
+                            Rename
+                          </button>
+                        </div>
+
+                        {isEditing ? (
+                          <div className="mt-3 flex gap-2">
+                            <input
+                              className="input h-9 text-sm"
+                              value={sessionNameDraft}
+                              onChange={(event) => setSessionNameDraft(event.target.value)}
+                              placeholder="Short session name"
+                              onKeyDown={(event) => {
+                                if (event.key === "Enter") {
+                                  event.preventDefault();
+                                  handleRenameSubmit(candidate.id);
+                                }
+                                if (event.key === "Escape") {
+                                  setEditingSessionId(null);
+                                  setSessionNameDraft("");
+                                }
+                              }}
+                            />
+                            <button
+                              type="button"
+                              className="button-primary px-3 py-2 text-xs"
+                              onClick={() => handleRenameSubmit(candidate.id)}
+                            >
+                              Save
+                            </button>
+                          </div>
+                        ) : null}
+
+                        <div className="mt-3 space-y-1 text-xs text-ink-100/72">
+                          <div>{presentation.hint}</div>
+                          <div>{candidate.workspaceId ?? "default"} · {candidate.model}</div>
+                          <div>Updated {formatSessionTimestamp(candidate.lastActivityAt)}</div>
+                        </div>
+
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          {canResume ? (
+                            <button
+                              type="button"
+                              className="button-secondary px-2.5 py-1.5 text-xs"
+                              onClick={() => handleResumeListedSession(candidate)}
+                            >
+                              Resume
+                            </button>
+                          ) : null}
+                          {canTakeover ? (
+                            <button
+                              type="button"
+                              className="button-secondary px-2.5 py-1.5 text-xs"
+                              onClick={() => handleTakeoverListedSession(candidate)}
+                            >
+                              Takeover
+                            </button>
+                          ) : null}
+                          <button
+                            type="button"
+                            className="button-secondary px-2.5 py-1.5 text-xs"
+                            onClick={() => handleSessionHistoryRequest(candidate.id)}
+                          >
+                            History
+                          </button>
+                          {canClose ? (
+                            <button
+                              type="button"
+                              className="button-secondary px-2.5 py-1.5 text-xs"
+                              onClick={() => handleCloseListedSession(candidate)}
+                            >
+                              Close
+                            </button>
+                          ) : null}
+                        </div>
+                      </div>
+                    </div>
+                  </article>
+                );
+              })}
+            </div>
+          </>
+        ) : (
+          <div className="mt-4 flex flex-col items-center gap-3">
+            {visibleSessions.slice(0, 6).map((candidate) => {
+              const presentation = getSessionStatusPresentation(candidate, session.sessionId);
+              return (
+                <button
+                  key={candidate.id}
+                  type="button"
+                  className="flex h-10 w-10 items-center justify-center rounded-2xl border border-white/8 bg-ink-950/60"
+                  title={`${formatSessionTitle(candidate)} · ${presentation.hint}`}
+                  onClick={() => {
+                    setSessionDrawerOpen(true);
+                    if (formatSessionState(candidate) === "parked" && candidate.parkedReason !== "transfer_pending") {
+                      handleResumeListedSession(candidate);
+                    }
+                  }}
+                >
+                  <span className={`h-2.5 w-2.5 rounded-full ${presentation.dotClass}`} aria-hidden />
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </aside>
+
       {showSessionControlPanel ? <aside className="panel min-h-0 overflow-y-auto p-4">
         <h2 className="panel-title">Session Control</h2>
 
@@ -1292,7 +1582,12 @@ const ConnectedClient = ({
               }`}
               aria-hidden
             />
-            <h1 className="panel-title">Nexus</h1>
+            <div>
+              <h1 className="panel-title">Nexus</h1>
+              <div className="text-xs text-ink-100/55">
+                {session.sessionDisplayName ?? (session.sessionId ? `Session ${session.sessionId.slice(-6)}` : "No active session")}
+              </div>
+            </div>
           </div>
           <div className="ml-auto flex items-center gap-2">
             <select

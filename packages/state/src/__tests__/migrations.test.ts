@@ -22,6 +22,7 @@ describe("initDatabase", () => {
     expect(columnNames).toContain("principalType");
     expect(columnNames).toContain("principalId");
     expect(columnNames).toContain("source");
+    expect(columnNames).toContain("displayName");
     expect(columnNames).toContain("runtimeId");
     expect(columnNames).toContain("acpSessionId");
     expect(columnNames).toContain("status");
@@ -195,6 +196,7 @@ describe("initDatabase", () => {
     expect(columnNames).toContain("principalId");
     expect(columnNames).toContain("lifecycleState");
     expect(columnNames).toContain("workspaceId");
+    expect(columnNames).toContain("displayName");
 
     const indexes = db
       .prepare(
