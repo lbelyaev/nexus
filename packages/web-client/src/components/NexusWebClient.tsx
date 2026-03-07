@@ -715,6 +715,18 @@ const ConnectedClient = ({
               appendSystem("Usage: /session transfer request <targetPrincipalId> [user|service_account] [expiresMs]");
               return true;
             }
+            const looksLikeSessionId =
+              targetPrincipalRaw.startsWith("gw-")
+              || session.sessionList.some((candidate) => candidate.id === targetPrincipalRaw);
+            if (looksLikeSessionId) {
+              appendSystem(
+                "That looks like a session ID, not a principal ID. `/session transfer request` transfers the current web session to a principal.",
+              );
+              appendSystem(
+                `To move a Telegram session into web, request the transfer from Telegram and target your web principal ${session.authPrincipalId ?? "(web principal not authenticated yet)"}.`,
+              );
+              return true;
+            }
             if (expiresInMsRaw) {
               const parsedExpiresInMs = Number.parseInt(expiresInMsRaw, 10);
               if (!Number.isFinite(parsedExpiresInMs) || parsedExpiresInMs <= 0) {
