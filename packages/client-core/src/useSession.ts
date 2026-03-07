@@ -380,15 +380,20 @@ export const useSession = (
         break;
       case "session_updated":
         if (event.sessionId === sessionId) {
-          setSessionDisplayName(event.displayName);
+          if (event.displayName !== undefined) {
+            setSessionDisplayName(event.displayName);
+          }
         }
         setSessionList((prev) => {
           const existing = prev.find((candidate) => candidate.id === event.sessionId);
           if (!existing) return prev;
           return upsertSessionListEntry(prev, {
             ...existing,
-            ...(event.displayName ? { displayName: event.displayName } : {}),
+            ...(event.displayName !== undefined && event.displayName !== null ? { displayName: event.displayName } : {}),
             ...(event.displayName === null ? { displayName: undefined } : {}),
+            ...(event.interruption !== undefined ? { interruption: event.interruption ?? undefined } : {}),
+            ...(event.lifecycleState ? { lifecycleState: event.lifecycleState } : {}),
+            ...(event.parkedReason !== undefined ? { parkedReason: event.parkedReason ?? undefined } : {}),
           });
         });
         break;

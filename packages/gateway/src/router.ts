@@ -9,6 +9,7 @@ import type {
   PromptSource,
   RuntimeHealthInfo,
   RuntimeHealthStatus,
+  SessionInterruption,
   SessionLifecycleEventType,
   SessionLifecycleState,
   SessionParkedReason,
@@ -193,6 +194,10 @@ const mapStopReasonToExecutionState = (stopReason: string | undefined): Executio
   return "succeeded";
 };
 
+const isPromptTimeoutErrorMessage = (message: string): boolean => (
+  message.includes('RPC request "session/prompt"') && message.includes("timed out")
+);
+
 const safeStringify = (value: unknown): string => {
   try {
     return JSON.stringify(value);
@@ -262,7 +267,7 @@ export const createRecordingEmitter = (
   downstream: EventEmitter,
   options?: {
     onTextDelta?: () => void;
-    onApprovalRequest?: (requestId: string) => void;
+    onApprovalRequest?: (event: Extract<GatewayEvent, { type: "approval_request" }>) => void;
     onAssistantMessage?: (assistantText: string) => void;
     onAnyEvent?: (event: GatewayEvent) => void;
   },
@@ -304,7 +309,7 @@ export const createRecordingEmitter = (
         });
         break;
       case "approval_request":
-        options?.onApprovalRequest?.(event.requestId);
+        options?.onApprovalRequest?.(event);
         break;
       case "turn_end":
         if (assistantBuffer) {
@@ -357,6 +362,10 @@ export const createRouter = (deps: RouterDeps): Router => {
     executionId?: string;
     parentExecutionId?: string;
     policySnapshotId?: string;
+    tool?: string;
+    description?: string;
+    task?: string;
+    createdAt: string;
   }>();
   const sessionIdempotency = new Map<string, Map<string, {
     state: "running" | "completed";
@@ -723,13 +732,46 @@ export const createRouter = (deps: RouterDeps): Router => {
   const emitSessionUpdated = (
     sessionId: string,
     displayName: string | null,
+    options?: {
+      interruption?: SessionInterruption | null;
+      lifecycleState?: SessionLifecycleState;
+      parkedReason?: SessionParkedReason | null;
+    },
     preferredEmit?: EventEmitter,
   ): void => {
     emitSessionEventToInterestedConnections(sessionId, {
       type: "session_updated",
       sessionId,
       displayName,
+      ...(options?.interruption !== undefined ? { interruption: options.interruption } : {}),
+      ...(options?.lifecycleState !== undefined ? { lifecycleState: options.lifecycleState } : {}),
+      ...(options?.parkedReason !== undefined ? { parkedReason: options.parkedReason } : {}),
     }, preferredEmit);
+  };
+
+  const setSessionInterruption = (
+    sessionId: string,
+    interruption: SessionInterruption | null,
+    preferredEmit?: EventEmitter,
+  ): void => {
+    try {
+      stateStore.updateSession(sessionId, {
+        interruption,
+      });
+    } catch {
+      return;
+    }
+    const sessionRecord = stateStore.getSession(sessionId);
+    emitSessionUpdated(
+      sessionId,
+      sessionRecord?.displayName ?? null,
+      {
+        interruption,
+        lifecycleState: sessionRecord?.lifecycleState,
+        parkedReason: sessionRecord?.parkedReason ?? null,
+      },
+      preferredEmit,
+    );
   };
 
   const setTransferExpired = (
@@ -1119,6 +1161,10 @@ export const createRouter = (deps: RouterDeps): Router => {
       }
 
       const workspaceId = sessionRecord.workspaceId || defaultWorkspaceId;
+      const interruption = sessionRecord.interruption;
+      const staleApprovalInterruption = interruption?.kind === "approval_pending"
+        ? { ...interruption, stale: true }
+        : null;
       const policyContext: SessionPolicyContext = {
         principalType,
         principalId,
@@ -1152,13 +1198,23 @@ export const createRouter = (deps: RouterDeps): Router => {
           principalId,
           source,
           workspaceId,
+          ...(staleApprovalInterruption ? { interruption: staleApprovalInterruption } : {}),
         });
         emit({
           type: "session_invalidated",
           sessionId,
           reason: "runtime_state_lost",
-          message: "Session runtime state was lost after restart and cold-restored. Replay transcript if needed.",
+          message: staleApprovalInterruption
+            ? "Session runtime restarted while a tool approval was pending. The original approval expired; continue the interrupted task to rerun it."
+            : "Session runtime state was lost after restart and cold-restored. Replay transcript if needed.",
         });
+        if (staleApprovalInterruption) {
+          emitSessionUpdated(sessionId, sessionRecord.displayName ?? null, {
+            interruption: staleApprovalInterruption,
+            lifecycleState: sessionRecord.lifecycleState,
+            parkedReason: sessionRecord.parkedReason ?? null,
+          }, emit);
+        }
         log.info("session_rehydrated", {
           connectionId: connectionId ?? null,
           sessionId,
@@ -1200,30 +1256,109 @@ export const createRouter = (deps: RouterDeps): Router => {
   const trackPendingApproval = (
     sessionId: string,
     requestId: string,
+    tool: string,
+    description: string,
+    task: string,
     turnId?: string,
     executionId?: string,
     parentExecutionId?: string,
     correlationPolicySnapshotId?: string,
+    preferredEmit?: EventEmitter,
   ): void => {
     requestToSession.set(requestId, {
       sessionId,
+      tool,
+      description,
+      task,
       turnId,
       executionId,
       parentExecutionId,
       policySnapshotId: correlationPolicySnapshotId,
+      createdAt: new Date().toISOString(),
     });
     const pending = sessionToPendingRequests.get(sessionId) ?? new Set<string>();
+    const wasEmpty = pending.size === 0;
     pending.add(requestId);
     sessionToPendingRequests.set(sessionId, pending);
+    const interruption: SessionInterruption = {
+      kind: "approval_pending",
+      requestId,
+      tool,
+      description,
+      task,
+      createdAt: new Date().toISOString(),
+      ...(executionId ? { executionId } : {}),
+      ...(parentExecutionId ? { parentExecutionId } : {}),
+      ...(turnId ? { turnId } : {}),
+    };
+    setSessionInterruption(sessionId, interruption, preferredEmit);
+    if (wasEmpty) {
+      applyLifecycleEvent(sessionId, "APPROVAL_REQUESTED", {
+        reason: "approval_requested",
+        parkedReason: "approval_pending",
+        notifyEmit: preferredEmit,
+      });
+    }
   };
 
-  const clearPendingApproval = (sessionId: string, requestId: string): void => {
+  const clearPendingApproval = (
+    sessionId: string,
+    requestId: string,
+    options?: {
+      resolveLifecycle?: boolean;
+      markStale?: boolean;
+      preferredEmit?: EventEmitter;
+    },
+  ): void => {
     requestToSession.delete(requestId);
     const pending = sessionToPendingRequests.get(sessionId);
-    if (!pending) return;
+    if (!pending) {
+      if (options?.markStale) {
+        const current = stateStore.getSession(sessionId)?.interruption;
+        if (current?.kind === "approval_pending") {
+          setSessionInterruption(sessionId, { ...current, stale: true }, options.preferredEmit);
+        }
+      }
+      return;
+    }
     pending.delete(requestId);
     if (pending.size === 0) {
       sessionToPendingRequests.delete(sessionId);
+      if (options?.markStale) {
+        const current = stateStore.getSession(sessionId)?.interruption;
+        if (current?.kind === "approval_pending") {
+          setSessionInterruption(sessionId, { ...current, stale: true }, options.preferredEmit);
+        }
+      } else {
+        setSessionInterruption(sessionId, null, options?.preferredEmit);
+        if (options?.resolveLifecycle !== false) {
+          const current = stateStore.getSession(sessionId);
+          if (current?.lifecycleState === "parked" && current.parkedReason === "approval_pending") {
+            applyLifecycleEvent(sessionId, "APPROVAL_RESOLVED", {
+              reason: "approval_resolved",
+              parkedReason: "approval_pending",
+              notifyEmit: options?.preferredEmit,
+            });
+          }
+        }
+      }
+      return;
+    }
+    const nextRequestId = Array.from(pending)[0];
+    const nextPending = nextRequestId ? requestToSession.get(nextRequestId) : undefined;
+    if (nextPending) {
+      setSessionInterruption(sessionId, {
+        kind: "approval_pending",
+        requestId: nextRequestId,
+        tool: nextPending.tool,
+        description: nextPending.description,
+        task: nextPending.task,
+        createdAt: nextPending.createdAt,
+        ...(nextPending.executionId ? { executionId: nextPending.executionId } : {}),
+        ...(nextPending.parentExecutionId ? { parentExecutionId: nextPending.parentExecutionId } : {}),
+        ...(nextPending.turnId ? { turnId: nextPending.turnId } : {}),
+        ...(options?.markStale ? { stale: true } : {}),
+      }, options?.preferredEmit);
     }
   };
 
@@ -2177,7 +2312,7 @@ export const createRouter = (deps: RouterDeps): Router => {
           stateStore.updateSession(msg.sessionId, {
             displayName: derivedDisplayName,
           });
-          emitSessionUpdated(msg.sessionId, derivedDisplayName, emit);
+          emitSessionUpdated(msg.sessionId, derivedDisplayName, undefined, emit);
         } catch {
           // Ignore naming races if the session disappeared during prompt handling.
         }
@@ -2289,14 +2424,18 @@ export const createRouter = (deps: RouterDeps): Router => {
       onTextDelta: () => {
         sawStreamedText = true;
       },
-      onApprovalRequest: (requestId) => {
+      onApprovalRequest: (approvalEvent) => {
         trackPendingApproval(
           msg.sessionId,
-          requestId,
+          approvalEvent.requestId,
+          approvalEvent.tool,
+          approvalEvent.description,
+          msg.text,
           turnId,
           executionId,
           parentExecutionId,
           policySnapshotId,
+          emit,
         );
       },
       onAssistantMessage: (assistantText) => {
@@ -2510,11 +2649,13 @@ export const createRouter = (deps: RouterDeps): Router => {
         }
       },
       (err: unknown) => {
+        const errorMessage = err instanceof Error ? err.message : "Unknown error";
+        const pendingApprovalCount = sessionToPendingRequests.get(msg.sessionId)?.size ?? 0;
         if (idempotencyKey) {
           sessionIdempotency.get(msg.sessionId)?.delete(idempotencyKey);
         }
         finalizeExecution("failed", {
-          errorMessage: err instanceof Error ? err.message : "Unknown error",
+          errorMessage,
         });
         markTurnCompleted();
         touchSession(msg.sessionId);
@@ -2526,7 +2667,8 @@ export const createRouter = (deps: RouterDeps): Router => {
           parentExecutionId: parentExecutionId ?? null,
           turnId,
           policySnapshotId,
-          error: err instanceof Error ? err.message : "Unknown error",
+          error: errorMessage,
+          pendingApprovalCount,
         });
         stateStore.logEvent({
           sessionId: msg.sessionId,
@@ -2540,13 +2682,16 @@ export const createRouter = (deps: RouterDeps): Router => {
             principalType: principal.principalType,
             principalId: principal.principalId,
             source: principal.source,
-            error: err instanceof Error ? err.message : "Unknown error",
+            error: errorMessage,
+            pendingApprovalCount,
           }),
         });
         emitWithCorrelation({
           type: "error",
           sessionId: msg.sessionId,
-          message: err instanceof Error ? err.message : "Unknown error",
+          message: pendingApprovalCount > 0 && isPromptTimeoutErrorMessage(errorMessage)
+            ? "Task paused while waiting for approval. Approve/deny the pending request, or continue the interrupted task if the runtime restarted."
+            : errorMessage,
         });
       },
     );
@@ -2675,7 +2820,7 @@ export const createRouter = (deps: RouterDeps): Router => {
     stateStore.updateSession(msg.sessionId, {
       displayName: nextDisplayName,
     });
-    emitSessionUpdated(msg.sessionId, nextDisplayName, emit);
+    emitSessionUpdated(msg.sessionId, nextDisplayName, undefined, emit);
     log.info("session_renamed", {
       connectionId: context?.connectionId ?? emitterConnectionIds.get(emit) ?? null,
       sessionId: msg.sessionId,
@@ -2772,7 +2917,11 @@ export const createRouter = (deps: RouterDeps): Router => {
 
     const session = sessions.get(sessionId);
     if (!session) {
-      clearPendingApproval(sessionId, msg.requestId);
+      clearPendingApproval(sessionId, msg.requestId, {
+        resolveLifecycle: false,
+        markStale: true,
+        preferredEmit: emit,
+      });
       log.info("approval_response_stale_session_ignored", {
         connectionId: context?.connectionId ?? emitterConnectionIds.get(emit) ?? null,
         sessionId,
@@ -2783,7 +2932,11 @@ export const createRouter = (deps: RouterDeps): Router => {
 
     const found = session.respondToPermission(msg.requestId, optionId);
     if (!found) {
-      clearPendingApproval(sessionId, msg.requestId);
+      clearPendingApproval(sessionId, msg.requestId, {
+        resolveLifecycle: false,
+        markStale: true,
+        preferredEmit: emit,
+      });
       log.warn("approval_response_no_pending_permission", {
         connectionId: context?.connectionId ?? emitterConnectionIds.get(emit) ?? null,
         sessionId,
@@ -2793,7 +2946,9 @@ export const createRouter = (deps: RouterDeps): Router => {
       return;
     }
 
-    clearPendingApproval(sessionId, msg.requestId);
+    clearPendingApproval(sessionId, msg.requestId, {
+      preferredEmit: emit,
+    });
     touchSession(sessionId);
     log.info("approval_response_applied", {
       connectionId: context?.connectionId ?? emitterConnectionIds.get(emit) ?? null,
@@ -2861,6 +3016,74 @@ export const createRouter = (deps: RouterDeps): Router => {
       sessionId: msg.sessionId,
       messageCount: messages.length,
     });
+  };
+
+  const handleSessionContinue = (
+    msg: Extract<ClientMessage, { type: "session_continue" }>,
+    emit: EventEmitter,
+    context?: RouterMessageContext,
+  ): void => {
+    const session = sessions.get(msg.sessionId);
+    if (!session) {
+      if (!stateStore.getSession(msg.sessionId)) {
+        emit({
+          type: "error",
+          sessionId: msg.sessionId,
+          message: `Session not found: ${msg.sessionId}`,
+        });
+        return;
+      }
+      void hydrateSessionIfPersisted(msg.sessionId, emit, context).then((hydrated) => {
+        if (!hydrated) return;
+        handleSessionContinue(msg, emit, context);
+      });
+      return;
+    }
+
+    if (!ensureSessionOwnerForConnection(msg.sessionId, emit, context)) {
+      return;
+    }
+
+    const persisted = stateStore.getSession(msg.sessionId);
+    const interruption = persisted?.interruption;
+    if (interruption?.kind !== "approval_pending" || !interruption.task) {
+      emit({
+        type: "error",
+        sessionId: msg.sessionId,
+        message: "No interrupted task is available to continue for this session.",
+      });
+      return;
+    }
+
+    const pendingApprovalCount = sessionToPendingRequests.get(msg.sessionId)?.size ?? 0;
+    if (pendingApprovalCount > 0 && !interruption.stale) {
+      emit({
+        type: "error",
+        sessionId: msg.sessionId,
+        message: "Approval is still pending for this task. Approve or deny it first.",
+      });
+      return;
+    }
+
+    if (!applyLifecycleEvent(msg.sessionId, "OWNER_RESUMED", {
+      reason: "approval_interruption_resumed",
+      actorRelation: "session_owner",
+      allowedParkedReasons: ["approval_pending"],
+      actorPrincipalType: persisted?.principalType,
+      actorPrincipalId: persisted?.principalId,
+      notifyEmit: emit,
+      stateErrorMessage: "Interrupted task is not resumable from its current state.",
+      authorizationErrorMessage: "Authenticated principal does not own this session.",
+    })) {
+      return;
+    }
+    setSessionInterruption(msg.sessionId, null, emit);
+    handlePrompt({
+      type: "prompt",
+      sessionId: msg.sessionId,
+      text: interruption.task,
+      parentExecutionId: interruption.executionId,
+    }, emit, context);
   };
 
   const handleSessionTakeover = (
@@ -3411,6 +3634,8 @@ export const createRouter = (deps: RouterDeps): Router => {
         return handleApprovalResponse(msg, emit, context);
       case "session_replay":
         return handleSessionReplay(msg, emit, context);
+      case "session_continue":
+        return handleSessionContinue(msg, emit, context);
       case "session_takeover":
         return handleSessionTakeover(msg, emit, context);
       case "session_transfer_request":

@@ -14,6 +14,8 @@ import {
   isSessionLifecycleState,
   isSessionParkedReason,
 } from "./sessionLifecycle.js";
+import type { SessionInterruption } from "./sessionInterruption.js";
+import { isSessionInterruption } from "./sessionInterruption.js";
 
 export interface SessionInfo {
   id: string;
@@ -26,6 +28,7 @@ export interface SessionInfo {
   model: string;
   workspaceId?: string;
   displayName?: string;
+  interruption?: SessionInterruption;
   principalType?: PrincipalType;
   principalId?: string;
   source?: PromptSource;
@@ -103,6 +106,7 @@ export type ClientMessage =
       displayName: string | null;
     }
   | { type: "session_replay"; sessionId: string }
+  | { type: "session_continue"; sessionId: string }
   | { type: "session_takeover"; sessionId: string }
   | {
       type: "auth_proof";
@@ -221,6 +225,9 @@ export type GatewayEvent =
       type: "session_updated";
       sessionId: string;
       displayName: string | null;
+      interruption?: SessionInterruption | null;
+      lifecycleState?: SessionLifecycleState;
+      parkedReason?: SessionParkedReason | null;
     }
   | {
       type: "session_invalidated";
@@ -401,6 +408,7 @@ const CLIENT_MESSAGE_TYPES = new Set([
   "session_lifecycle_query",
   "session_rename",
   "session_replay",
+  "session_continue",
   "session_takeover",
   "auth_proof",
   "session_transfer_request",
@@ -573,6 +581,8 @@ export const isClientMessage = (value: unknown): value is ClientMessage => {
       );
     case "session_replay":
       return typeof obj.sessionId === "string";
+    case "session_continue":
+      return typeof obj.sessionId === "string";
     case "session_takeover":
       return typeof obj.sessionId === "string";
     case "auth_proof":
@@ -711,6 +721,9 @@ export const isGatewayEvent = (value: unknown): value is GatewayEvent => {
       return (
         typeof obj.sessionId === "string"
         && (obj.displayName === null || typeof obj.displayName === "string")
+        && (obj.interruption === undefined || obj.interruption === null || isSessionInterruption(obj.interruption))
+        && (obj.lifecycleState === undefined || isSessionLifecycleState(obj.lifecycleState))
+        && (obj.parkedReason === undefined || obj.parkedReason === null || isSessionParkedReason(obj.parkedReason))
       );
     case "session_invalidated":
       return (

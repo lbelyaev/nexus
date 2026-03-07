@@ -160,6 +160,35 @@ describe("SessionStore", () => {
     expect(store.getSession("sess-1")?.displayName).toBeUndefined();
   });
 
+  it("createSession and updateSession persist interruption metadata", () => {
+    store.createSession(makeSession({
+      interruption: {
+        kind: "approval_pending",
+        createdAt: "2025-01-01T00:00:00Z",
+        requestId: "req-1",
+        tool: "Bash",
+        task: "write the plan",
+      },
+    }));
+    expect(store.getSession("sess-1")?.interruption?.requestId).toBe("req-1");
+
+    store.updateSession("sess-1", {
+      interruption: {
+        kind: "approval_pending",
+        createdAt: "2025-01-01T00:00:00Z",
+        requestId: "req-2",
+        tool: "Edit",
+        task: "update the plan",
+        stale: true,
+      },
+    });
+    expect(store.getSession("sess-1")?.interruption?.requestId).toBe("req-2");
+    expect(store.listSessions()[0]?.interruption?.stale).toBe(true);
+
+    store.updateSession("sess-1", { interruption: null });
+    expect(store.getSession("sess-1")?.interruption).toBeUndefined();
+  });
+
   it("updateSession throws for non-existent session ID", () => {
     expect(() => store.updateSession("no-such-id", { status: "idle" })).toThrow();
   });

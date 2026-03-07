@@ -2074,6 +2074,45 @@ describe("createRouter", () => {
     expect(acpSession.respondToPermission).toHaveBeenCalledWith("req-1", "allow_once");
   });
 
+  it("approval_request parks the session and persists interrupted task metadata", async () => {
+    const { emit, events } = collectEvents();
+    router.handleMessage({ type: "session_new" }, emit);
+
+    await vi.waitFor(() => {
+      expect(events).toHaveLength(1);
+    });
+
+    const sessionId = (events[0] as Extract<GatewayEvent, { type: "session_created" }>).sessionId;
+    router.handleMessage(
+      { type: "prompt", sessionId, text: "write the implementation plan" },
+      emit,
+    );
+    const eventHandler = (acpSession.onEvent as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as EventEmitter;
+    eventHandler({
+      type: "approval_request",
+      sessionId,
+      requestId: "req-approval-park",
+      tool: "Bash",
+      description: "Ready to code?",
+    });
+
+    const stored = stateStore.getSession(sessionId);
+    expect(stored?.lifecycleState).toBe("parked");
+    expect(stored?.parkedReason).toBe("approval_pending");
+    expect(stored?.interruption).toMatchObject({
+      kind: "approval_pending",
+      requestId: "req-approval-park",
+      tool: "Bash",
+      task: "write the implementation plan",
+    });
+    expect(events.some((event) => (
+      event.type === "session_lifecycle"
+      && event.sessionId === sessionId
+      && event.eventType === "APPROVAL_REQUESTED"
+      && event.parkedReason === "approval_pending"
+    ))).toBe(true);
+  });
+
   it("approval_response forwards explicit optionId when provided", async () => {
     const { emit, events } = collectEvents();
     router.handleMessage({ type: "session_new" }, emit);
@@ -2159,6 +2198,56 @@ describe("createRouter", () => {
 
     expect(acpSession.respondToPermission).toHaveBeenCalledWith("stale-req", "allow_once");
     expect(events.filter((event) => event.type === "error")).toHaveLength(0);
+  });
+
+  it("session_continue reruns the interrupted task after stale approval", async () => {
+    (acpSession.prompt as ReturnType<typeof vi.fn>)
+      .mockImplementationOnce(() => new Promise(() => {}))
+      .mockResolvedValueOnce({ stopReason: "end_turn" });
+    (acpSession.respondToPermission as ReturnType<typeof vi.fn>).mockReturnValueOnce(false);
+
+    const { emit, events } = collectEvents();
+    router.handleMessage({ type: "session_new" }, emit);
+
+    await vi.waitFor(() => {
+      expect(events).toHaveLength(1);
+    });
+
+    const sessionId = (events[0] as Extract<GatewayEvent, { type: "session_created" }>).sessionId;
+    router.handleMessage(
+      { type: "prompt", sessionId, text: "write the implementation plan" },
+      emit,
+    );
+    const eventHandler = (acpSession.onEvent as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as EventEmitter;
+    eventHandler({
+      type: "approval_request",
+      sessionId,
+      requestId: "req-continue-1",
+      tool: "Bash",
+      description: "Ready to code?",
+    });
+
+    router.handleMessage(
+      { type: "approval_response", requestId: "req-continue-1", allow: true },
+      emit,
+    );
+
+    events.length = 0;
+    router.handleMessage(
+      { type: "session_continue", sessionId },
+      emit,
+    );
+
+    await vi.waitFor(() => {
+      expect(acpSession.prompt).toHaveBeenCalledTimes(2);
+    });
+    expect(acpSession.prompt).toHaveBeenLastCalledWith("write the implementation plan", []);
+    expect(stateStore.getSession(sessionId)?.interruption).toBeUndefined();
+    expect(events.some((event) => (
+      event.type === "session_lifecycle"
+      && event.sessionId === sessionId
+      && event.eventType === "OWNER_RESUMED"
+    ))).toBe(true);
   });
 
   it("prompt records user message to transcript", async () => {

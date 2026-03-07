@@ -31,6 +31,7 @@ describe("initDatabase", () => {
     expect(columnNames).toContain("parkedAt");
     expect(columnNames).toContain("lifecycleUpdatedAt");
     expect(columnNames).toContain("lifecycleVersion");
+    expect(columnNames).toContain("interruption");
     expect(columnNames).toContain("createdAt");
     expect(columnNames).toContain("lastActivityAt");
     expect(columnNames).toContain("tokenInput");
@@ -197,6 +198,7 @@ describe("initDatabase", () => {
     expect(columnNames).toContain("lifecycleState");
     expect(columnNames).toContain("workspaceId");
     expect(columnNames).toContain("displayName");
+    expect(columnNames).toContain("interruption");
 
     const indexes = db
       .prepare(

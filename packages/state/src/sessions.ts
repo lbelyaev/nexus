@@ -1,8 +1,10 @@
 import type { DatabaseAdapter } from "./database.js";
 import {
   applySessionLifecycleTransition,
+  isSessionInterruption,
   type SessionLifecycleEventRecord,
   type SessionLifecycleEventType,
+  type SessionInterruption,
   type SessionLifecycleState,
   type SessionParkedReason,
   type SessionRecord,
@@ -32,10 +34,11 @@ export interface ApplySessionLifecycleEventInput {
   metadata?: string;
 }
 
-export type SessionPatch = Partial<Omit<SessionRecord, "id" | "parkedReason" | "parkedAt" | "displayName">> & {
+export type SessionPatch = Partial<Omit<SessionRecord, "id" | "parkedReason" | "parkedAt" | "displayName" | "interruption">> & {
   parkedReason?: SessionParkedReason | null;
   parkedAt?: string | null;
   displayName?: string | null;
+  interruption?: SessionInterruption | null;
 };
 
 export interface SessionStore {
@@ -64,6 +67,7 @@ interface SessionRow {
   parkedAt?: string | null;
   lifecycleUpdatedAt?: string;
   lifecycleVersion?: number;
+  interruption?: string | null;
   createdAt: string;
   lastActivityAt: string;
   tokenInput: number;
@@ -93,6 +97,16 @@ const lifecycleStateToSessionStatus = (state: SessionLifecycleState): SessionRec
   state === "live" ? "active" : "idle"
 );
 
+const parseSessionInterruption = (raw: string | null | undefined): SessionInterruption | undefined => {
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return isSessionInterruption(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
 const rowToRecord = (row: SessionRow): SessionRecord => {
   const lifecycleState =
     row.lifecycleState === "live" || row.lifecycleState === "parked" || row.lifecycleState === "closed"
@@ -102,6 +116,7 @@ const rowToRecord = (row: SessionRow): SessionRecord => {
     ? row.lifecycleUpdatedAt
     : row.lastActivityAt;
   const lifecycleVersion = typeof row.lifecycleVersion === "number" ? row.lifecycleVersion : 0;
+  const interruption = parseSessionInterruption(row.interruption);
 
   return {
     id: row.id,
@@ -118,6 +133,7 @@ const rowToRecord = (row: SessionRow): SessionRecord => {
     ...(row.parkedAt ? { parkedAt: row.parkedAt } : {}),
     lifecycleUpdatedAt,
     lifecycleVersion,
+    ...(interruption ? { interruption } : {}),
     createdAt: row.createdAt,
     lastActivityAt: row.lastActivityAt,
     tokenUsage: { input: row.tokenInput, output: row.tokenOutput },
@@ -134,6 +150,7 @@ const rowToInfo = (row: SessionRow): SessionInfo => {
     ? row.lifecycleUpdatedAt
     : row.lastActivityAt;
   const lifecycleVersion = typeof row.lifecycleVersion === "number" ? row.lifecycleVersion : 0;
+  const interruption = parseSessionInterruption(row.interruption);
 
   return {
     id: row.id,
@@ -146,6 +163,7 @@ const rowToInfo = (row: SessionRow): SessionInfo => {
     model: row.model,
     workspaceId: row.workspaceId,
     ...(row.displayName ? { displayName: row.displayName } : {}),
+    ...(interruption ? { interruption } : {}),
     principalType: row.principalType,
     principalId: row.principalId,
     source: row.source,
@@ -206,6 +224,7 @@ export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
       parkedAt,
       lifecycleUpdatedAt,
       lifecycleVersion,
+      interruption,
       createdAt,
       lastActivityAt,
       tokenInput,
@@ -227,6 +246,7 @@ export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
       @parkedAt,
       @lifecycleUpdatedAt,
       @lifecycleVersion,
+      @interruption,
       @createdAt,
       @lastActivityAt,
       @tokenInput,
@@ -323,6 +343,7 @@ export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
       parkedAt,
       lifecycleUpdatedAt,
       lifecycleVersion,
+      interruption: session.interruption ? JSON.stringify(session.interruption) : null,
       createdAt: session.createdAt,
       lastActivityAt: session.lastActivityAt,
       tokenInput: session.tokenUsage.input,
@@ -423,6 +444,10 @@ export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
     if (normalizedPatch.displayName !== undefined) {
       setClauses.push("displayName = @displayName");
       params.displayName = normalizedPatch.displayName;
+    }
+    if (normalizedPatch.interruption !== undefined) {
+      setClauses.push("interruption = @interruption");
+      params.interruption = normalizedPatch.interruption ? JSON.stringify(normalizedPatch.interruption) : null;
     }
     if (normalizedPatch.principalType !== undefined) {
       setClauses.push("principalType = @principalType");

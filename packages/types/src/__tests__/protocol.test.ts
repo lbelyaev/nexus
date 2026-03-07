@@ -64,6 +64,10 @@ describe("isClientMessage", () => {
     expect(isClientMessage({ type: "session_replay", sessionId: "s1" })).toBe(true);
   });
 
+  it("validates a session_continue message", () => {
+    expect(isClientMessage({ type: "session_continue", sessionId: "s1" })).toBe(true);
+  });
+
   it("validates a session_takeover message", () => {
     expect(isClientMessage({ type: "session_takeover", sessionId: "s1" })).toBe(true);
   });
@@ -164,6 +168,10 @@ describe("isClientMessage", () => {
 
   it("rejects session_replay with missing sessionId", () => {
     expect(isClientMessage({ type: "session_replay" })).toBe(false);
+  });
+
+  it("rejects session_continue with missing sessionId", () => {
+    expect(isClientMessage({ type: "session_continue" })).toBe(false);
   });
 
   it("rejects session_takeover with missing sessionId", () => {
@@ -290,6 +298,21 @@ describe("isGatewayEvent", () => {
   it("validates session_updated", () => {
     expect(isGatewayEvent({ type: "session_updated", sessionId: "s1", displayName: "FSM cleanup" })).toBe(true);
     expect(isGatewayEvent({ type: "session_updated", sessionId: "s1", displayName: null })).toBe(true);
+    expect(isGatewayEvent({
+      type: "session_updated",
+      sessionId: "s1",
+      displayName: null,
+      lifecycleState: "parked",
+      parkedReason: "approval_pending",
+      interruption: {
+        kind: "approval_pending",
+        createdAt: "2026-01-01T00:00:00Z",
+        requestId: "req-1",
+        tool: "Bash",
+        task: "write the plan",
+        stale: true,
+      },
+    })).toBe(true);
   });
 
   it("validates session_lifecycle", () => {

@@ -277,6 +277,12 @@ const formatUserFacingError = (message: string): string => {
   return `Error: ${message}`;
 };
 
+const isApprovalPendingSession = (session: SessionInfo | undefined): boolean => (
+  session?.lifecycleState === "parked"
+  && session.parkedReason === "approval_pending"
+  && session.interruption?.kind === "approval_pending"
+);
+
 const parseUsageScope = (
   value: string | undefined,
 ): "session" | "workspace" | "hybrid" | undefined => {
@@ -405,6 +411,9 @@ const formatSessionList = (
     }
     if (state === "parked" && (session.parkedReason ?? "manual") === "transfer_pending") {
       return "transfer pending";
+    }
+    if (state === "parked" && (session.parkedReason ?? "manual") === "approval_pending") {
+      return session.interruption?.stale ? `/session continue ${session.id}` : "approval pending";
     }
     return `/session resume ${session.id}`;
   };
@@ -968,6 +977,47 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     const pendingForSession = listPendingApprovalsForSession(sessionId);
     if (pendingForSession.length === 0) return;
     await sendApprovalPrompt(pendingForSession[0], pendingForSession.length);
+  };
+
+  const sendInterruptedTaskPrompt = async (
+    binding: ConversationBinding,
+    options?: {
+      stale?: boolean;
+    },
+  ): Promise<void> => {
+    const session = sessionInfoById.get(binding.sessionId);
+    const interruption = session?.interruption;
+    if (interruption?.kind !== "approval_pending") {
+      await sendToConversation(
+        binding.adapterId,
+        binding.conversationId,
+        `Session ${binding.sessionId} has an interrupted task. Use /session continue ${binding.sessionId} to rerun it.`,
+      );
+      return;
+    }
+    const adapter = adapterById.get(binding.adapterId);
+    const supportsQuickActions = adapter?.supportsQuickActions === true;
+    const stale = options?.stale ?? interruption.stale ?? false;
+    const lines = [
+      "Interrupted task found.",
+      ...(interruption.task ? [`task=${interruption.task}`] : []),
+      ...(interruption.tool ? [`blocked_on=${compactApprovalTool(interruption.tool)}`] : []),
+      stale
+        ? "The original approval expired after runtime restart."
+        : "Approval is still pending for this task.",
+      `Use /session continue ${binding.sessionId} to rerun the interrupted task.`,
+    ];
+    await sendToConversation(
+      binding.adapterId,
+      binding.conversationId,
+      lines.join("\n"),
+      supportsQuickActions
+        ? [
+            { label: "Continue Task", command: `/session continue ${binding.sessionId}` },
+            { label: "New Session", command: "/new" },
+          ]
+        : undefined,
+    );
   };
 
   const resolveBindingBySession = (sessionId: string): ConversationBinding | undefined => {
@@ -1553,7 +1603,16 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
 
   const sendPromptOrSteer = async (message: ChannelInboundMessage): Promise<void> => {
     const sessionId = await ensureSession(message);
+    const pendingApprovals = listPendingApprovalsForSession(sessionId);
+    if (pendingApprovals.length > 0) {
+      await sendApprovalPrompt(pendingApprovals[0], pendingApprovals.length);
+      return;
+    }
     const binding = resolveBindingBySession(sessionId);
+    if (binding && isApprovalPendingSession(sessionInfoById.get(sessionId))) {
+      await sendInterruptedTaskPrompt(binding);
+      return;
+    }
     if (binding?.steeringMode === "on" && runningTurns.has(sessionId)) {
       await queueSteer(sessionId, message);
       return;
@@ -1619,7 +1678,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         "Nexus channel commands:",
         "/help",
         "/status",
-        "/session [list|history|resume|transfer|close|delete]",
+        "/session [list|history|resume|continue|transfer|close|delete]",
         "/usage [summary|stats|recent|search|context|clear]",
         "/new",
         "/cancel",
@@ -1847,6 +1906,9 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
               `Runtime: ${resolvedBinding.runtimeId ?? "default"}`,
               `Model: ${resolvedBinding.model ?? "runtime-default"}`,
               `Workspace: ${resolvedBinding.workspaceId ?? "default"}`,
+              ...(isApprovalPendingSession(sessionInfoById.get(resolvedBinding.sessionId))
+                ? [`Interrupted: approval pending${sessionInfoById.get(resolvedBinding.sessionId)?.interruption?.stale ? " (stale)" : ""}`]
+                : []),
               `Steering: ${resolvedBinding.steeringMode}`,
               `Running: ${runningTurns.has(resolvedBinding.sessionId) ? "yes" : "no"}`,
               `Pending transfers: ${Array.from(pendingTransfersBySession.values()).filter((transfer) => (
@@ -1870,6 +1932,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
             "/session list [limit|next [limit]]",
             "/session history [sessionId] [limit]",
             "/session resume <sessionId>",
+            "/session continue [sessionId]",
             "/session takeover <sessionId>",
             "/session transfer pending|request|accept|dismiss",
             "/session close [sessionId]",
@@ -1963,29 +2026,40 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         return true;
       }
 
-      if (sub === "resume" || sub === "takeover") {
+      if (sub === "resume" || sub === "takeover" || sub === "continue") {
         const sessionId = parts[1]?.trim();
-        if (!sessionId) {
+        const resolvedSessionId = sessionId || binding?.sessionId;
+        if (!resolvedSessionId) {
           await sendToConversation(
             message.adapterId,
             message.conversationId,
-            `Usage: /session ${sub} <sessionId>`,
+            `Usage: /session ${sub} [sessionId]`,
+          );
+          return true;
+        }
+        if (sub === "continue") {
+          await ensureConnectionPrincipal(resolvedPrincipal.principalType, resolvedPrincipal.principalId);
+          gatewayClient.send({ type: "session_continue", sessionId: resolvedSessionId });
+          await sendToConversation(
+            message.adapterId,
+            message.conversationId,
+            `Continuing interrupted task for session ${resolvedSessionId}...`,
           );
           return true;
         }
         await ensureConnectionPrincipal(resolvedPrincipal.principalType, resolvedPrincipal.principalId);
-        pendingSessionResumeBySession.set(sessionId, {
+        pendingSessionResumeBySession.set(resolvedSessionId, {
           adapterId: message.adapterId,
           conversationId: message.conversationId,
           principalType: resolvedPrincipal.principalType,
           principalId: resolvedPrincipal.principalId,
           previousSessionId: binding?.sessionId,
         });
-        gatewayClient.send({ type: sub === "takeover" ? "session_takeover" : "session_replay", sessionId });
+        gatewayClient.send({ type: sub === "takeover" ? "session_takeover" : "session_replay", sessionId: resolvedSessionId });
         await sendToConversation(
           message.adapterId,
           message.conversationId,
-          `${sub === "takeover" ? "Taking over" : "Resuming"} session ${sessionId}...`,
+          `${sub === "takeover" ? "Taking over" : "Resuming"} session ${resolvedSessionId}...`,
         );
         return true;
       }
@@ -2015,7 +2089,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         await sendToConversation(
           message.adapterId,
           message.conversationId,
-          "Usage: /session [list|history|resume|takeover|transfer|close|delete]",
+          "Usage: /session [list|history|resume|continue|takeover|transfer|close|delete]",
         );
         return true;
       }
@@ -2359,6 +2433,19 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
           model: event.model,
           workspaceId: event.workspaceId ?? "default",
         });
+        sessionInfoById.set(event.sessionId, {
+          id: event.sessionId,
+          status: "active",
+          lifecycleState: "live",
+          model: event.model,
+          ...(event.workspaceId ? { workspaceId: event.workspaceId } : {}),
+          ...(event.displayName ? { displayName: event.displayName } : {}),
+          ...(event.principalType ? { principalType: event.principalType } : {}),
+          ...(event.principalId ? { principalId: event.principalId } : {}),
+          ...(event.source ? { source: event.source } : {}),
+          createdAt: new Date().toISOString(),
+          lastActivityAt: new Date().toISOString(),
+        });
         const conversationKey = sessionToConversation.get(event.sessionId);
         if (conversationKey) {
           const binding = conversationBindings.get(conversationKey);
@@ -2375,6 +2462,32 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
           pendingSessionCreate = null;
           clearTimeout(resolver.timeout);
           resolver.resolve(event.sessionId);
+        }
+        break;
+      }
+      case "session_updated": {
+        const existing = sessionInfoById.get(event.sessionId);
+        if (existing) {
+          sessionInfoById.set(event.sessionId, {
+            ...existing,
+            ...(event.displayName !== null ? { displayName: event.displayName } : {}),
+            ...(event.displayName === null ? { displayName: undefined } : {}),
+            ...(event.interruption !== undefined ? { interruption: event.interruption ?? undefined } : {}),
+            ...(event.lifecycleState ? { lifecycleState: event.lifecycleState } : {}),
+            ...(event.parkedReason !== undefined ? { parkedReason: event.parkedReason ?? undefined } : {}),
+          });
+        }
+        break;
+      }
+      case "session_lifecycle": {
+        const existing = sessionInfoById.get(event.sessionId);
+        if (existing) {
+          sessionInfoById.set(event.sessionId, {
+            ...existing,
+            status: event.toState === "live" ? "active" : "idle",
+            lifecycleState: event.toState,
+            ...(event.parkedReason !== undefined ? { parkedReason: event.parkedReason } : {}),
+          });
         }
         break;
       }
@@ -2679,6 +2792,10 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         await flushStreamBufferQueued(event.sessionId, true);
         const pending = pendingPrompts.get(event.sessionId);
         pendingPrompts.delete(event.sessionId);
+        const pendingApprovals = listPendingApprovalsForSession(event.sessionId);
+        for (const approval of pendingApprovals) {
+          pendingApprovalsById.delete(approval.requestId);
+        }
         stopTyping(event.sessionId);
         runningTurns.delete(event.sessionId);
         cancelRequested.delete(event.sessionId);
@@ -2687,13 +2804,18 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         if (!binding) break;
         const conversationKey = conversationKeyOf(binding.adapterId, binding.conversationId);
         const hasQueuedReconnectPrompt = (queuedPromptsByConversation.get(conversationKey)?.length ?? 0) > 0;
-        const shouldRetryPendingPrompt = Boolean(pending && pending.retryCount < 1);
+        const approvalInterrupted = pendingApprovals.length > 0 || isApprovalPendingSession(sessionInfoById.get(event.sessionId));
+        const shouldRetryPendingPrompt = !approvalInterrupted && Boolean(pending && pending.retryCount < 1);
         if (!hasQueuedReconnectPrompt && !shouldRetryPendingPrompt) {
-          await sendToConversation(
-            binding.adapterId,
-            binding.conversationId,
-            "Session runtime restarted. Transcript and memory are still available.",
-          );
+          if (approvalInterrupted) {
+            await sendInterruptedTaskPrompt(binding, { stale: true });
+          } else {
+            await sendToConversation(
+              binding.adapterId,
+              binding.conversationId,
+              "Session runtime restarted. Transcript and memory are still available.",
+            );
+          }
         }
         if (shouldRetryPendingPrompt && pending) {
           await sendPrompt(pending.message, pending.retryCount + 1);
@@ -2769,6 +2891,20 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         stopTyping(event.sessionId);
         runningTurns.delete(event.sessionId);
         cancelRequested.delete(event.sessionId);
+        const pendingApprovals = listPendingApprovalsForSession(event.sessionId);
+        if (isPromptTimeoutMessage(event.message) && pendingApprovals.length > 0) {
+          await sendApprovalPrompt(pendingApprovals[0], pendingApprovals.length);
+          await sendToConversation(
+            binding.adapterId,
+            binding.conversationId,
+            "Task is paused waiting for approval. Approve or deny the pending request to continue.",
+          );
+          return;
+        }
+        if (isPromptTimeoutMessage(event.message) && isApprovalPendingSession(sessionInfoById.get(event.sessionId))) {
+          await sendInterruptedTaskPrompt(binding);
+          return;
+        }
         await sendToConversation(binding.adapterId, binding.conversationId, formatUserFacingError(event.message));
         break;
       }

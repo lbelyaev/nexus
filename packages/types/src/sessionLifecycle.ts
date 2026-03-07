@@ -7,10 +7,13 @@ export type SessionParkedReason =
   | "transfer_expired"
   | "runtime_timeout"
   | "owner_disconnected"
+  | "approval_pending"
   | "manual";
 
 export type SessionLifecycleEventType =
   | "SESSION_CREATED"
+  | "APPROVAL_REQUESTED"
+  | "APPROVAL_RESOLVED"
   | "TRANSFER_REQUESTED"
   | "TRANSFER_ACCEPTED"
   | "TRANSFER_DISMISSED"
@@ -63,6 +66,14 @@ export const OWNER_RESUMABLE_PARKED_REASONS = [
   "transfer_expired",
 ] as const satisfies readonly SessionParkedReason[];
 
+export const AUTO_RESUME_ALLOWED_PARKED_REASONS = [
+  "owner_disconnected",
+  "runtime_timeout",
+  "manual",
+  "transfer_expired",
+  "approval_pending",
+] as const satisfies readonly SessionParkedReason[];
+
 export const TAKEOVER_ALLOWED_PARKED_REASONS = [
   "owner_disconnected",
   "runtime_timeout",
@@ -72,6 +83,7 @@ export const TAKEOVER_ALLOWED_PARKED_REASONS = [
 
 const OWNER_RESUMABLE_PARKED_REASON_SET = new Set<SessionParkedReason>(OWNER_RESUMABLE_PARKED_REASONS);
 const TAKEOVER_ALLOWED_PARKED_REASON_SET = new Set<SessionParkedReason>(TAKEOVER_ALLOWED_PARKED_REASONS);
+const AUTO_RESUME_ALLOWED_PARKED_REASON_SET = new Set<SessionParkedReason>(AUTO_RESUME_ALLOWED_PARKED_REASONS);
 
 const SESSION_LIFECYCLE_STATES = new Set<SessionLifecycleState>([
   "live",
@@ -84,11 +96,14 @@ const SESSION_PARKED_REASONS = new Set<SessionParkedReason>([
   "transfer_expired",
   "runtime_timeout",
   "owner_disconnected",
+  "approval_pending",
   "manual",
 ]);
 
 const SESSION_LIFECYCLE_EVENT_TYPES = new Set<SessionLifecycleEventType>([
   "SESSION_CREATED",
+  "APPROVAL_REQUESTED",
+  "APPROVAL_RESOLVED",
   "TRANSFER_REQUESTED",
   "TRANSFER_ACCEPTED",
   "TRANSFER_DISMISSED",
@@ -103,12 +118,15 @@ const SESSION_LIFECYCLE_EVENT_TYPES = new Set<SessionLifecycleEventType>([
 const SESSION_LIFECYCLE_TRANSITIONS: Record<SessionLifecycleState, Partial<Record<SessionLifecycleEventType, SessionLifecycleState>>> = {
   live: {
     SESSION_CREATED: "live",
+    APPROVAL_REQUESTED: "parked",
     TRANSFER_REQUESTED: "parked",
     RUNTIME_TIMEOUT: "parked",
     OWNER_DISCONNECTED: "parked",
     SESSION_CLOSED: "closed",
   },
   parked: {
+    APPROVAL_REQUESTED: "parked",
+    APPROVAL_RESOLVED: "live",
     TRANSFER_REQUESTED: "parked",
     TRANSFER_ACCEPTED: "live",
     TRANSFER_DISMISSED: "live",
@@ -127,6 +145,7 @@ const DEFAULT_PARKED_REASON_BY_EVENT: Partial<Record<SessionLifecycleEventType, 
   TRANSFER_EXPIRED: "transfer_expired",
   RUNTIME_TIMEOUT: "runtime_timeout",
   OWNER_DISCONNECTED: "owner_disconnected",
+  APPROVAL_REQUESTED: "approval_pending",
 };
 
 export const isSessionLifecycleState = (value: unknown): value is SessionLifecycleState => (
@@ -162,7 +181,8 @@ export const canAutoResumeSession = (
   const normalizedState = lifecycleState ?? "live";
   if (normalizedState === "closed") return false;
   if (normalizedState !== "parked") return true;
-  return canOwnerResumeParkedSession(parkedReason);
+  const normalized = parkedReason ?? "manual";
+  return AUTO_RESUME_ALLOWED_PARKED_REASON_SET.has(normalized);
 };
 
 export const getSessionLifecycleNextState = (

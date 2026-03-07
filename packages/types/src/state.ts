@@ -1,6 +1,8 @@
 import type { PrincipalType, PromptSource } from "./protocol.js";
 import type { SessionLifecycleState, SessionParkedReason } from "./sessionLifecycle.js";
 import { isSessionLifecycleState, isSessionParkedReason } from "./sessionLifecycle.js";
+import type { SessionInterruption } from "./sessionInterruption.js";
+import { isSessionInterruption } from "./sessionInterruption.js";
 
 // State record types
 
@@ -19,6 +21,7 @@ export interface SessionRecord {
   parkedAt?: string;
   lifecycleUpdatedAt?: string;
   lifecycleVersion?: number;
+  interruption?: SessionInterruption;
   createdAt: string;
   lastActivityAt: string;
   tokenUsage: { input: number; output: number };
@@ -119,6 +122,7 @@ export const isSessionRecord = (value: unknown): value is SessionRecord => {
         && obj.lifecycleVersion >= 0
       )
     ) &&
+    (obj.interruption === undefined || isSessionInterruption(obj.interruption)) &&
     typeof obj.createdAt === "string" &&
     typeof obj.lastActivityAt === "string" &&
     typeof obj.model === "string" &&

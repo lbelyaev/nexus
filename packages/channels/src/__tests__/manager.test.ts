@@ -2020,6 +2020,239 @@ describe("createChannelManager", () => {
     await manager.stop();
   });
 
+  it("surfaces interrupted approval recovery instead of retrying after session_invalidated", async () => {
+    const { gatewayClient, handlers } = createMockGateway();
+    createGatewayClientMock.mockReturnValue(gatewayClient);
+    const adapterFixture = createAdapter();
+    adapterFixture.adapter.supportsQuickActions = true;
+
+    const manager = createChannelManager({
+      gatewayUrl: "ws://127.0.0.1:18800/ws",
+      token: "test-token",
+      adapters: [{ adapter: adapterFixture.adapter }],
+    });
+
+    await manager.start();
+    const context = adapterFixture.getContext();
+    expect(context).toBeDefined();
+
+    const inbound = context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-approval-restart",
+      senderId: "user-1",
+      text: "write the implementation plan",
+    });
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith(expect.objectContaining({ type: "session_new" }));
+    });
+    handlers.onEvent?.({
+      type: "session_created",
+      sessionId: "gw-session-approval-restart",
+      runtimeId: "claude",
+      model: "claude-sonnet-4-6",
+      workspaceId: "default",
+    });
+    await inbound;
+
+    handlers.onEvent?.({
+      type: "approval_request",
+      sessionId: "gw-session-approval-restart",
+      requestId: "req-restart-1",
+      tool: "Bash",
+      description: "Ready to code?",
+      options: [
+        { optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+        { optionId: "reject_once", name: "Reject once", kind: "reject_once" },
+      ],
+    });
+    handlers.onEvent?.({
+      type: "session_updated",
+      sessionId: "gw-session-approval-restart",
+      displayName: null,
+      lifecycleState: "parked",
+      parkedReason: "approval_pending",
+      interruption: {
+        kind: "approval_pending",
+        createdAt: "2026-03-07T20:00:00Z",
+        requestId: "req-restart-1",
+        tool: "Bash",
+        task: "write the implementation plan",
+        stale: true,
+      },
+    });
+
+    gatewayClient.send.mockClear();
+    adapterFixture.sendMessage.mockClear();
+
+    handlers.onEvent?.({
+      type: "session_invalidated",
+      sessionId: "gw-session-approval-restart",
+      reason: "runtime_state_lost",
+      message: "Session runtime restarted while a tool approval was pending. The original approval expired; continue the interrupted task to rerun it.",
+    });
+
+    await vi.waitFor(() => {
+      expect(adapterFixture.sendMessage).toHaveBeenCalledWith({
+        conversationId: "chat-approval-restart",
+        text: [
+          "Interrupted task found.",
+          "task=write the implementation plan",
+          "blocked_on=Bash",
+          "The original approval expired after runtime restart.",
+          "Use /session continue gw-session-approval-restart to rerun the interrupted task.",
+        ].join("\n"),
+        quickActions: [
+          { label: "Continue Task", command: "/session continue gw-session-approval-restart" },
+          { label: "New Session", command: "/new" },
+        ],
+      });
+    });
+    expect(gatewayClient.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: "prompt",
+      sessionId: "gw-session-approval-restart",
+    }));
+
+    await manager.stop();
+  });
+
+  it("blocks fresh prompts while session is parked for stale approval and offers continue", async () => {
+    const { gatewayClient, handlers } = createMockGateway();
+    createGatewayClientMock.mockReturnValue(gatewayClient);
+    const adapterFixture = createAdapter();
+    adapterFixture.adapter.supportsQuickActions = true;
+
+    const manager = createChannelManager({
+      gatewayUrl: "ws://127.0.0.1:18800/ws",
+      token: "test-token",
+      adapters: [{ adapter: adapterFixture.adapter }],
+    });
+
+    await manager.start();
+    const context = adapterFixture.getContext();
+    expect(context).toBeDefined();
+
+    const first = context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-approval-block",
+      senderId: "user-1",
+      text: "create the implementation plan",
+    });
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith(expect.objectContaining({ type: "session_new" }));
+    });
+    handlers.onEvent?.({
+      type: "session_created",
+      sessionId: "gw-session-approval-block",
+      runtimeId: "claude",
+      model: "claude-sonnet-4-6",
+      workspaceId: "default",
+    });
+    await first;
+
+    handlers.onEvent?.({
+      type: "session_updated",
+      sessionId: "gw-session-approval-block",
+      displayName: null,
+      lifecycleState: "parked",
+      parkedReason: "approval_pending",
+      interruption: {
+        kind: "approval_pending",
+        createdAt: "2026-03-07T20:00:00Z",
+        tool: "Bash",
+        task: "create the implementation plan",
+        stale: true,
+      },
+    });
+
+    gatewayClient.send.mockClear();
+    adapterFixture.sendMessage.mockClear();
+
+    await context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-approval-block",
+      senderId: "user-1",
+      text: "did you finish?",
+    });
+
+    expect(gatewayClient.send).not.toHaveBeenCalledWith(expect.objectContaining({
+      type: "prompt",
+      sessionId: "gw-session-approval-block",
+    }));
+    expect(adapterFixture.sendMessage).toHaveBeenCalledWith({
+      conversationId: "chat-approval-block",
+      text: [
+        "Interrupted task found.",
+        "task=create the implementation plan",
+        "blocked_on=Bash",
+        "The original approval expired after runtime restart.",
+        "Use /session continue gw-session-approval-block to rerun the interrupted task.",
+      ].join("\n"),
+      quickActions: [
+        { label: "Continue Task", command: "/session continue gw-session-approval-block" },
+        { label: "New Session", command: "/new" },
+      ],
+    });
+
+    await manager.stop();
+  });
+
+  it("forwards /session continue to gateway", async () => {
+    const { gatewayClient, handlers } = createMockGateway();
+    createGatewayClientMock.mockReturnValue(gatewayClient);
+    wireAuthFlow(gatewayClient, handlers);
+    const adapterFixture = createAdapter();
+
+    const manager = createChannelManager({
+      gatewayUrl: "ws://127.0.0.1:18800/ws",
+      token: "test-token",
+      adapters: [{ adapter: adapterFixture.adapter }],
+    });
+
+    await manager.start();
+    const context = adapterFixture.getContext();
+    expect(context).toBeDefined();
+
+    const inbound = context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-continue",
+      senderId: "user-1",
+      text: "start a task",
+    });
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith(expect.objectContaining({ type: "session_new" }));
+    });
+    handlers.onEvent?.({
+      type: "session_created",
+      sessionId: "gw-session-continue",
+      runtimeId: "claude",
+      model: "claude-sonnet-4-6",
+      workspaceId: "default",
+    });
+    await inbound;
+
+    gatewayClient.send.mockClear();
+    await context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-continue",
+      senderId: "user-1",
+      text: "/session continue",
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: "auth_proof",
+        principalType: "user",
+        principalId: "user:telegram-test:user-1",
+      }));
+      expect(gatewayClient.send).toHaveBeenCalledWith({
+        type: "session_continue",
+        sessionId: "gw-session-continue",
+      });
+    });
+
+    await manager.stop();
+  });
+
   it("streams assistant text via adapter upsert when streaming mode is edit", async () => {
     const { gatewayClient, handlers } = createMockGateway();
     createGatewayClientMock.mockReturnValue(gatewayClient);

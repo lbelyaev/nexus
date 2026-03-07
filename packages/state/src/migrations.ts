@@ -22,6 +22,7 @@ export const initDatabase = (db: DatabaseAdapter): void => {
       parkedAt TEXT,
       lifecycleUpdatedAt TEXT NOT NULL DEFAULT '',
       lifecycleVersion INTEGER NOT NULL DEFAULT 0,
+      interruption TEXT,
       createdAt TEXT NOT NULL,
       lastActivityAt TEXT NOT NULL,
       tokenInput INTEGER NOT NULL DEFAULT 0,
@@ -189,6 +190,9 @@ export const initDatabase = (db: DatabaseAdapter): void => {
   }
   if (!hasColumn(db, "sessions", "lifecycleVersion")) {
     db.exec("ALTER TABLE sessions ADD COLUMN lifecycleVersion INTEGER NOT NULL DEFAULT 0;");
+  }
+  if (!hasColumn(db, "sessions", "interruption")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN interruption TEXT;");
   }
   if (!hasColumn(db, "transcript_messages", "workspaceId")) {
     db.exec("ALTER TABLE transcript_messages ADD COLUMN workspaceId TEXT NOT NULL DEFAULT 'default';");
