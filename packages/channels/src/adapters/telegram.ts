@@ -156,6 +156,11 @@ const isMessageTooLongError = (error: unknown): boolean => {
   return /message[_ ]too[_ ]long|message is too long/i.test(message);
 };
 
+const isMessageNotModifiedError = (error: unknown): boolean => {
+  const message = error instanceof Error ? error.message : String(error);
+  return /message is not modified/i.test(message);
+};
+
 const toCallbackData = (command: string): string | undefined => {
   const data = `${TELEGRAM_CALLBACK_PREFIX}${command}`;
   if (Buffer.byteLength(data, "utf8") > 64) return undefined;
@@ -556,7 +561,14 @@ export const createTelegramAdapter = (options: TelegramAdapterOptions): ChannelA
               disable_web_page_preview: false,
             });
           } catch (error) {
-            if (isEntityParseError(error)) {
+            if (isMessageNotModifiedError(error)) {
+              ctx?.log.debug("telegram_stream_edit_noop", {
+                adapterId: id,
+                conversationId: state.conversationId,
+                streamId: state.streamId,
+                phase: "final",
+              });
+            } else if (isEntityParseError(error)) {
               ctx?.log.warn("telegram_parse_mode_fallback_plain_edit", {
                 adapterId: id,
                 conversationId: state.conversationId,
@@ -570,6 +582,15 @@ export const createTelegramAdapter = (options: TelegramAdapterOptions): ChannelA
                   disable_web_page_preview: false,
                 });
               } catch (plainError) {
+                if (isMessageNotModifiedError(plainError)) {
+                  ctx?.log.debug("telegram_stream_edit_noop", {
+                    adapterId: id,
+                    conversationId: state.conversationId,
+                    streamId: state.streamId,
+                    phase: "final_plain_fallback",
+                  });
+                  return;
+                }
                 if (!isMessageTooLongError(plainError)) throw plainError;
                 await replaceStreamingPreviewWithChunkedFinal(
                   state.conversationId,
@@ -592,12 +613,22 @@ export const createTelegramAdapter = (options: TelegramAdapterOptions): ChannelA
             }
           }
         } else {
-          await apiCall("editMessageText", {
-            chat_id: state.conversationId,
-            message_id: currentMessageId,
-            text: previewText,
-            disable_web_page_preview: false,
-          });
+          try {
+            await apiCall("editMessageText", {
+              chat_id: state.conversationId,
+              message_id: currentMessageId,
+              text: previewText,
+              disable_web_page_preview: false,
+            });
+          } catch (error) {
+            if (!isMessageNotModifiedError(error)) throw error;
+            ctx?.log.debug("telegram_stream_edit_noop", {
+              adapterId: id,
+              conversationId: state.conversationId,
+              streamId: state.streamId,
+              phase: "preview",
+            });
+          }
         }
         if (state.done) {
           streamingMessageIds.delete(state.streamId);

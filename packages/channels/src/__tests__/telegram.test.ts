@@ -117,6 +117,34 @@ describe("createTelegramAdapter", () => {
     expect(secondPayload.text.endsWith("\n\n...")).toBe(true);
   });
 
+  it("ignores Telegram no-op errors when final streaming edit matches the current message", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ message_id: 45 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        ok: false,
+        error_code: 400,
+        description: "Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message",
+      }), { status: 400, headers: { "Content-Type": "application/json" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const adapter = createTelegramAdapter({ botToken: "token" });
+    await adapter.upsertStreamingMessage?.({
+      conversationId: "chat-noop-final",
+      streamId: "stream-noop-final",
+      text: "plain final text",
+      done: false,
+    });
+    await expect(adapter.upsertStreamingMessage?.({
+      conversationId: "chat-noop-final",
+      streamId: "stream-noop-final",
+      text: "plain final text",
+      done: true,
+    })).resolves.toBeUndefined();
+
+    const methods = fetchMock.mock.calls.map((call) => String(call[0]).split("/").at(-1));
+    expect(methods).toEqual(["sendMessage", "editMessageText"]);
+  });
+
   it("falls back to chunked final messages when a streamed response is too long", async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(jsonResponse({ message_id: 55 }))
