@@ -1291,7 +1291,17 @@ const ConnectedClient = ({
                       isCurrent
                         ? "border-sky-400/45 bg-sky-500/10"
                         : "border-white/8 bg-ink-950/55"
-                    }`}
+                    } ${canResume && !isEditing ? "cursor-pointer transition-colors hover:border-sky-400/35 hover:bg-sky-500/6" : ""}`}
+                    onClick={canResume && !isEditing ? () => handleResumeListedSession(candidate) : undefined}
+                    onKeyDown={canResume && !isEditing ? (event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        handleResumeListedSession(candidate);
+                      }
+                    } : undefined}
+                    role={canResume && !isEditing ? "button" : undefined}
+                    tabIndex={canResume && !isEditing ? 0 : undefined}
+                    aria-label={canResume && !isEditing ? `Resume session ${formatSessionTitle(candidate)}` : undefined}
                   >
                     <div className="flex items-start gap-3">
                       <span className={`mt-1 h-2.5 w-2.5 rounded-full ${presentation.dotClass}`} aria-hidden />
@@ -1308,7 +1318,8 @@ const ConnectedClient = ({
                           <button
                             type="button"
                             className="text-xs text-ink-100/55 hover:text-ink-100"
-                            onClick={() => {
+                            onClick={(event) => {
+                              event.stopPropagation();
                               setEditingSessionId(candidate.id);
                               setSessionNameDraft(candidate.displayName ?? "");
                             }}
@@ -1318,13 +1329,18 @@ const ConnectedClient = ({
                         </div>
 
                         {isEditing ? (
-                          <div className="mt-3 flex gap-2">
+                          <div
+                            className="mt-3 flex gap-2"
+                            onClick={(event) => event.stopPropagation()}
+                            onKeyDown={(event) => event.stopPropagation()}
+                          >
                             <input
                               className="input h-9 text-sm"
                               value={sessionNameDraft}
                               onChange={(event) => setSessionNameDraft(event.target.value)}
                               placeholder="Short session name"
                               onKeyDown={(event) => {
+                                event.stopPropagation();
                                 if (event.key === "Enter") {
                                   event.preventDefault();
                                   handleRenameSubmit(candidate.id);
@@ -1338,7 +1354,10 @@ const ConnectedClient = ({
                             <button
                               type="button"
                               className="button-primary px-3 py-2 text-xs"
-                              onClick={() => handleRenameSubmit(candidate.id)}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                handleRenameSubmit(candidate.id);
+                              }}
                             >
                               Save
                             </button>
@@ -1351,7 +1370,20 @@ const ConnectedClient = ({
                           <div>Updated {formatSessionTimestamp(candidate.lastActivityAt)}</div>
                         </div>
 
-                        <div className="mt-3 flex flex-wrap gap-2">
+                        <div
+                          className="mt-3 flex flex-wrap gap-2"
+                          onClick={(event) => event.stopPropagation()}
+                          onKeyDown={(event) => event.stopPropagation()}
+                        >
+                          {canResume ? (
+                            <button
+                              type="button"
+                              className="button-primary px-2.5 py-1.5 text-xs"
+                              onClick={() => handleResumeListedSession(candidate)}
+                            >
+                              Resume
+                            </button>
+                          ) : null}
                           {canTakeover ? (
                             <button
                               type="button"
