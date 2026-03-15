@@ -96,6 +96,7 @@ const wireAuthFlow = (
       ok: true,
       principalType,
       principalId,
+      ownerDid: `did:key:${principalId.replace(/[^a-zA-Z0-9]/g, "")}`,
       message: "Authenticated connection principal.",
     });
   });
@@ -307,7 +308,7 @@ describe("createChannelManager", () => {
         });
         return;
       }
-      if (message.type === "session_replay" && message.sessionId === "gw-session-fresh") {
+      if (message.type === "session_attach" && message.sessionId === "gw-session-fresh") {
         handlers.onEvent?.({
           type: "transcript",
           sessionId: "gw-session-fresh",
@@ -365,7 +366,7 @@ describe("createChannelManager", () => {
       limit: 10,
     });
     expect(gatewayClient.send).toHaveBeenCalledWith({
-      type: "session_replay",
+      type: "session_attach",
       sessionId: "gw-session-fresh",
     });
     expect(gatewayClient.send).toHaveBeenCalledWith({
@@ -1171,8 +1172,9 @@ describe("createChannelManager", () => {
         conversationId: "chat-session-list",
         text: [
           "Sessions (1/1):",
-          "- gw-session-list-active (current) lifecycle=parked(owner_disconnected) workspace=default model=claude-sonnet-4-6 last=2026-03-04T01:00:00.000Z next=current",
+          "- gw-session-list-active (current) lifecycle=parked(owner_disconnected) workspace=default model=claude-sonnet-4-6 last=2026-03-04T01:00:00.000Z next=/session detach gw-session-list-active",
           "Use /session resume <sessionId> to attach a listed session.",
+          "Use /session detach [sessionId] to leave the current session without closing it.",
           "Use /session delete [sessionId] to close a session explicitly.",
         ].join("\n"),
       });
@@ -1414,7 +1416,7 @@ describe("createChannelManager", () => {
         principalId: "user:telegram-test:user-1",
       }));
       expect(gatewayClient.send).toHaveBeenCalledWith({
-        type: "session_replay",
+        type: "session_attach",
         sessionId: "gw-session-archive",
       });
     });
@@ -1444,7 +1446,7 @@ describe("createChannelManager", () => {
     await manager.stop();
   });
 
-  it("uses session_takeover message for /session takeover", async () => {
+  it("uses session_attach message for /session takeover alias", async () => {
     const { gatewayClient, handlers } = createMockGateway();
     createGatewayClientMock.mockReturnValue(gatewayClient);
     wireAuthFlow(gatewayClient, handlers);
@@ -1474,7 +1476,7 @@ describe("createChannelManager", () => {
         principalId: "user:telegram-test:user-1",
       }));
       expect(gatewayClient.send).toHaveBeenCalledWith({
-        type: "session_takeover",
+        type: "session_attach",
         sessionId: "gw-session-parked",
       });
     });
@@ -1484,6 +1486,98 @@ describe("createChannelManager", () => {
       sessionId: "gw-session-parked",
       messages: [],
     });
+
+    await manager.stop();
+  });
+
+  it("detaches the current conversation session with /session detach", async () => {
+    const { gatewayClient, handlers } = createMockGateway();
+    createGatewayClientMock.mockReturnValue(gatewayClient);
+    wireAuthFlow(gatewayClient, handlers);
+    const adapterFixture = createAdapter();
+
+    const manager = createChannelManager({
+      gatewayUrl: "ws://127.0.0.1:18800/ws",
+      token: "test-token",
+      adapters: [{ adapter: adapterFixture.adapter }],
+    });
+
+    await manager.start();
+    const context = adapterFixture.getContext();
+    expect(context).toBeDefined();
+
+    const prompt = context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-session-detach",
+      senderId: "user-1",
+      text: "seed detach session",
+    });
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith(expect.objectContaining({ type: "session_new" }));
+    });
+    handlers.onEvent?.({
+      type: "session_created",
+      sessionId: "gw-session-detach",
+      runtimeId: "claude",
+      model: "claude-sonnet-4-6",
+      workspaceId: "default",
+      principalType: "user",
+      principalId: "user:telegram-test:user-1",
+      source: "api",
+    });
+    await prompt;
+
+    gatewayClient.send.mockClear();
+    adapterFixture.sendMessage.mockClear();
+
+    await context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-session-detach",
+      senderId: "user-1",
+      text: "/session detach",
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: "auth_proof",
+        principalType: "user",
+        principalId: "user:telegram-test:user-1",
+      }));
+      expect(gatewayClient.send).toHaveBeenCalledWith({
+        type: "session_detach",
+        sessionId: "gw-session-detach",
+      });
+    });
+
+    expect(adapterFixture.sendMessage).toHaveBeenCalledWith({
+      conversationId: "chat-session-detach",
+      text: "Detached session gw-session-detach.",
+    });
+
+    gatewayClient.send.mockClear();
+
+    const nextPrompt = context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-session-detach",
+      senderId: "user-1",
+      text: "fresh session after detach",
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith(expect.objectContaining({ type: "session_new" }));
+    });
+
+    handlers.onEvent?.({
+      type: "session_created",
+      sessionId: "gw-session-detach-new",
+      runtimeId: "claude",
+      model: "claude-sonnet-4-6",
+      workspaceId: "default",
+      principalType: "user",
+      principalId: "user:telegram-test:user-1",
+      source: "api",
+    });
+    await nextPrompt;
 
     await manager.stop();
   });
@@ -1604,7 +1698,7 @@ describe("createChannelManager", () => {
 
     await vi.waitFor(() => {
       expect(gatewayClient.send).toHaveBeenCalledWith({
-        type: "session_replay",
+        type: "session_attach",
         sessionId: "gw-session-candidate",
       });
     });
@@ -1630,6 +1724,155 @@ describe("createChannelManager", () => {
     });
 
     await manager.stop();
+  });
+
+  it("auto-resumes an unbound conversation for /status", async () => {
+    const { gatewayClient, handlers } = createMockGateway();
+    createGatewayClientMock.mockReturnValue(gatewayClient);
+    wireAuthFlow(gatewayClient, handlers);
+    const adapterFixture = createAdapter();
+
+    const manager = createChannelManager({
+      gatewayUrl: "ws://127.0.0.1:18800/ws",
+      token: "test-token",
+      autoResumeOnUnboundPrompt: true,
+      adapters: [{ adapter: adapterFixture.adapter }],
+    });
+
+    await manager.start();
+    const context = adapterFixture.getContext();
+    expect(context).toBeDefined();
+
+    const commandPromise = context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-auto-resume-status",
+      senderId: "user-1",
+      text: "/status",
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith({
+        type: "session_list",
+        limit: 10,
+      });
+    });
+
+    handlers.onEvent?.({
+      type: "session_list",
+      sessions: [{
+        id: "gw-session-status",
+        status: "idle",
+        lifecycleState: "parked",
+        parkedReason: "idle",
+        model: "claude-sonnet-4-6",
+        ownerDid: "did:key:usertelegramtestuser1",
+        workspaceId: "default",
+        principalType: "user",
+        principalId: "user:telegram-test:user-1",
+        createdAt: "2026-01-01T00:00:00Z",
+        lastActivityAt: "2026-01-01T00:10:00Z",
+      }],
+      hasMore: false,
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith({
+        type: "session_attach",
+        sessionId: "gw-session-status",
+      });
+    });
+
+    handlers.onEvent?.({
+      type: "transcript",
+      sessionId: "gw-session-status",
+      messages: [],
+    });
+
+    await commandPromise;
+
+    expect(
+      gatewayClient.send.mock.calls.filter(
+        ([payload]) => (payload as { type?: string }).type === "prompt",
+      ),
+    ).toHaveLength(0);
+    expect(adapterFixture.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
+      conversationId: "chat-auto-resume-status",
+      text: expect.stringContaining("Owner DID: did:key:usertelegramtestuser1"),
+    }));
+
+    await manager.stop();
+  });
+
+  it("reuses a persisted auth key for the same telegram principal across restarts", async () => {
+    const storedAuthKeys = new Map<string, { publicKey: string; privateKey: string }>();
+    const authKeyStore = {
+      getChannelAuthKeyPair: (principalType: "user" | "service_account", principalId: string) => (
+        storedAuthKeys.get(`${principalType}:${principalId}`) ?? null
+      ),
+      upsertChannelAuthKeyPair: (
+        principalType: "user" | "service_account",
+        principalId: string,
+        pair: { publicKey: string; privateKey: string },
+      ) => {
+        storedAuthKeys.set(`${principalType}:${principalId}`, pair);
+      },
+    };
+
+    const runStatusProbe = async (): Promise<string> => {
+      const { gatewayClient, handlers } = createMockGateway();
+      createGatewayClientMock.mockReturnValue(gatewayClient);
+      wireAuthFlow(gatewayClient, handlers);
+      const adapterFixture = createAdapter();
+
+      const manager = createChannelManager({
+        gatewayUrl: "ws://127.0.0.1:18800/ws",
+        token: "test-token",
+        autoResumeOnUnboundPrompt: true,
+        adapters: [{ adapter: adapterFixture.adapter }],
+        authKeyStore,
+      });
+
+      await manager.start();
+      const context = adapterFixture.getContext();
+      expect(context).toBeDefined();
+
+      const commandPromise = context!.onMessage({
+        adapterId: "telegram-test",
+        conversationId: "chat-auth-key-reuse",
+        senderId: "user-1",
+        text: "/status",
+      });
+
+      await vi.waitFor(() => {
+        expect(gatewayClient.send).toHaveBeenCalledWith({
+          type: "session_list",
+          limit: 10,
+        });
+      });
+
+      handlers.onEvent?.({
+        type: "session_list",
+        sessions: [],
+        hasMore: false,
+      });
+
+      await commandPromise;
+
+      const authProof = gatewayClient.send.mock.calls
+        .map(([payload]) => payload as { type?: string; publicKey?: string })
+        .find((payload) => payload.type === "auth_proof" && payload.publicKey);
+      if (!authProof?.publicKey) {
+        throw new Error("expected auth_proof public key");
+      }
+
+      await manager.stop();
+      return authProof.publicKey;
+    };
+
+    const first = await runStatusProbe();
+    const second = await runStatusProbe();
+
+    expect(second).toBe(first);
   });
 
   it("falls back to session_new when auto-resume replay fails", async () => {
@@ -1682,7 +1925,7 @@ describe("createChannelManager", () => {
 
     await vi.waitFor(() => {
       expect(gatewayClient.send).toHaveBeenCalledWith({
-        type: "session_replay",
+        type: "session_attach",
         sessionId: "gw-session-stale",
       });
     });
@@ -1777,7 +2020,7 @@ describe("createChannelManager", () => {
     });
 
     expect(gatewayClient.send).not.toHaveBeenCalledWith({
-      type: "session_replay",
+      type: "session_attach",
       sessionId: "gw-session-transfer-pending",
     });
 

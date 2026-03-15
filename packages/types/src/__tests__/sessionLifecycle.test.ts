@@ -20,16 +20,19 @@ describe("session lifecycle types", () => {
 
     expect(isSessionLifecycleEventType("TRANSFER_REQUESTED")).toBe(true);
     expect(isSessionLifecycleEventType("APPROVAL_REQUESTED")).toBe(true);
+    expect(isSessionLifecycleEventType("IDLE_TIMEOUT")).toBe(true);
     expect(isSessionLifecycleEventType("UNKNOWN")).toBe(false);
 
     expect(isSessionParkedReason("transfer_pending")).toBe(true);
     expect(isSessionParkedReason("approval_pending")).toBe(true);
+    expect(isSessionParkedReason("idle")).toBe(true);
     expect(isSessionParkedReason("invalid")).toBe(false);
   });
 
   it("computes next states from transition table", () => {
     expect(getSessionLifecycleNextState("live", "TRANSFER_REQUESTED")).toBe("parked");
     expect(getSessionLifecycleNextState("live", "APPROVAL_REQUESTED")).toBe("parked");
+    expect(getSessionLifecycleNextState("live", "IDLE_TIMEOUT")).toBe("parked");
     expect(getSessionLifecycleNextState("parked", "TRANSFER_REQUESTED")).toBe("parked");
     expect(getSessionLifecycleNextState("parked", "OWNER_DISCONNECTED")).toBe("parked");
     expect(getSessionLifecycleNextState("parked", "OWNER_RESUMED")).toBe("live");
@@ -48,6 +51,12 @@ describe("session lifecycle types", () => {
       toState: "parked",
       eventType: "APPROVAL_REQUESTED",
       parkedReason: "approval_pending",
+    });
+    expect(applySessionLifecycleTransition("live", "IDLE_TIMEOUT")).toEqual({
+      fromState: "live",
+      toState: "parked",
+      eventType: "IDLE_TIMEOUT",
+      parkedReason: "idle",
     });
     expect(applySessionLifecycleTransition("parked", "TRANSFER_EXPIRED")).toEqual({
       fromState: "parked",
@@ -89,15 +98,18 @@ describe("session lifecycle types", () => {
   it("applies shared parked-session policy helpers", () => {
     expect(canOwnerResumeParkedSession("owner_disconnected")).toBe(true);
     expect(canOwnerResumeParkedSession("runtime_timeout")).toBe(true);
+    expect(canOwnerResumeParkedSession("idle")).toBe(true);
     expect(canOwnerResumeParkedSession("transfer_pending")).toBe(false);
     expect(canOwnerResumeParkedSession("approval_pending")).toBe(false);
 
     expect(canTakeoverParkedSession("manual")).toBe(true);
+    expect(canTakeoverParkedSession("idle")).toBe(true);
     expect(canTakeoverParkedSession("transfer_expired")).toBe(true);
     expect(canTakeoverParkedSession("transfer_pending")).toBe(false);
 
     expect(canAutoResumeSession("live", undefined)).toBe(true);
     expect(canAutoResumeSession("parked", "owner_disconnected")).toBe(true);
+    expect(canAutoResumeSession("parked", "idle")).toBe(true);
     expect(canAutoResumeSession("parked", "transfer_expired")).toBe(true);
     expect(canAutoResumeSession("parked", "approval_pending")).toBe(true);
     expect(canAutoResumeSession("parked", "transfer_pending")).toBe(false);

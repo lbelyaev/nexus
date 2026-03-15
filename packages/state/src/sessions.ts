@@ -12,6 +12,7 @@ import {
 } from "@nexus/types";
 
 export interface SessionListPageQuery {
+  ownerDid?: string;
   principalType?: SessionRecord["principalType"];
   principalId?: string;
   limit?: number;
@@ -55,6 +56,7 @@ export interface SessionStore {
 interface SessionRow {
   id: string;
   workspaceId: string;
+  ownerDid?: string | null;
   principalType: SessionRecord["principalType"];
   principalId: string;
   source: SessionRecord["source"];
@@ -121,6 +123,7 @@ const rowToRecord = (row: SessionRow): SessionRecord => {
   return {
     id: row.id,
     workspaceId: row.workspaceId,
+    ...(row.ownerDid ? { ownerDid: row.ownerDid } : {}),
     principalType: row.principalType,
     principalId: row.principalId,
     source: row.source,
@@ -162,6 +165,7 @@ const rowToInfo = (row: SessionRow): SessionInfo => {
     lifecycleVersion,
     model: row.model,
     workspaceId: row.workspaceId,
+    ...(row.ownerDid ? { ownerDid: row.ownerDid } : {}),
     ...(row.displayName ? { displayName: row.displayName } : {}),
     ...(interruption ? { interruption } : {}),
     principalType: row.principalType,
@@ -212,6 +216,7 @@ export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
     `INSERT INTO sessions (
       id,
       workspaceId,
+      ownerDid,
       principalType,
       principalId,
       source,
@@ -234,6 +239,7 @@ export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
     VALUES (
       @id,
       @workspaceId,
+      @ownerDid,
       @principalType,
       @principalId,
       @source,
@@ -290,6 +296,7 @@ export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
   const listPageStmt = db.prepare(
     `SELECT * FROM sessions
      WHERE (@principalType IS NULL OR principalType = @principalType)
+       AND (@ownerDid IS NULL OR ownerDid = @ownerDid)
        AND (@principalId IS NULL OR principalId = @principalId)
        AND (
          @cursorLastActivityAt IS NULL
@@ -331,6 +338,7 @@ export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
     insertStmt.run({
       id: session.id,
       workspaceId: session.workspaceId,
+      ownerDid: session.ownerDid ?? null,
       principalType: session.principalType,
       principalId: session.principalId,
       source: session.source,
@@ -376,6 +384,7 @@ export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
     const cursor = query.cursor ? decodeSessionListCursor(query.cursor) : null;
     const rows = listPageStmt.all({
       principalType: query.principalType ?? null,
+      ownerDid: query.ownerDid ?? null,
       principalId: query.principalId ?? null,
       cursorLastActivityAt: cursor?.lastActivityAt ?? null,
       cursorId: cursor?.id ?? null,
@@ -452,6 +461,10 @@ export const createSessionStore = (db: DatabaseAdapter): SessionStore => {
     if (normalizedPatch.principalType !== undefined) {
       setClauses.push("principalType = @principalType");
       params.principalType = normalizedPatch.principalType;
+    }
+    if (normalizedPatch.ownerDid !== undefined) {
+      setClauses.push("ownerDid = @ownerDid");
+      params.ownerDid = normalizedPatch.ownerDid;
     }
     if (normalizedPatch.principalId !== undefined) {
       setClauses.push("principalId = @principalId");

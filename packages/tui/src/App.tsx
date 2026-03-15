@@ -171,7 +171,7 @@ const formatSessionListResult = (
 
   const formatNextAction = (session: ReturnType<typeof useSession>["sessionList"][number]): string => {
     if (session.id === activeSessionId) {
-      return "current";
+      return `/session detach ${session.id}`;
     }
     const state = session.lifecycleState ?? (session.status === "active" ? "live" : "parked");
     if (state === "closed") {
@@ -196,6 +196,7 @@ const formatSessionListResult = (
     })),
     ...(hasMore ? [{ role: "system" as const, text: "  More sessions available. Use /session list next." }] : []),
     { role: "system" as const, text: "  Use /session resume <sessionId> to attach a listed session." },
+    { role: "system" as const, text: "  Use /session detach [sessionId] to leave the current session without closing it." },
     { role: "system" as const, text: "  Use /session delete [sessionId] to close a session explicitly." },
   ];
 };
@@ -219,6 +220,19 @@ const formatSessionLifecycleResult = (
       ].filter((part): part is string => Boolean(part)).join(" "),
     })),
   ];
+};
+
+const pickLatestAttachableSession = (
+  sessions: ReturnType<typeof useSession>["sessionList"],
+): ReturnType<typeof useSession>["sessionList"][number] | null => {
+  const sorted = [...sessions].sort((left, right) => {
+    const byActivity = right.lastActivityAt.localeCompare(left.lastActivityAt);
+    if (byActivity !== 0) return byActivity;
+    return right.id.localeCompare(left.id);
+  });
+  return sorted.find((session) => (
+    (session.lifecycleState ?? (session.status === "active" ? "live" : "parked")) !== "closed"
+  )) ?? null;
 };
 
 export const App = ({ url, token }: AppProps) => {
@@ -281,6 +295,8 @@ export const App = ({ url, token }: AppProps) => {
   const pendingSessionListLimitRef = useRef<number | null>(null);
   const pendingSessionHistorySessionIdRef = useRef<string | null>(null);
   const sessionListLimitRef = useRef(10);
+  const initialRestoreRequestedRef = useRef(false);
+  const initialRestoreResolvedRef = useRef(false);
   useEffect(() => {
     if (prevStreamingRef.current && !session.isStreaming) {
       setMessages((prev) => {
@@ -328,6 +344,8 @@ export const App = ({ url, token }: AppProps) => {
         { role: "system", text: `    workspace=${session.sessionWorkspaceId ?? preferredWorkspaceId}` },
         { role: "system", text: `    runtime=${session.sessionRuntimeId ?? preferredRuntimeId ?? "default"}` },
         { role: "system", text: `    model=${session.sessionModel ?? preferredModel ?? "runtime-default"}` },
+        { role: "system", text: `    principal=${session.sessionPrincipalId ?? "(none)"} (type=${session.sessionPrincipalType ?? "user"})` },
+        ...(session.sessionOwnerDid ? [{ role: "system" as const, text: `    owner_did=${session.sessionOwnerDid}` }] : []),
       ]);
     } else if (previousSessionId && nextSessionId) {
       setMessages((prev) => [
@@ -338,6 +356,8 @@ export const App = ({ url, token }: AppProps) => {
         { role: "system", text: `    workspace=${session.sessionWorkspaceId ?? preferredWorkspaceId}` },
         { role: "system", text: `    runtime=${session.sessionRuntimeId ?? preferredRuntimeId ?? "default"}` },
         { role: "system", text: `    model=${session.sessionModel ?? preferredModel ?? "runtime-default"}` },
+        { role: "system", text: `    principal=${session.sessionPrincipalId ?? "(none)"} (type=${session.sessionPrincipalType ?? "user"})` },
+        ...(session.sessionOwnerDid ? [{ role: "system" as const, text: `    owner_did=${session.sessionOwnerDid}` }] : []),
       ]);
     } else if (previousSessionId && !nextSessionId) {
       setMessages((prev) => [
@@ -355,6 +375,9 @@ export const App = ({ url, token }: AppProps) => {
     preferredWorkspaceId,
     session.sessionId,
     session.sessionModel,
+    session.sessionOwnerDid,
+    session.sessionPrincipalId,
+    session.sessionPrincipalType,
     session.sessionRuntimeId,
     session.sessionWorkspaceId,
   ]);
@@ -386,7 +409,7 @@ export const App = ({ url, token }: AppProps) => {
     [preferredWorkspaceId, sendMessage],
   );
 
-  // On first connect: create a session. On reconnect: replay current session transcript.
+  // On first connect: create a session. On reconnect: reattach the current session.
   const previousStatusRef = useRef(status);
   useEffect(() => {
     const wasConnected = previousStatusRef.current === "connected";
@@ -395,25 +418,57 @@ export const App = ({ url, token }: AppProps) => {
     if (!isConnected || wasConnected) return;
 
     if (session.sessionId) {
-      session.requestReplay(session.sessionId);
+      session.attachSession(session.sessionId);
     }
-  }, [session.sessionId, session.requestReplay, status]);
+  }, [session.attachSession, session.sessionId, status]);
 
   useEffect(() => {
     if (status !== "connected") {
       creatingSessionRef.current = false;
+      initialRestoreRequestedRef.current = false;
+      initialRestoreResolvedRef.current = false;
+      return;
+    }
+    if (session.authStatus === "unverified" || session.authStatus === "verifying") {
       return;
     }
     if (session.sessionId) {
       creatingSessionRef.current = false;
+      initialRestoreResolvedRef.current = true;
+      return;
+    }
+    if (!initialRestoreRequestedRef.current) {
+      initialRestoreRequestedRef.current = true;
+      session.requestSessionList({ limit: 20 });
+      return;
+    }
+    if (!session.sessionListLoaded || initialRestoreResolvedRef.current) {
+      return;
+    }
+    const candidate = pickLatestAttachableSession(session.sessionList);
+    if (candidate) {
+      initialRestoreResolvedRef.current = true;
+      session.attachSession(candidate.id);
       return;
     }
     if (creatingSessionRef.current) {
       return;
     }
+    initialRestoreResolvedRef.current = true;
     creatingSessionRef.current = true;
     createSession(preferredRuntimeId, preferredModel);
-  }, [createSession, preferredModel, preferredRuntimeId, session.sessionId, status]);
+  }, [
+    createSession,
+    preferredModel,
+    preferredRuntimeId,
+    session.attachSession,
+    session.authStatus,
+    session.requestSessionList,
+    session.sessionId,
+    session.sessionList,
+    session.sessionListLoaded,
+    status,
+  ]);
 
   const handleRuntimeCommand = useCallback(
     (runtimeArg: string) => {
@@ -523,9 +578,11 @@ export const App = ({ url, token }: AppProps) => {
     const activeRuntime = session.sessionRuntimeId ?? preferredRuntimeId ?? "default";
     const activeWorkspace = session.sessionWorkspaceId ?? preferredWorkspaceId;
     const activeModel = session.sessionModel ?? preferredModel ?? "(unknown)";
+    const activeOwnerDid = session.sessionOwnerDid ?? "(none)";
     const activePrincipalType = session.sessionPrincipalType ?? "user";
     const activePrincipalId = session.sessionPrincipalId ?? "user:local";
     const activeSource = session.sessionSource ?? "interactive";
+    const authOwnerDid = session.authOwnerDid ?? "(unverified)";
     const authPrincipalType = session.authPrincipalType ?? "user";
     const authPrincipalId = session.authPrincipalId ?? "(unverified)";
     const catalogRuntimes = Object.keys(session.modelCatalog).length;
@@ -540,7 +597,9 @@ export const App = ({ url, token }: AppProps) => {
       { role: "system", text: `    session=${session.sessionId ?? "(none)"}` },
       { role: "system", text: `    workspace=${activeWorkspace}` },
       { role: "system", text: `    principal=${activePrincipalId} (type=${activePrincipalType})` },
+      { role: "system", text: `    owner_did=${activeOwnerDid}` },
       { role: "system", text: `    auth_principal=${authPrincipalId} (type=${authPrincipalType})` },
+      { role: "system", text: `    auth_did=${authOwnerDid}` },
       { role: "system", text: `    source=${activeSource}` },
       { role: "system", text: `    runtime=${activeRuntime}` },
       { role: "system", text: `    model=${activeModel}` },
@@ -681,7 +740,7 @@ export const App = ({ url, token }: AppProps) => {
           { role: "system", text: "    /session list [limit|next [limit]]" },
           { role: "system", text: "    /session history [sessionId] [limit]" },
           { role: "system", text: "    /session resume <sessionId>" },
-          { role: "system", text: "    /session takeover <sessionId>" },
+          { role: "system", text: "    /session detach [sessionId]" },
           { role: "system", text: "    /session transfer pending|request|accept|dismiss" },
           { role: "system", text: "    /session close [sessionId]" },
           { role: "system", text: "    /session delete [sessionId]" },
@@ -744,12 +803,22 @@ export const App = ({ url, token }: AppProps) => {
           setMessages((prev) => [...prev, { role: "system", text: `  Usage: /session ${sub} <sessionId>` }]);
           return;
         }
-        if (sub === "takeover") {
-          session.takeoverSession(sessionId);
-        } else {
-          session.resumeSession(sessionId);
+        session.attachSession(sessionId);
+        setMessages((prev) => [...prev, {
+          role: "system",
+          text: `  Attaching session ${sessionId}...`,
+        }]);
+        return;
+      }
+
+      if (sub === "detach") {
+        const sessionId = parts[1] ?? session.sessionId ?? undefined;
+        if (!sessionId) {
+          setMessages((prev) => [...prev, { role: "system", text: "  Usage: /session detach [sessionId]" }]);
+          return;
         }
-        setMessages((prev) => [...prev, { role: "system", text: `  ${sub === "takeover" ? "Taking over" : "Resuming"} session ${sessionId}...` }]);
+        session.detachSession(sessionId);
+        setMessages((prev) => [...prev, { role: "system", text: `  Detaching session ${sessionId}...` }]);
         return;
       }
 
@@ -772,7 +841,7 @@ export const App = ({ url, token }: AppProps) => {
         return;
       }
 
-      setMessages((prev) => [...prev, { role: "system", text: "  Usage: /session [list|history|resume|takeover|transfer|close|delete]" }]);
+      setMessages((prev) => [...prev, { role: "system", text: "  Usage: /session [list|history|resume|detach|transfer|close|delete]" }]);
     },
     [handleTransferCommand, sendMessage, session],
   );

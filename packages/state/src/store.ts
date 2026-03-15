@@ -7,8 +7,10 @@ import { createMemoryStore, type MemoryStore } from "./memory.js";
 import { createExecutionStore, type ExecutionStore } from "./executions.js";
 import { createChannelBindingStore, type ChannelBindingStore } from "./channelBindings.js";
 import { createSessionTransferStore, type SessionTransferStore } from "./sessionTransfers.js";
+import { createSessionEventStore, type SessionEventStore } from "./sessionEvents.js";
+import { createIdentityStore, type IdentityStore } from "./identities.js";
 
-export interface StateStore extends SessionStore, AuditStore, TranscriptStore, MemoryStore, ExecutionStore, ChannelBindingStore, SessionTransferStore {
+export interface StateStore extends SessionStore, AuditStore, TranscriptStore, MemoryStore, ExecutionStore, ChannelBindingStore, SessionTransferStore, SessionEventStore, IdentityStore {
   close: () => void;
 }
 
@@ -23,6 +25,8 @@ export const createStateStore = (dbPath: string = ":memory:"): StateStore => {
     ...createExecutionStore(db),
     ...createChannelBindingStore(db),
     ...createSessionTransferStore(db),
+    ...createSessionEventStore(db),
+    ...createIdentityStore(db),
     close: () => db.close(),
   };
 };

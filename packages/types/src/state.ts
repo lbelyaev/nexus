@@ -1,4 +1,4 @@
-import type { PrincipalType, PromptSource } from "./protocol.js";
+import type { GatewayEvent, PrincipalType, PromptSource } from "./protocol.js";
 import type { SessionLifecycleState, SessionParkedReason } from "./sessionLifecycle.js";
 import { isSessionLifecycleState, isSessionParkedReason } from "./sessionLifecycle.js";
 import type { SessionInterruption } from "./sessionInterruption.js";
@@ -6,9 +6,35 @@ import { isSessionInterruption } from "./sessionInterruption.js";
 
 // State record types
 
+export type OwnerIdentityStatus = "active" | "revoked";
+export type PrincipalBindingStatus = "pending" | "verified" | "revoked";
+export type PrincipalBindingProofFormat = "did-auth" | "vc" | "linked-domain" | "nexus-signed-binding";
+export type PrincipalBindingSource = "web" | "telegram" | "tui" | "cli" | "api" | "gateway";
+
+export interface OwnerIdentity {
+  did: string;
+  status: OwnerIdentityStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PrincipalBindingRecord {
+  principalType: PrincipalType;
+  principalId: string;
+  source: PrincipalBindingSource;
+  ownerDid: string;
+  bindingStatus: PrincipalBindingStatus;
+  verificationMethodId?: string;
+  proofFormat?: PrincipalBindingProofFormat;
+  proofPayload?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface SessionRecord {
   id: string;
   workspaceId: string;
+  ownerDid?: string;
   principalType: PrincipalType;
   principalId: string;
   source: PromptSource;
@@ -35,6 +61,16 @@ export interface AuditEvent {
   type: "tool_call" | "approval" | "deny" | "error";
   tool?: string;
   detail: string;
+}
+
+export interface StoredSessionEvent {
+  id: number;
+  sessionId: string;
+  type: GatewayEvent["type"];
+  payload: GatewayEvent;
+  timestamp: string;
+  executionId?: string;
+  turnId?: string;
 }
 
 export type ExecutionState =
@@ -84,6 +120,15 @@ export interface ChannelBindingRecord {
 }
 
 const SESSION_STATUSES = new Set(["active", "idle"]);
+const OWNER_IDENTITY_STATUSES = new Set<OwnerIdentityStatus>(["active", "revoked"]);
+const PRINCIPAL_BINDING_STATUSES = new Set<PrincipalBindingStatus>(["pending", "verified", "revoked"]);
+const PRINCIPAL_BINDING_SOURCES = new Set<PrincipalBindingSource>(["web", "telegram", "tui", "cli", "api", "gateway"]);
+const PRINCIPAL_BINDING_PROOF_FORMATS = new Set<PrincipalBindingProofFormat>([
+  "did-auth",
+  "vc",
+  "linked-domain",
+  "nexus-signed-binding",
+]);
 const AUDIT_TYPES = new Set(["tool_call", "approval", "deny", "error"]);
 const EXECUTION_STATES = new Set<ExecutionState>([
   "queued",
@@ -102,6 +147,7 @@ export const isSessionRecord = (value: unknown): value is SessionRecord => {
   return (
     typeof obj.id === "string" &&
     typeof obj.workspaceId === "string" &&
+    (obj.ownerDid === undefined || typeof obj.ownerDid === "string") &&
     (obj.principalType === "user" || obj.principalType === "service_account") &&
     typeof obj.principalId === "string" &&
     (obj.source === "interactive" || obj.source === "schedule" || obj.source === "hook" || obj.source === "api") &&
@@ -130,6 +176,37 @@ export const isSessionRecord = (value: unknown): value is SessionRecord => {
     obj.tokenUsage !== null &&
     typeof (obj.tokenUsage as Record<string, unknown>).input === "number" &&
     typeof (obj.tokenUsage as Record<string, unknown>).output === "number"
+  );
+};
+
+export const isOwnerIdentity = (value: unknown): value is OwnerIdentity => {
+  if (typeof value !== "object" || value === null) return false;
+  const obj = value as Record<string, unknown>;
+  return (
+    typeof obj.did === "string"
+    && typeof obj.status === "string"
+    && OWNER_IDENTITY_STATUSES.has(obj.status as OwnerIdentityStatus)
+    && typeof obj.createdAt === "string"
+    && typeof obj.updatedAt === "string"
+  );
+};
+
+export const isPrincipalBindingRecord = (value: unknown): value is PrincipalBindingRecord => {
+  if (typeof value !== "object" || value === null) return false;
+  const obj = value as Record<string, unknown>;
+  return (
+    (obj.principalType === "user" || obj.principalType === "service_account")
+    && typeof obj.principalId === "string"
+    && typeof obj.source === "string"
+    && PRINCIPAL_BINDING_SOURCES.has(obj.source as PrincipalBindingSource)
+    && typeof obj.ownerDid === "string"
+    && typeof obj.bindingStatus === "string"
+    && PRINCIPAL_BINDING_STATUSES.has(obj.bindingStatus as PrincipalBindingStatus)
+    && (obj.verificationMethodId === undefined || typeof obj.verificationMethodId === "string")
+    && (obj.proofFormat === undefined || PRINCIPAL_BINDING_PROOF_FORMATS.has(obj.proofFormat as PrincipalBindingProofFormat))
+    && (obj.proofPayload === undefined || typeof obj.proofPayload === "string")
+    && typeof obj.createdAt === "string"
+    && typeof obj.updatedAt === "string"
   );
 };
 

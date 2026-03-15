@@ -64,6 +64,17 @@ describe("isClientMessage", () => {
     expect(isClientMessage({ type: "session_replay", sessionId: "s1" })).toBe(true);
   });
 
+  it("validates session attach and detach messages", () => {
+    expect(isClientMessage({ type: "session_attach", sessionId: "s1" })).toBe(true);
+    expect(isClientMessage({ type: "session_detach" })).toBe(true);
+    expect(isClientMessage({ type: "session_detach", sessionId: "s1" })).toBe(true);
+  });
+
+  it("validates a session_history message", () => {
+    expect(isClientMessage({ type: "session_history", sessionId: "s1" })).toBe(true);
+    expect(isClientMessage({ type: "session_history", sessionId: "s1", afterId: 12, limit: 50 })).toBe(true);
+  });
+
   it("validates a session_continue message", () => {
     expect(isClientMessage({ type: "session_continue", sessionId: "s1" })).toBe(true);
   });
@@ -168,6 +179,17 @@ describe("isClientMessage", () => {
 
   it("rejects session_replay with missing sessionId", () => {
     expect(isClientMessage({ type: "session_replay" })).toBe(false);
+  });
+
+  it("rejects invalid session attach and detach messages", () => {
+    expect(isClientMessage({ type: "session_attach" })).toBe(false);
+    expect(isClientMessage({ type: "session_detach", sessionId: 123 })).toBe(false);
+  });
+
+  it("rejects invalid session_history messages", () => {
+    expect(isClientMessage({ type: "session_history" })).toBe(false);
+    expect(isClientMessage({ type: "session_history", sessionId: "s1", afterId: -1 })).toBe(false);
+    expect(isClientMessage({ type: "session_history", sessionId: "s1", limit: 0 })).toBe(false);
   });
 
   it("rejects session_continue with missing sessionId", () => {
@@ -350,6 +372,19 @@ describe("isGatewayEvent", () => {
     })).toBe(true);
   });
 
+  it("validates session attachment events", () => {
+    expect(isGatewayEvent({
+      type: "session_attached",
+      sessionId: "s1",
+      controller: true,
+    })).toBe(true);
+    expect(isGatewayEvent({
+      type: "session_detached",
+      sessionId: "s1",
+      reason: "client_detach",
+    })).toBe(true);
+  });
+
   it("validates auth and transfer gateway events", () => {
     expect(isGatewayEvent({
       type: "auth_challenge",
@@ -364,6 +399,7 @@ describe("isGatewayEvent", () => {
       ok: true,
       principalType: "user",
       principalId: "user:alice",
+      ownerDid: "did:key:z6Mkowner",
     })).toBe(true);
     expect(isGatewayEvent({
       type: "session_transfer_requested",
@@ -421,6 +457,19 @@ describe("isGatewayEvent", () => {
     expect(isGatewayEvent({ type: "session_list", sessions: [] })).toBe(true);
     expect(isGatewayEvent({ type: "session_list", sessions: [], hasMore: false })).toBe(true);
     expect(isGatewayEvent({ type: "session_list", sessions: [], hasMore: true, nextCursor: "abc" })).toBe(true);
+    expect(isGatewayEvent({
+      type: "session_list",
+      sessions: [{
+        id: "s1",
+        status: "active",
+        ownerDid: "did:key:z6Mkowner",
+        lifecycleState: "live",
+        model: "claude-sonnet-4-6",
+        attachmentState: "controller",
+        createdAt: "2026-01-01T00:00:00Z",
+        lastActivityAt: "2026-01-01T00:00:05Z",
+      }],
+    })).toBe(true);
   });
 
   it("validates session_lifecycle_result", () => {
@@ -437,6 +486,32 @@ describe("isGatewayEvent", () => {
           createdAt: "2026-01-01T00:00:00Z",
         },
       ],
+    })).toBe(true);
+  });
+
+  it("validates session_history", () => {
+    expect(isGatewayEvent({
+      type: "session_history",
+      sessionId: "s1",
+      events: [
+        {
+          id: 1,
+          sessionId: "s1",
+          type: "text_delta",
+          payload: {
+            type: "text_delta",
+            sessionId: "s1",
+            delta: "hello",
+            executionId: "exec-1",
+            turnId: "turn-1",
+          },
+          timestamp: "2026-01-01T00:00:00Z",
+          executionId: "exec-1",
+          turnId: "turn-1",
+        },
+      ],
+      hasMore: false,
+      nextAfterId: 1,
     })).toBe(true);
   });
 
@@ -546,6 +621,26 @@ describe("isGatewayEvent", () => {
     expect(isGatewayEvent(null)).toBe(false);
     expect(isGatewayEvent({ type: "text_delta" })).toBe(false);
     expect(isGatewayEvent({ type: "unknown" })).toBe(false);
+    expect(isGatewayEvent({
+      type: "session_history",
+      sessionId: "s1",
+      events: [
+        {
+          id: 1,
+          sessionId: "s1",
+          type: "text_delta",
+          payload: { type: "text_delta", sessionId: "s1" },
+          timestamp: "2026-01-01T00:00:00Z",
+        },
+      ],
+      hasMore: false,
+    })).toBe(false);
+    expect(isGatewayEvent({
+      type: "session_history",
+      sessionId: "s1",
+      events: [],
+      hasMore: "nope",
+    })).toBe(false);
   });
 });
 

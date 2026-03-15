@@ -155,13 +155,20 @@ const waitForMatchingEvent = <T extends GatewayEvent["type"]>(
     check();
   });
 
+const authKeyPairs = new Map<string, ReturnType<typeof generateKeyPairSync>>();
+
 const sendAuthProof = async (
   ws: WebSocket,
   messages: string[],
   principalId: string,
 ): Promise<void> => {
   const challenge = await waitForEvent(messages, "auth_challenge");
-  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  let keyPair = authKeyPairs.get(principalId);
+  if (!keyPair) {
+    keyPair = generateKeyPairSync("ed25519");
+    authKeyPairs.set(principalId, keyPair);
+  }
+  const { privateKey, publicKey } = keyPair;
   const payload = `${challenge.challengeId}:${challenge.nonce}:user:${principalId}`;
   const signature = sign(null, Buffer.from(payload, "utf8"), privateKey).toString("base64");
   const exportedPublicKey = publicKey.export({
@@ -225,6 +232,7 @@ describe("E2E: WS client -> Gateway -> mock ACP session -> events back", () => {
 
   beforeEach(async () => {
     sessionCounter = 0;
+    authKeyPairs.clear();
     stateStore = createStateStore(":memory:");
     await startServer();
   });

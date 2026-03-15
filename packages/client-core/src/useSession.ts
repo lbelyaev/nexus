@@ -4,6 +4,7 @@ import type {
   GatewayEvent,
   PromptImageInput,
   SessionInfo,
+  StoredSessionEvent,
   TranscriptMessage,
 } from "@nexus/types";
 
@@ -38,6 +39,7 @@ export type SessionTransferRequestedEvent = Extract<GatewayEvent, { type: "sessi
 export type SessionTransferUpdatedEvent = Extract<GatewayEvent, { type: "session_transfer_updated" }>;
 export type SessionListEvent = Extract<GatewayEvent, { type: "session_list" }>;
 export type SessionLifecycleResultEvent = Extract<GatewayEvent, { type: "session_lifecycle_result" }>;
+export type SessionHistoryEvent = Extract<GatewayEvent, { type: "session_history" }>;
 
 export interface PendingSessionTransfer {
   sessionId: string;
@@ -103,28 +105,46 @@ const toPendingTransfer = (
   };
 };
 
+const mergeStoredSessionEvents = (
+  previous: StoredSessionEvent[],
+  incoming: StoredSessionEvent[],
+): StoredSessionEvent[] => {
+  if (previous.length === 0) return incoming;
+  if (incoming.length === 0) return previous;
+  const byId = new Map<number, StoredSessionEvent>();
+  for (const event of previous) byId.set(event.id, event);
+  for (const event of incoming) byId.set(event.id, event);
+  return Array.from(byId.values()).sort((left, right) => left.id - right.id);
+};
+
 export interface UseSessionResult {
   sessionId: string | null;
   sessionDisplayName: string | null;
   sessionModel: string | null;
   sessionRuntimeId: string | null;
   sessionWorkspaceId: string | null;
+  sessionOwnerDid: string | null;
   sessionPrincipalType: "user" | "service_account" | null;
   sessionPrincipalId: string | null;
   sessionSource: "interactive" | "schedule" | "hook" | "api" | null;
+  sessionAttachmentState: "controller" | "elsewhere" | "detached" | null;
+  isSessionController: boolean;
   modelRouting: Record<string, string>;
   modelAliases: Record<string, string>;
   modelCatalog: Record<string, string[]>;
   runtimeDefaults: Record<string, string>;
   runtimeHealth: Record<string, { status: "starting" | "healthy" | "degraded" | "unavailable"; updatedAt: string; reason?: string }>;
   authStatus: "unverified" | "verifying" | "verified" | "failed";
+  authOwnerDid: string | null;
   authPrincipalType: "user" | "service_account" | null;
   authPrincipalId: string | null;
   pendingSessionTransfers: PendingSessionTransfer[];
   sessionList: SessionListEvent["sessions"];
+  sessionListLoaded: boolean;
   sessionListHasMore: boolean;
   sessionListNextCursor: string | null;
   sessionLifecycleHistory: SessionLifecycleResultEvent["events"];
+  sessionHistory: SessionHistoryEvent["events"];
   responseText: string;
   thinkingText: string;
   isStreaming: boolean;
@@ -137,7 +157,10 @@ export interface UseSessionResult {
   steer: (text: string) => void;
   cancel: () => void;
   closeSession: () => void;
+  attachSession: (sessionId: string) => void;
+  detachSession: (sessionId?: string) => void;
   requestReplay: (sessionId: string) => void;
+  requestSessionHistory: (sessionId?: string, afterId?: number, limit?: number) => void;
   requestSessionList: (request?: SessionListRequestInput) => void;
   requestSessionLifecycle: (sessionId?: string, limit?: number) => void;
   renameSession: (sessionId: string, displayName: string | null) => void;
@@ -163,9 +186,12 @@ export const useSession = (
   const [sessionModel, setSessionModel] = useState<string | null>(null);
   const [sessionRuntimeId, setSessionRuntimeId] = useState<string | null>(null);
   const [sessionWorkspaceId, setSessionWorkspaceId] = useState<string | null>(null);
+  const [sessionOwnerDid, setSessionOwnerDid] = useState<string | null>(null);
   const [sessionPrincipalType, setSessionPrincipalType] = useState<"user" | "service_account" | null>(null);
   const [sessionPrincipalId, setSessionPrincipalId] = useState<string | null>(null);
   const [sessionSource, setSessionSource] = useState<"interactive" | "schedule" | "hook" | "api" | null>(null);
+  const [sessionAttachmentState, setSessionAttachmentState] = useState<"controller" | "elsewhere" | "detached" | null>(null);
+  const sessionOwnerDidRef = useRef(sessionOwnerDid);
   const sessionPrincipalTypeRef = useRef(sessionPrincipalType);
   const sessionPrincipalIdRef = useRef(sessionPrincipalId);
   const sessionSourceRef = useRef(sessionSource);
@@ -175,16 +201,21 @@ export const useSession = (
   const [runtimeDefaults, setRuntimeDefaults] = useState<Record<string, string>>({});
   const [runtimeHealth, setRuntimeHealth] = useState<Record<string, { status: "starting" | "healthy" | "degraded" | "unavailable"; updatedAt: string; reason?: string }>>({});
   const [authStatus, setAuthStatus] = useState<"unverified" | "verifying" | "verified" | "failed">("unverified");
+  const [authOwnerDid, setAuthOwnerDid] = useState<string | null>(null);
   const [authPrincipalType, setAuthPrincipalType] = useState<"user" | "service_account" | null>(null);
   const [authPrincipalId, setAuthPrincipalId] = useState<string | null>(null);
   const authStatusRef = useRef(authStatus);
+  const authOwnerDidRef = useRef(authOwnerDid);
   const authPrincipalTypeRef = useRef(authPrincipalType);
   const authPrincipalIdRef = useRef(authPrincipalId);
   const [pendingSessionTransfers, setPendingSessionTransfers] = useState<PendingSessionTransfer[]>([]);
   const [sessionList, setSessionList] = useState<SessionListEvent["sessions"]>([]);
+  const [sessionListLoaded, setSessionListLoaded] = useState(false);
   const [sessionListHasMore, setSessionListHasMore] = useState(false);
   const [sessionListNextCursor, setSessionListNextCursor] = useState<string | null>(null);
   const [sessionLifecycleHistory, setSessionLifecycleHistory] = useState<SessionLifecycleResultEvent["events"]>([]);
+  const [sessionHistory, setSessionHistory] = useState<SessionHistoryEvent["events"]>([]);
+  const sessionHistorySessionIdRef = useRef<string | null>(null);
   const sessionListRef = useRef<SessionListEvent["sessions"]>([]);
   const [responseText, setResponseText] = useState("");
   const [thinkingText, setThinkingText] = useState("");
@@ -231,15 +262,17 @@ export const useSession = (
 
   useEffect(() => {
     authStatusRef.current = authStatus;
+    authOwnerDidRef.current = authOwnerDid;
     authPrincipalTypeRef.current = authPrincipalType;
     authPrincipalIdRef.current = authPrincipalId;
-  }, [authPrincipalId, authPrincipalType, authStatus]);
+  }, [authOwnerDid, authPrincipalId, authPrincipalType, authStatus]);
 
   useEffect(() => {
+    sessionOwnerDidRef.current = sessionOwnerDid;
     sessionPrincipalTypeRef.current = sessionPrincipalType;
     sessionPrincipalIdRef.current = sessionPrincipalId;
     sessionSourceRef.current = sessionSource;
-  }, [sessionPrincipalId, sessionPrincipalType, sessionSource]);
+  }, [sessionOwnerDid, sessionPrincipalId, sessionPrincipalType, sessionSource]);
 
   useEffect(() => {
     sessionListRef.current = sessionList;
@@ -248,6 +281,10 @@ export const useSession = (
   const sendPromptInternal = useCallback(
     (text: string, images?: PromptImageInput[]) => {
       if (!sessionId) return;
+      if (sessionAttachmentState !== "controller") {
+        setError("Session is attached read-only in this client. Reattach to take control before sending a prompt.");
+        return;
+      }
       // Clear buffers and state
       textBufferRef.current = "";
       thinkingBufferRef.current = "";
@@ -268,7 +305,7 @@ export const useSession = (
         ...(images && images.length > 0 ? { images } : {}),
       });
     },
-    [sessionId, sendMessage],
+    [sessionAttachmentState, sessionId, sendMessage],
   );
 
   const handleEvent = useCallback((event: GatewayEvent) => {
@@ -287,6 +324,9 @@ export const useSession = (
         setIsStreaming(false);
         setActiveTools([]);
         setToolCalls([]);
+        setTranscript([]);
+        setSessionHistory([]);
+        sessionHistorySessionIdRef.current = null;
         setError(null);
         setSessionId(event.sessionId);
         setSessionDisplayName(event.displayName ?? null);
@@ -304,19 +344,24 @@ export const useSession = (
             && createdPrincipalId === "user:local"
             && (event.source === undefined || event.source === "interactive");
           if (shouldUseAuthenticatedPrincipal) {
+            sessionOwnerDidRef.current = authOwnerDidRef.current;
             sessionPrincipalTypeRef.current = authPrincipalTypeRef.current;
             sessionPrincipalIdRef.current = authPrincipalIdRef.current;
+            setSessionOwnerDid(authOwnerDidRef.current);
             setSessionPrincipalType(authPrincipalTypeRef.current);
             setSessionPrincipalId(authPrincipalIdRef.current);
           } else {
+            sessionOwnerDidRef.current = event.ownerDid ?? null;
             sessionPrincipalTypeRef.current = createdPrincipalType;
             sessionPrincipalIdRef.current = createdPrincipalId;
+            setSessionOwnerDid(event.ownerDid ?? null);
             setSessionPrincipalType(createdPrincipalType);
             setSessionPrincipalId(createdPrincipalId);
           }
         }
         sessionSourceRef.current = event.source ?? "interactive";
         setSessionSource(event.source ?? "interactive");
+        setSessionAttachmentState("controller");
         setModelRouting(event.modelRouting ?? {});
         setModelAliases(event.modelAliases ?? {});
         setModelCatalog(event.modelCatalog ?? {});
@@ -329,7 +374,9 @@ export const useSession = (
             status: "active",
             lifecycleState: "live",
             model: event.model,
+            attachmentState: "controller",
             workspaceId: event.workspaceId ?? "default",
+            ...(event.ownerDid ? { ownerDid: event.ownerDid } : {}),
             ...(event.displayName ? { displayName: event.displayName } : {}),
             principalType: event.principalType ?? "user",
             principalId: event.principalId ?? "user:local",
@@ -354,17 +401,23 @@ export const useSession = (
           setSessionModel(null);
           setSessionRuntimeId(null);
           setSessionWorkspaceId(null);
+          sessionOwnerDidRef.current = null;
           sessionPrincipalTypeRef.current = null;
           sessionPrincipalIdRef.current = null;
           sessionSourceRef.current = null;
+          setSessionOwnerDid(null);
           setSessionPrincipalType(null);
           setSessionPrincipalId(null);
           setSessionSource(null);
+          setSessionAttachmentState(null);
           setResponseText("");
           setThinkingText("");
           setIsStreaming(false);
           setActiveTools([]);
           setToolCalls([]);
+          setTranscript([]);
+          setSessionHistory([]);
+          sessionHistorySessionIdRef.current = null;
           setError(null);
         }
         setPendingSessionTransfers((prev) => prev.filter((transfer) => transfer.sessionId !== event.sessionId));
@@ -397,6 +450,61 @@ export const useSession = (
           });
         });
         break;
+      case "session_attached":
+        setSessionId(event.sessionId);
+        setSessionAttachmentState(event.controller ? "controller" : "elsewhere");
+        setError(null);
+        setSessionList((prev) => prev.map((candidate) => (
+          candidate.id === event.sessionId
+            ? {
+                ...candidate,
+                attachmentState: event.controller ? "controller" : "elsewhere",
+              }
+            : candidate
+        )));
+        break;
+      case "session_detached":
+        if (event.sessionId === sessionId) {
+          queuedSteerRef.current = null;
+          ignoreCancelledTurnEndRef.current = false;
+          textBufferRef.current = "";
+          thinkingBufferRef.current = "";
+          if (flushTimerRef.current) {
+            clearTimeout(flushTimerRef.current);
+            flushTimerRef.current = null;
+          }
+          setSessionId(null);
+          setSessionDisplayName(null);
+          setSessionModel(null);
+          setSessionRuntimeId(null);
+          setSessionWorkspaceId(null);
+          sessionOwnerDidRef.current = null;
+          sessionPrincipalTypeRef.current = null;
+          sessionPrincipalIdRef.current = null;
+          sessionSourceRef.current = null;
+          setSessionOwnerDid(null);
+          setSessionPrincipalType(null);
+          setSessionPrincipalId(null);
+          setSessionSource(null);
+          setResponseText("");
+          setThinkingText("");
+          setSessionAttachmentState("detached");
+          setIsStreaming(false);
+          setActiveTools([]);
+          setToolCalls((prev) => prev.map((tool) => (
+            tool.status === "running" ? { ...tool, status: "failed" } : tool
+          )));
+          setTranscript([]);
+          setSessionHistory([]);
+          sessionHistorySessionIdRef.current = null;
+          setError(null);
+        }
+        setSessionList((prev) => prev.map((candidate) => (
+          candidate.id === event.sessionId
+            ? { ...candidate, attachmentState: "detached" }
+            : candidate
+        )));
+        break;
       case "session_invalidated":
         if (event.sessionId !== sessionId) break;
         queuedSteerRef.current = null;
@@ -414,6 +522,10 @@ export const useSession = (
         setToolCalls((prev) => prev.map((tool) => (
           tool.status === "running" ? { ...tool, status: "failed" } : tool
         )));
+        setTranscript([]);
+        setSessionHistory([]);
+        sessionHistorySessionIdRef.current = null;
+        setSessionAttachmentState("detached");
         setError(event.message);
         break;
       case "runtime_health":
@@ -435,9 +547,12 @@ export const useSession = (
           setAuthStatus("verified");
           const nextType = event.principalType ?? "user";
           const nextId = event.principalId ?? null;
+          const nextOwnerDid = event.ownerDid ?? null;
           authStatusRef.current = "verified";
+          authOwnerDidRef.current = nextOwnerDid;
           authPrincipalTypeRef.current = nextType;
           authPrincipalIdRef.current = nextId;
+          setAuthOwnerDid(nextOwnerDid);
           setAuthPrincipalType(nextType);
           setAuthPrincipalId(nextId);
           if (
@@ -446,8 +561,10 @@ export const useSession = (
             && sessionPrincipalIdRef.current === "user:local"
             && (sessionSourceRef.current === null || sessionSourceRef.current === "interactive")
           ) {
+            sessionOwnerDidRef.current = nextOwnerDid;
             sessionPrincipalTypeRef.current = nextType;
             sessionPrincipalIdRef.current = nextId;
+            setSessionOwnerDid(nextOwnerDid);
             setSessionPrincipalType(nextType);
             setSessionPrincipalId(nextId);
           }
@@ -537,16 +654,23 @@ export const useSession = (
           setIsStreaming(false);
           setActiveTools([]);
           setToolCalls([]);
+          setTranscript([]);
+          setSessionHistory([]);
+          sessionHistorySessionIdRef.current = null;
           setError(null);
           setSessionDisplayName(knownSession?.displayName ?? null);
           setSessionId(event.sessionId);
+          sessionOwnerDidRef.current = knownSession?.ownerDid ?? null;
           sessionPrincipalTypeRef.current = event.targetPrincipalType;
           sessionPrincipalIdRef.current = event.targetPrincipalId;
           sessionSourceRef.current = "interactive";
+          setSessionOwnerDid(knownSession?.ownerDid ?? null);
           setSessionPrincipalType(event.targetPrincipalType);
           setSessionPrincipalId(event.targetPrincipalId);
           setSessionSource("interactive");
+          setSessionAttachmentState("controller");
           sendMessage({ type: "session_replay", sessionId: event.sessionId });
+          sendMessage({ type: "session_history", sessionId: event.sessionId });
         } else if (isSource && sessionId === event.sessionId) {
           // Session ownership moved away from this client; detach local active session pointer.
           queuedSteerRef.current = null;
@@ -562,17 +686,23 @@ export const useSession = (
           setSessionModel(null);
           setSessionRuntimeId(null);
           setSessionWorkspaceId(null);
+          sessionOwnerDidRef.current = null;
           sessionPrincipalTypeRef.current = null;
           sessionPrincipalIdRef.current = null;
           sessionSourceRef.current = null;
+          setSessionOwnerDid(null);
           setSessionPrincipalType(null);
           setSessionPrincipalId(null);
           setSessionSource(null);
+          setSessionAttachmentState(null);
           setResponseText("");
           setThinkingText("");
           setIsStreaming(false);
           setActiveTools([]);
           setToolCalls([]);
+          setTranscript([]);
+          setSessionHistory([]);
+          sessionHistorySessionIdRef.current = null;
         }
         setSessionList((prev) => {
           if (isSource) {
@@ -657,6 +787,8 @@ export const useSession = (
             setSessionDisplayName(match.displayName ?? null);
             setSessionModel(match.model);
             setSessionWorkspaceId(match.workspaceId ?? "default");
+            sessionOwnerDidRef.current = match.ownerDid ?? null;
+            setSessionOwnerDid(match.ownerDid ?? null);
             if (match.principalType) {
               sessionPrincipalTypeRef.current = match.principalType;
               setSessionPrincipalType(match.principalType);
@@ -669,22 +801,57 @@ export const useSession = (
               sessionSourceRef.current = match.source;
               setSessionSource(match.source);
             }
+            setSessionAttachmentState(match.attachmentState ?? "detached");
           }
         }
         break;
       case "session_list":
         setSessionList(event.sessions);
+        setSessionListLoaded(true);
         setSessionListHasMore(event.hasMore ?? false);
         setSessionListNextCursor(event.nextCursor ?? null);
         if (sessionId) {
           const current = event.sessions.find((session) => session.id === sessionId);
           if (current) {
             setSessionDisplayName(current.displayName ?? null);
+            sessionOwnerDidRef.current = current.ownerDid ?? null;
+            setSessionOwnerDid(current.ownerDid ?? null);
+            setSessionAttachmentState(current.attachmentState ?? "detached");
           }
         }
         break;
       case "session_lifecycle_result":
         setSessionLifecycleHistory(event.events);
+        break;
+      case "session_history":
+        if (sessionHistorySessionIdRef.current !== event.sessionId) {
+          sessionHistorySessionIdRef.current = event.sessionId;
+          setSessionId(event.sessionId);
+          const match = sessionListRef.current.find((session) => session.id === event.sessionId);
+          if (match) {
+            setSessionDisplayName(match.displayName ?? null);
+            setSessionModel(match.model);
+            setSessionWorkspaceId(match.workspaceId ?? "default");
+            sessionOwnerDidRef.current = match.ownerDid ?? null;
+            setSessionOwnerDid(match.ownerDid ?? null);
+            if (match.principalType) {
+              sessionPrincipalTypeRef.current = match.principalType;
+              setSessionPrincipalType(match.principalType);
+            }
+            if (match.principalId) {
+              sessionPrincipalIdRef.current = match.principalId;
+              setSessionPrincipalId(match.principalId);
+            }
+            if (match.source) {
+              sessionSourceRef.current = match.source;
+              setSessionSource(match.source);
+            }
+            setSessionAttachmentState(match.attachmentState ?? "detached");
+          }
+          setSessionHistory(event.events);
+          break;
+        }
+        setSessionHistory((prev) => mergeStoredSessionEvents(prev, event.events));
         break;
       case "usage_result":
         setUsageResults((prev) => [...prev, event]);
@@ -729,6 +896,10 @@ export const useSession = (
     (text: string) => {
       const trimmed = text.trim();
       if (!trimmed || !sessionId) return;
+      if (sessionAttachmentState !== "controller") {
+        setError("Session is attached read-only in this client. Reattach to take control before steering.");
+        return;
+      }
 
       if (!isStreaming) {
         sendPromptInternal(trimmed);
@@ -742,14 +913,29 @@ export const useSession = (
         sendMessage({ type: "cancel", sessionId });
       }
     },
-    [isStreaming, sendMessage, sendPromptInternal, sessionId],
+    [isStreaming, sendMessage, sendPromptInternal, sessionAttachmentState, sessionId],
   );
 
   const requestReplay = useCallback(
     (sid: string) => {
       sendMessage({ type: "session_replay", sessionId: sid });
+      sendMessage({ type: "session_history", sessionId: sid });
     },
     [sendMessage],
+  );
+
+  const requestSessionHistory = useCallback(
+    (explicitSessionId?: string, afterId?: number, limit?: number) => {
+      const sid = explicitSessionId ?? sessionId;
+      if (!sid) return;
+      sendMessage({
+        type: "session_history",
+        sessionId: sid,
+        ...(afterId !== undefined ? { afterId } : {}),
+        ...(limit !== undefined ? { limit } : {}),
+      });
+    },
+    [sendMessage, sessionId],
   );
 
   const requestSessionList = useCallback(
@@ -790,13 +976,32 @@ export const useSession = (
     [sendMessage],
   );
 
-  const resumeSession = useCallback(
+  const attachSession = useCallback(
     (sid: string) => {
       const normalized = sid.trim();
       if (!normalized) return;
-      sendMessage({ type: "session_replay", sessionId: normalized });
+      setError(null);
+      sendMessage({ type: "session_attach", sessionId: normalized });
     },
     [sendMessage],
+  );
+
+  const detachSession = useCallback(
+    (explicitSessionId?: string) => {
+      const sid = explicitSessionId?.trim() || sessionId || undefined;
+      sendMessage({
+        type: "session_detach",
+        ...(sid ? { sessionId: sid } : {}),
+      });
+    },
+    [sendMessage, sessionId],
+  );
+
+  const resumeSession = useCallback(
+    (sid: string) => {
+      attachSession(sid);
+    },
+    [attachSession],
   );
 
   const takeoverSession = useCallback(
@@ -864,18 +1069,28 @@ export const useSession = (
   const cancel = useCallback(() => {
     queuedSteerRef.current = null;
     ignoreCancelledTurnEndRef.current = false;
+    if (sessionAttachmentState !== "controller") {
+      setError("Session is attached read-only in this client. Reattach to take control before cancelling.");
+      return;
+    }
     if (sessionId) {
       sendMessage({ type: "cancel", sessionId });
     }
-  }, [sessionId, sendMessage]);
+  }, [sessionAttachmentState, sessionId, sendMessage]);
 
   const closeSession = useCallback(() => {
     queuedSteerRef.current = null;
     ignoreCancelledTurnEndRef.current = false;
+    if (sessionAttachmentState !== "controller") {
+      setError("Session is attached read-only in this client. Reattach to take control before closing.");
+      return;
+    }
     if (sessionId) {
       sendMessage({ type: "session_close", sessionId });
     }
-  }, [sessionId, sendMessage]);
+  }, [sessionAttachmentState, sessionId, sendMessage]);
+
+  const isSessionController = sessionAttachmentState === "controller";
 
   return {
     sessionId,
@@ -883,22 +1098,28 @@ export const useSession = (
     sessionModel,
     sessionRuntimeId,
     sessionWorkspaceId,
+    sessionOwnerDid,
     sessionPrincipalType,
     sessionPrincipalId,
     sessionSource,
+    sessionAttachmentState,
+    isSessionController,
     modelRouting,
     modelAliases,
     modelCatalog,
     runtimeDefaults,
     runtimeHealth,
     authStatus,
+    authOwnerDid,
     authPrincipalType,
     authPrincipalId,
     pendingSessionTransfers,
     sessionList,
+    sessionListLoaded,
     sessionListHasMore,
     sessionListNextCursor,
     sessionLifecycleHistory,
+    sessionHistory,
     responseText,
     thinkingText,
     isStreaming,
@@ -911,7 +1132,10 @@ export const useSession = (
     steer,
     cancel,
     closeSession,
+    attachSession,
+    detachSession,
     requestReplay,
+    requestSessionHistory,
     requestSessionList,
     requestSessionLifecycle,
     renameSession,

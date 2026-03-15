@@ -1,3 +1,4 @@
+import type { StoredSessionEvent } from "./state.js";
 // Client ↔ Gateway protocol types
 
 import type { MemoryItem, TranscriptMessage } from "./memory.js";
@@ -27,11 +28,13 @@ export interface SessionInfo {
   lifecycleVersion?: number;
   model: string;
   workspaceId?: string;
+  ownerDid?: string;
   displayName?: string;
   interruption?: SessionInterruption;
   principalType?: PrincipalType;
   principalId?: string;
   source?: PromptSource;
+  attachmentState?: SessionAttachmentState;
   createdAt: string;
   lastActivityAt: string;
 }
@@ -49,6 +52,7 @@ export type RuntimeHealthStatus = "starting" | "healthy" | "degraded" | "unavail
 export type PrincipalType = "user" | "service_account";
 export type PromptSource = "interactive" | "schedule" | "hook" | "api";
 export type AuthAlgorithm = "ed25519";
+export type SessionAttachmentState = "controller" | "elsewhere" | "detached";
 
 export interface RuntimeHealthInfo {
   runtimeId: string;
@@ -106,6 +110,14 @@ export type ClientMessage =
       displayName: string | null;
     }
   | { type: "session_replay"; sessionId: string }
+  | { type: "session_attach"; sessionId: string }
+  | { type: "session_detach"; sessionId?: string }
+  | {
+      type: "session_history";
+      sessionId: string;
+      afterId?: number;
+      limit?: number;
+    }
   | { type: "session_continue"; sessionId: string }
   | { type: "session_takeover"; sessionId: string }
   | {
@@ -212,6 +224,7 @@ export type GatewayEvent =
       model: string;
       runtimeId?: string;
       workspaceId?: string;
+      ownerDid?: string;
       displayName?: string;
       principalType?: PrincipalType;
       principalId?: string;
@@ -235,6 +248,16 @@ export type GatewayEvent =
       reason: string;
       message: string;
     }
+  | {
+      type: "session_attached";
+      sessionId: string;
+      controller: boolean;
+    }
+  | {
+      type: "session_detached";
+      sessionId: string;
+      reason: string;
+    }
   | { type: "session_closed"; sessionId: string; reason: string }
   | {
       type: "auth_challenge";
@@ -249,6 +272,7 @@ export type GatewayEvent =
       ok: boolean;
       principalType?: PrincipalType;
       principalId?: string;
+      ownerDid?: string;
       message?: string;
     }
   | {
@@ -299,6 +323,13 @@ export type GatewayEvent =
       events: SessionLifecycleEventRecord[];
     }
   | { type: "runtime_health"; runtime: RuntimeHealthInfo }
+  | {
+      type: "session_history";
+      sessionId: string;
+      events: StoredSessionEvent[];
+      hasMore: boolean;
+      nextAfterId?: number;
+    }
   | {
       type: "session_list";
       sessions: SessionInfo[];
@@ -408,6 +439,9 @@ const CLIENT_MESSAGE_TYPES = new Set([
   "session_lifecycle_query",
   "session_rename",
   "session_replay",
+  "session_attach",
+  "session_detach",
+  "session_history",
   "session_continue",
   "session_takeover",
   "auth_proof",
@@ -429,6 +463,8 @@ const GATEWAY_EVENT_TYPES = new Set([
   "session_created",
   "session_updated",
   "session_invalidated",
+  "session_attached",
+  "session_detached",
   "session_closed",
   "auth_challenge",
   "auth_result",
@@ -438,6 +474,7 @@ const GATEWAY_EVENT_TYPES = new Set([
   "session_lifecycle",
   "session_lifecycle_result",
   "runtime_health",
+  "session_history",
   "session_list",
   "transcript",
   "memory_result",
@@ -450,6 +487,12 @@ const MEMORY_QUERY_ACTIONS = new Set<MemoryQueryAction>([
   "search",
   "context",
   "clear",
+]);
+
+const SESSION_ATTACHMENT_STATES = new Set<SessionAttachmentState>([
+  "controller",
+  "elsewhere",
+  "detached",
 ]);
 
 const MEMORY_SCOPES = new Set<MemoryScope>([
@@ -526,6 +569,21 @@ const isPromptImageInput = (value: unknown): value is PromptImageInput => {
   );
 };
 
+const isStoredSessionEvent = (value: unknown): value is StoredSessionEvent => {
+  if (typeof value !== "object" || value === null) return false;
+  const obj = value as Record<string, unknown>;
+  return (
+    typeof obj.id === "number"
+    && Number.isInteger(obj.id)
+    && typeof obj.sessionId === "string"
+    && typeof obj.type === "string"
+    && typeof obj.timestamp === "string"
+    && (obj.executionId === undefined || typeof obj.executionId === "string")
+    && (obj.turnId === undefined || typeof obj.turnId === "string")
+    && isGatewayEvent(obj.payload)
+  );
+};
+
 export const isClientMessage = (value: unknown): value is ClientMessage => {
   if (typeof value !== "object" || value === null) return false;
   const obj = value as Record<string, unknown>;
@@ -581,6 +639,22 @@ export const isClientMessage = (value: unknown): value is ClientMessage => {
       );
     case "session_replay":
       return typeof obj.sessionId === "string";
+    case "session_attach":
+      return typeof obj.sessionId === "string";
+    case "session_detach":
+      return obj.sessionId === undefined || typeof obj.sessionId === "string";
+    case "session_history":
+      return (
+        typeof obj.sessionId === "string"
+        && (
+          obj.afterId === undefined
+          || (typeof obj.afterId === "number" && Number.isInteger(obj.afterId) && obj.afterId >= 0)
+        )
+        && (
+          obj.limit === undefined
+          || (typeof obj.limit === "number" && Number.isFinite(obj.limit) && obj.limit > 0)
+        )
+      );
     case "session_continue":
       return typeof obj.sessionId === "string";
     case "session_takeover":
@@ -708,6 +782,7 @@ export const isGatewayEvent = (value: unknown): value is GatewayEvent => {
         && typeof obj.model === "string"
         && (obj.runtimeId === undefined || typeof obj.runtimeId === "string")
         && (obj.workspaceId === undefined || typeof obj.workspaceId === "string")
+        && (obj.ownerDid === undefined || typeof obj.ownerDid === "string")
         && (obj.displayName === undefined || typeof obj.displayName === "string")
         && (obj.principalType === undefined || (typeof obj.principalType === "string" && PRINCIPAL_TYPES.has(obj.principalType as PrincipalType)))
         && (obj.principalId === undefined || typeof obj.principalId === "string")
@@ -731,6 +806,16 @@ export const isGatewayEvent = (value: unknown): value is GatewayEvent => {
         && typeof obj.reason === "string"
         && typeof obj.message === "string"
       );
+    case "session_attached":
+      return (
+        typeof obj.sessionId === "string"
+        && typeof obj.controller === "boolean"
+      );
+    case "session_detached":
+      return (
+        typeof obj.sessionId === "string"
+        && typeof obj.reason === "string"
+      );
     case "session_closed":
       return (
         typeof obj.sessionId === "string"
@@ -749,6 +834,7 @@ export const isGatewayEvent = (value: unknown): value is GatewayEvent => {
         typeof obj.ok === "boolean"
         && (obj.principalType === undefined || (typeof obj.principalType === "string" && PRINCIPAL_TYPES.has(obj.principalType as PrincipalType)))
         && (obj.principalId === undefined || typeof obj.principalId === "string")
+        && (obj.ownerDid === undefined || typeof obj.ownerDid === "string")
         && (obj.message === undefined || typeof obj.message === "string")
       );
     case "session_transfer_requested":
@@ -830,9 +916,43 @@ export const isGatewayEvent = (value: unknown): value is GatewayEvent => {
           || typeof (obj.runtime as Record<string, unknown>).reason === "string"
         )
       );
+    case "session_history":
+      return (
+        typeof obj.sessionId === "string"
+        && Array.isArray(obj.events)
+        && obj.events.every((event) => isStoredSessionEvent(event))
+        && typeof obj.hasMore === "boolean"
+        && (obj.nextAfterId === undefined || (typeof obj.nextAfterId === "number" && Number.isInteger(obj.nextAfterId) && obj.nextAfterId >= 0))
+      );
     case "session_list":
       return (
         Array.isArray(obj.sessions)
+        && obj.sessions.every((entry) => (
+          typeof entry === "object"
+          && entry !== null
+          && typeof (entry as Record<string, unknown>).id === "string"
+          && typeof (entry as Record<string, unknown>).status === "string"
+          && (
+            (entry as Record<string, unknown>).status === "active"
+            || (entry as Record<string, unknown>).status === "idle"
+          )
+          && typeof (entry as Record<string, unknown>).model === "string"
+          && ((entry as Record<string, unknown>).ownerDid === undefined || typeof (entry as Record<string, unknown>).ownerDid === "string")
+          && ((entry as Record<string, unknown>).lifecycleState === undefined || isSessionLifecycleState((entry as Record<string, unknown>).lifecycleState))
+          && ((entry as Record<string, unknown>).parkedReason === undefined || isSessionParkedReason((entry as Record<string, unknown>).parkedReason))
+          && ((entry as Record<string, unknown>).parkedAt === undefined || typeof (entry as Record<string, unknown>).parkedAt === "string")
+          && ((entry as Record<string, unknown>).lifecycleUpdatedAt === undefined || typeof (entry as Record<string, unknown>).lifecycleUpdatedAt === "string")
+          && ((entry as Record<string, unknown>).lifecycleVersion === undefined || typeof (entry as Record<string, unknown>).lifecycleVersion === "number")
+          && ((entry as Record<string, unknown>).workspaceId === undefined || typeof (entry as Record<string, unknown>).workspaceId === "string")
+          && ((entry as Record<string, unknown>).displayName === undefined || typeof (entry as Record<string, unknown>).displayName === "string")
+          && ((entry as Record<string, unknown>).interruption === undefined || isSessionInterruption((entry as Record<string, unknown>).interruption))
+          && ((entry as Record<string, unknown>).principalType === undefined || PRINCIPAL_TYPES.has((entry as Record<string, unknown>).principalType as PrincipalType))
+          && ((entry as Record<string, unknown>).principalId === undefined || typeof (entry as Record<string, unknown>).principalId === "string")
+          && ((entry as Record<string, unknown>).source === undefined || PROMPT_SOURCES.has((entry as Record<string, unknown>).source as PromptSource))
+          && ((entry as Record<string, unknown>).attachmentState === undefined || SESSION_ATTACHMENT_STATES.has((entry as Record<string, unknown>).attachmentState as SessionAttachmentState))
+          && typeof (entry as Record<string, unknown>).createdAt === "string"
+          && typeof (entry as Record<string, unknown>).lastActivityAt === "string"
+        ))
         && (obj.hasMore === undefined || typeof obj.hasMore === "boolean")
         && (obj.nextCursor === undefined || typeof obj.nextCursor === "string")
       );

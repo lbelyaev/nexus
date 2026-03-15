@@ -1,4 +1,4 @@
-import { readFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { loadConfig, repoRoot } from "./config.js";
 import {
@@ -15,8 +15,15 @@ import { spawnAgent, createAcpSession } from "@nexus/acp-bridge";
 import type { AgentProcess } from "@nexus/acp-bridge";
 import { evaluatePolicy } from "@nexus/policy";
 import { createSqliteMemoryProvider, type MemoryProvider } from "@nexus/memory";
-import type { NexusConfig, RuntimeHealthInfo, RuntimeHealthStatus, RuntimeProfile } from "@nexus/types";
-import { createChannelManager, createDiscordAdapter, createTelegramAdapter, type ChannelAdapterRegistration } from "@nexus/channels";
+import type { NexusConfig, PrincipalType, RuntimeHealthInfo, RuntimeHealthStatus, RuntimeProfile } from "@nexus/types";
+import {
+  createChannelManager,
+  createDiscordAdapter,
+  createTelegramAdapter,
+  type ChannelAdapterRegistration,
+  type ChannelAuthKeyStore,
+  type StoredChannelAuthKeyPair,
+} from "@nexus/channels";
 import { createLogger } from "./logger.js";
 
 const inferRuntimeId = (command: string[]): string => {
@@ -198,8 +205,36 @@ export const startGateway = async (configPath?: string) => {
   const dataDir = resolve(repoRoot, config.dataDir ?? "./data");
   mkdirSync(dataDir, { recursive: true });
   const dbPath = resolve(dataDir, "nexus.db");
+  const channelAuthKeysPath = resolve(dataDir, "channel-auth-keys.json");
   const stateStore = createStateStore(dbPath);
   log.info("state_store_initialized", { dbPath });
+
+  let channelAuthKeys: Record<string, StoredChannelAuthKeyPair> = {};
+  if (existsSync(channelAuthKeysPath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(channelAuthKeysPath, "utf-8")) as Record<string, StoredChannelAuthKeyPair>;
+      channelAuthKeys = parsed;
+    } catch (error) {
+      log.warn("channel_auth_key_store_load_failed", {
+        path: channelAuthKeysPath,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  const channelAuthKeyStore: ChannelAuthKeyStore = {
+    getChannelAuthKeyPair: (principalType: PrincipalType, principalId: string) => (
+      channelAuthKeys[`${principalType}:${principalId}`] ?? null
+    ),
+    upsertChannelAuthKeyPair: (
+      principalType: PrincipalType,
+      principalId: string,
+      pair: StoredChannelAuthKeyPair,
+    ) => {
+      channelAuthKeys[`${principalType}:${principalId}`] = pair;
+      writeFileSync(channelAuthKeysPath, JSON.stringify(channelAuthKeys, null, 2));
+    },
+  };
 
   let memoryProvider: MemoryProvider | undefined;
   const memoryConfig = config.memory;
@@ -683,6 +718,7 @@ export const startGateway = async (configPath?: string) => {
       token: config.auth.token,
       autoResumeOnUnboundPrompt: true,
       adapters: channelRegistrations,
+      authKeyStore: channelAuthKeyStore,
       bindingStore: {
         getChannelBinding: (adapterId, conversationId) => stateStore.getChannelBinding(adapterId, conversationId),
         upsertChannelBinding: (binding) => stateStore.upsertChannelBinding(binding),

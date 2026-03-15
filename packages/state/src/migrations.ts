@@ -10,6 +10,7 @@ export const initDatabase = (db: DatabaseAdapter): void => {
     CREATE TABLE IF NOT EXISTS sessions (
       id TEXT PRIMARY KEY,
       workspaceId TEXT NOT NULL DEFAULT 'default',
+      ownerDid TEXT,
       principalType TEXT NOT NULL DEFAULT 'user',
       principalId TEXT NOT NULL DEFAULT 'user:local',
       source TEXT NOT NULL DEFAULT 'interactive',
@@ -125,6 +126,17 @@ export const initDatabase = (db: DatabaseAdapter): void => {
       createdAt TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS session_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      sessionId TEXT NOT NULL,
+      type TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+      executionId TEXT,
+      turnId TEXT,
+      FOREIGN KEY (sessionId) REFERENCES sessions(id)
+    );
+
     CREATE TABLE IF NOT EXISTS session_transfers (
       sessionId TEXT PRIMARY KEY,
       fromPrincipalType TEXT NOT NULL,
@@ -135,6 +147,28 @@ export const initDatabase = (db: DatabaseAdapter): void => {
       state TEXT NOT NULL,
       createdAt TEXT NOT NULL,
       updatedAt TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS owner_identities (
+      did TEXT PRIMARY KEY,
+      status TEXT NOT NULL DEFAULT 'active',
+      createdAt TEXT NOT NULL,
+      updatedAt TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS principal_bindings (
+      principalType TEXT NOT NULL,
+      principalId TEXT NOT NULL,
+      source TEXT NOT NULL,
+      ownerDid TEXT NOT NULL,
+      bindingStatus TEXT NOT NULL,
+      verificationMethodId TEXT,
+      proofFormat TEXT,
+      proofPayload TEXT,
+      createdAt TEXT NOT NULL,
+      updatedAt TEXT NOT NULL,
+      PRIMARY KEY (principalType, principalId),
+      FOREIGN KEY (ownerDid) REFERENCES owner_identities(did)
     );
 
     CREATE INDEX IF NOT EXISTS idx_memory_items_session_kind_createdAt
@@ -155,14 +189,23 @@ export const initDatabase = (db: DatabaseAdapter): void => {
       ON session_lifecycle_events(sessionId, createdAt DESC, id DESC);
     CREATE INDEX IF NOT EXISTS idx_session_lifecycle_events_eventType_createdAt
       ON session_lifecycle_events(eventType, createdAt DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_session_events_session
+      ON session_events(sessionId, id);
+    CREATE INDEX IF NOT EXISTS idx_session_events_execution
+      ON session_events(executionId) WHERE executionId IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_session_transfers_target_updatedAt
       ON session_transfers(targetPrincipalType, targetPrincipalId, updatedAt DESC);
     CREATE INDEX IF NOT EXISTS idx_session_transfers_state_expiresAt
       ON session_transfers(state, expiresAt ASC);
+    CREATE INDEX IF NOT EXISTS idx_principal_bindings_ownerDid_updatedAt
+      ON principal_bindings(ownerDid, updatedAt DESC);
   `);
 
   if (!hasColumn(db, "sessions", "workspaceId")) {
     db.exec("ALTER TABLE sessions ADD COLUMN workspaceId TEXT NOT NULL DEFAULT 'default';");
+  }
+  if (!hasColumn(db, "sessions", "ownerDid")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN ownerDid TEXT;");
   }
   if (!hasColumn(db, "sessions", "principalType")) {
     db.exec("ALTER TABLE sessions ADD COLUMN principalType TEXT NOT NULL DEFAULT 'user';");
@@ -277,6 +320,8 @@ export const initDatabase = (db: DatabaseAdapter): void => {
       ON sessions(lastActivityAt DESC, id DESC);
     CREATE INDEX IF NOT EXISTS idx_sessions_principal_lastActivity_id
       ON sessions(principalType, principalId, lastActivityAt DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_sessions_ownerDid_lastActivity_id
+      ON sessions(ownerDid, lastActivityAt DESC, id DESC);
     CREATE INDEX IF NOT EXISTS idx_transcript_workspaceId_session
       ON transcript_messages(workspaceId, sessionId, id ASC);
     CREATE INDEX IF NOT EXISTS idx_memory_items_workspace_kind_createdAt
@@ -297,5 +342,7 @@ export const initDatabase = (db: DatabaseAdapter): void => {
       ON session_lifecycle_events(sessionId, createdAt DESC, id DESC);
     CREATE INDEX IF NOT EXISTS idx_session_lifecycle_events_eventType_createdAt
       ON session_lifecycle_events(eventType, createdAt DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_principal_bindings_ownerDid_updatedAt
+      ON principal_bindings(ownerDid, updatedAt DESC);
   `);
 };

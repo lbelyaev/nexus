@@ -29,8 +29,10 @@ describe("useSession", () => {
     expect(result.current.sessionModel).toBeNull();
     expect(result.current.sessionRuntimeId).toBeNull();
     expect(result.current.sessionWorkspaceId).toBeNull();
+    expect(result.current.sessionOwnerDid).toBeNull();
     expect(result.current.sessionPrincipalType).toBeNull();
     expect(result.current.sessionPrincipalId).toBeNull();
+    expect(result.current.authOwnerDid).toBeNull();
     expect(result.current.sessionSource).toBeNull();
     expect(result.current.runtimeHealth).toEqual({});
     expect(result.current.responseText).toBe("");
@@ -40,9 +42,11 @@ describe("useSession", () => {
     expect(result.current.usageResults).toEqual([]);
     expect(result.current.pendingSessionTransfers).toEqual([]);
     expect(result.current.sessionList).toEqual([]);
+    expect(result.current.sessionListLoaded).toBe(false);
     expect(result.current.sessionListHasMore).toBe(false);
     expect(result.current.sessionListNextCursor).toBeNull();
     expect(result.current.sessionLifecycleHistory).toEqual([]);
+    expect(result.current.sessionHistory).toEqual([]);
   });
 
   it("sets sessionId on session_created event", () => {
@@ -54,6 +58,7 @@ describe("useSession", () => {
         type: "session_created",
         sessionId: "sess-123",
         model: "claude-4",
+        ownerDid: "did:key:zSession123",
         displayName: "Prompt triage",
       });
     });
@@ -63,6 +68,7 @@ describe("useSession", () => {
     expect(result.current.sessionModel).toBe("claude-4");
     expect(result.current.sessionRuntimeId).toBeNull();
     expect(result.current.sessionWorkspaceId).toBe("default");
+    expect(result.current.sessionOwnerDid).toBe("did:key:zSession123");
     expect(result.current.sessionPrincipalType).toBe("user");
     expect(result.current.sessionPrincipalId).toBe("user:local");
     expect(result.current.sessionSource).toBe("interactive");
@@ -671,7 +677,7 @@ describe("useSession", () => {
     expect(sendMessage).toHaveBeenCalledTimes(2);
   });
 
-  it("requestReplay sends session_replay message", () => {
+  it("requestReplay sends transcript and history requests", () => {
     const sendMessage = vi.fn();
     const { result } = renderHook(() => useSession(sendMessage));
 
@@ -679,9 +685,29 @@ describe("useSession", () => {
       result.current.requestReplay("sess-42");
     });
 
-    expect(sendMessage).toHaveBeenCalledWith({
+    expect(sendMessage).toHaveBeenNthCalledWith(1, {
       type: "session_replay",
       sessionId: "sess-42",
+    });
+    expect(sendMessage).toHaveBeenNthCalledWith(2, {
+      type: "session_history",
+      sessionId: "sess-42",
+    });
+  });
+
+  it("requestSessionHistory sends session_history message", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.requestSessionHistory("sess-42", 15, 200);
+    });
+
+    expect(sendMessage).toHaveBeenCalledWith({
+      type: "session_history",
+      sessionId: "sess-42",
+      afterId: 15,
+      limit: 200,
     });
   });
 
@@ -696,6 +722,87 @@ describe("useSession", () => {
     expect(sendMessage).toHaveBeenCalledWith({
       type: "session_takeover",
       sessionId: "sess-77",
+    });
+  });
+
+  it("attachSession sends session_attach message", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.attachSession("sess-55");
+    });
+
+    expect(sendMessage).toHaveBeenCalledWith({
+      type: "session_attach",
+      sessionId: "sess-55",
+    });
+  });
+
+  it("detachSession sends session_detach message", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.detachSession("sess-55");
+    });
+
+    expect(sendMessage).toHaveBeenCalledWith({
+      type: "session_detach",
+      sessionId: "sess-55",
+    });
+  });
+
+  it("session_detached clears the active session pointer", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_created",
+        sessionId: "sess-55",
+        model: "claude-4",
+      });
+      result.current.handleEvent({
+        type: "tool_start",
+        sessionId: "sess-55",
+        tool: "Bash",
+        params: { command: "pwd" },
+      });
+      result.current.handleEvent({
+        type: "text_delta",
+        sessionId: "sess-55",
+        delta: "working",
+      });
+    });
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_detached",
+        sessionId: "sess-55",
+        reason: "detached_by_client",
+      });
+    });
+
+    expect(result.current.sessionId).toBeNull();
+    expect(result.current.sessionModel).toBeNull();
+    expect(result.current.sessionAttachmentState).toBe("detached");
+    expect(result.current.isStreaming).toBe(false);
+    expect(result.current.activeTools).toEqual([]);
+    expect(result.current.transcript).toEqual([]);
+  });
+
+  it("resumeSession attaches the target session", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.resumeSession("sess-88");
+    });
+
+    expect(sendMessage).toHaveBeenCalledWith({
+      type: "session_attach",
+      sessionId: "sess-88",
     });
   });
 
@@ -757,6 +864,7 @@ describe("useSession", () => {
     });
 
     expect(result.current.sessionList).toHaveLength(1);
+    expect(result.current.sessionListLoaded).toBe(true);
     expect(result.current.sessionListHasMore).toBe(true);
     expect(result.current.sessionListNextCursor).toBe("cursor-2");
   });
@@ -997,11 +1105,14 @@ describe("useSession", () => {
       result.current.handleEvent({
         type: "auth_result",
         ok: true,
+        ownerDid: "did:key:zWebAbc",
         principalType: "user",
         principalId: "user:web:abc",
       });
     });
 
+    expect(result.current.authOwnerDid).toBe("did:key:zWebAbc");
+    expect(result.current.sessionOwnerDid).toBe("did:key:zWebAbc");
     expect(result.current.sessionPrincipalType).toBe("user");
     expect(result.current.sessionPrincipalId).toBe("user:web:abc");
   });
@@ -1039,6 +1150,7 @@ describe("useSession", () => {
       result.current.handleEvent({
         type: "auth_result",
         ok: true,
+        ownerDid: "did:key:zWebLate",
         principalType: "user",
         principalId: "user:web:late",
       });
@@ -1052,6 +1164,8 @@ describe("useSession", () => {
       });
     });
 
+    expect(result.current.authOwnerDid).toBe("did:key:zWebLate");
+    expect(result.current.sessionOwnerDid).toBe("did:key:zWebLate");
     expect(result.current.sessionPrincipalType).toBe("user");
     expect(result.current.sessionPrincipalId).toBe("user:web:late");
   });
@@ -1088,8 +1202,12 @@ describe("useSession", () => {
     });
 
     expect(result.current.sessionId).toBe("sess-new");
-    expect(sendMessage).toHaveBeenCalledWith({
+    expect(sendMessage).toHaveBeenNthCalledWith(1, {
       type: "session_replay",
+      sessionId: "sess-new",
+    });
+    expect(sendMessage).toHaveBeenNthCalledWith(2, {
+      type: "session_history",
       sessionId: "sess-new",
     });
   });
@@ -1218,6 +1336,53 @@ describe("useSession", () => {
     });
 
     expect(result.current.transcript).toEqual(messages);
+  });
+
+  it("stores session history events", () => {
+    const sendMessage = vi.fn();
+    const { result } = renderHook(() => useSession(sendMessage));
+
+    act(() => {
+      result.current.handleEvent({
+        type: "session_history",
+        sessionId: "sess-1",
+        events: [
+          {
+            id: 1,
+            sessionId: "sess-1",
+            type: "text_delta",
+            payload: {
+              type: "text_delta",
+              sessionId: "sess-1",
+              delta: "hello",
+            },
+            timestamp: "2026-01-01T00:00:00Z",
+          },
+        ],
+        hasMore: false,
+      });
+      result.current.handleEvent({
+        type: "session_history",
+        sessionId: "sess-1",
+        events: [
+          {
+            id: 2,
+            sessionId: "sess-1",
+            type: "turn_end",
+            payload: {
+              type: "turn_end",
+              sessionId: "sess-1",
+              stopReason: "end_turn",
+            },
+            timestamp: "2026-01-01T00:00:01Z",
+          },
+        ],
+        hasMore: false,
+      });
+    });
+
+    expect(result.current.sessionHistory).toHaveLength(2);
+    expect(result.current.sessionHistory.map((event) => event.id)).toEqual([1, 2]);
   });
 
   it("has empty transcript initially", () => {

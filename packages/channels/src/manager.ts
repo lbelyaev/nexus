@@ -7,7 +7,7 @@ import type {
   SessionLifecycleEventRecord,
 } from "@nexus/types";
 import { canAutoResumeSession } from "@nexus/types";
-import { generateKeyPairSync, sign, type KeyObject } from "node:crypto";
+import { createPrivateKey, generateKeyPairSync, sign, type KeyObject } from "node:crypto";
 import { createGatewayClient, type GatewayClient } from "./gatewayClient.js";
 import type {
   ChannelAdapter,
@@ -27,11 +27,26 @@ export interface ChannelManagerOptions {
   reconnectDelayMs?: number;
   autoResumeOnUnboundPrompt?: boolean;
   logger?: LoggerLike;
+  authKeyStore?: ChannelAuthKeyStore;
   bindingStore?: {
     getChannelBinding: (adapterId: string, conversationId: string) => ChannelBindingRecord | null;
     upsertChannelBinding: (binding: ChannelBindingRecord) => void;
     deleteChannelBinding: (adapterId: string, conversationId: string) => void;
   };
+}
+
+export interface StoredChannelAuthKeyPair {
+  publicKey: string;
+  privateKey: string;
+}
+
+export interface ChannelAuthKeyStore {
+  getChannelAuthKeyPair: (principalType: PrincipalType, principalId: string) => StoredChannelAuthKeyPair | null;
+  upsertChannelAuthKeyPair: (
+    principalType: PrincipalType,
+    principalId: string,
+    pair: StoredChannelAuthKeyPair,
+  ) => void;
 }
 
 export interface ChannelManager {
@@ -403,7 +418,7 @@ const formatSessionList = (
 
   const formatNextAction = (session: SessionInfo): string => {
     if (session.id === activeSessionId) {
-      return "current";
+      return `/session detach ${session.id}`;
     }
     const state = session.lifecycleState ?? (session.status === "active" ? "live" : "parked");
     if (state === "closed") {
@@ -430,6 +445,7 @@ const formatSessionList = (
     )),
     ...(hasMore ? ["More sessions available. Use /session list next."] : []),
     "Use /session resume <sessionId> to attach a listed session.",
+    "Use /session detach [sessionId] to leave the current session without closing it.",
     "Use /session delete [sessionId] to close a session explicitly.",
   ].join("\n");
 };
@@ -468,6 +484,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     reconnectDelayMs = 1_500,
     autoResumeOnUnboundPrompt = false,
     logger = createFallbackLogger(),
+    authKeyStore,
     bindingStore,
   } = options;
 
@@ -500,6 +517,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
   const cancelRequested = new Set<string>();
   const queuedSteers = new Map<string, ChannelInboundMessage>();
   const authKeyPairs = new Map<string, AuthKeyPair>();
+  const ownerDidByPrincipal = new Map<string, string>();
   const authResultQueue: AuthResultEvent[] = [];
   const authChallengeWaiters = new Set<AuthChallengeWaiter>();
   const authResultWaiters = new Set<AuthResultWaiter>();
@@ -516,6 +534,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
   const gatewayClient: GatewayClient = createGatewayClient(gatewayUrl, token);
 
   const conversationKeyOf = (adapterId: string, conversationId: string): string => `${adapterId}:${conversationId}`;
+  const principalKeyOf = (principalType: PrincipalType, principalId: string): string => `${principalType}:${principalId}`;
 
   const persistConversationBinding = (binding: ConversationBinding): void => {
     if (!bindingStore) return;
@@ -641,12 +660,35 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     const key = `${principalType}:${principalId}`;
     const existing = authKeyPairs.get(key);
     if (existing) return existing;
+    const persisted = authKeyStore?.getChannelAuthKeyPair(principalType, principalId);
+    if (persisted) {
+      const restored: AuthKeyPair = {
+        publicKey: persisted.publicKey,
+        privateKey: createPrivateKey(persisted.privateKey),
+      };
+      authKeyPairs.set(key, restored);
+      return restored;
+    }
     const { publicKey, privateKey } = generateKeyPairSync("ed25519");
     const generated: AuthKeyPair = {
       publicKey: publicKey.export({ type: "spki", format: "pem" }).toString(),
       privateKey,
     };
     authKeyPairs.set(key, generated);
+    if (authKeyStore) {
+      try {
+        authKeyStore.upsertChannelAuthKeyPair(principalType, principalId, {
+          publicKey: generated.publicKey,
+          privateKey: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+        });
+      } catch (error) {
+        logger.warn("channel_auth_key_persist_failed", {
+          principalType,
+          principalId,
+          error: formatChannelError(error),
+        });
+      }
+    }
     return generated;
   };
 
@@ -1363,7 +1405,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
       });
       try {
         gatewayClient.send({
-          type: "session_replay",
+          type: "session_attach",
           sessionId: candidate.id,
         });
       } catch (error) {
@@ -1371,7 +1413,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
       }
     }).catch((error: unknown) => {
       if (isGatewayDisconnectedError(error)) throw error;
-      logger.warn("channel_auto_resume_replay_failed", {
+      logger.warn("channel_auto_resume_attach_failed", {
         adapterId: message.adapterId,
         conversationId: message.conversationId,
         principalType,
@@ -1391,6 +1433,28 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
       principalId,
     });
     return resumedSessionId;
+  };
+
+  const resolveConversationBinding = async (
+    message: ChannelInboundMessage,
+    resolvedPrincipal: ReturnType<typeof resolveInboundPrincipal>,
+    options?: {
+      allowAutoResume?: boolean;
+    },
+  ): Promise<ConversationBinding | null> => {
+    const key = conversationKeyOf(message.adapterId, message.conversationId);
+    const existing = conversationBindings.get(key);
+    if (existing) return existing;
+
+    const persisted = await reconcilePersistedBinding(message, resolvedPrincipal);
+    if (persisted) return persisted;
+
+    if (options?.allowAutoResume === false) return null;
+
+    const resumedSessionId = await tryAutoResumeSession(message, resolvedPrincipal);
+    if (!resumedSessionId) return null;
+
+    return conversationBindings.get(key) ?? null;
   };
 
   const deletePersistedBinding = (binding: ConversationBinding): void => {
@@ -1894,7 +1958,11 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     }
 
     if (command === "status") {
-      const resolvedBinding = binding ?? await reconcilePersistedBinding(message, resolvedPrincipal);
+      const resolvedBinding = await resolveConversationBinding(message, resolvedPrincipal);
+      const sessionInfo = resolvedBinding ? sessionInfoById.get(resolvedBinding.sessionId) : undefined;
+      const authOwnerDid = ownerDidByPrincipal.get(
+        principalKeyOf(resolvedPrincipal.principalType, resolvedPrincipal.principalId),
+      );
       await sendToConversation(
         message.adapterId,
         message.conversationId,
@@ -1902,12 +1970,14 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
           ? [
               `Session: ${resolvedBinding.sessionId}`,
               `Principal: ${resolvedBinding.principalId}`,
+              ...(sessionInfo?.ownerDid ? [`Owner DID: ${sessionInfo.ownerDid}`] : []),
+              ...(authOwnerDid && authOwnerDid !== sessionInfo?.ownerDid ? [`Auth DID: ${authOwnerDid}`] : []),
               `Source: api`,
               `Runtime: ${resolvedBinding.runtimeId ?? "default"}`,
               `Model: ${resolvedBinding.model ?? "runtime-default"}`,
               `Workspace: ${resolvedBinding.workspaceId ?? "default"}`,
-              ...(isApprovalPendingSession(sessionInfoById.get(resolvedBinding.sessionId))
-                ? [`Interrupted: approval pending${sessionInfoById.get(resolvedBinding.sessionId)?.interruption?.stale ? " (stale)" : ""}`]
+              ...(isApprovalPendingSession(sessionInfo)
+                ? [`Interrupted: approval pending${sessionInfo?.interruption?.stale ? " (stale)" : ""}`]
                 : []),
               `Steering: ${resolvedBinding.steeringMode}`,
               `Running: ${runningTurns.has(resolvedBinding.sessionId) ? "yes" : "no"}`,
@@ -1932,8 +2002,8 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
             "/session list [limit|next [limit]]",
             "/session history [sessionId] [limit]",
             "/session resume <sessionId>",
+            "/session detach [sessionId]",
             "/session continue [sessionId]",
-            "/session takeover <sessionId>",
             "/session transfer pending|request|accept|dismiss",
             "/session close [sessionId]",
             "/session delete [sessionId]",
@@ -1991,11 +2061,12 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
       }
 
       if (sub === "history") {
+        const resolvedBinding = binding ?? await resolveConversationBinding(message, resolvedPrincipal);
         const rawTarget = parts[1]?.trim();
         const implicitLimit = parsePositiveInteger(rawTarget);
         const sessionId = implicitLimit !== undefined
-          ? binding?.sessionId
-          : rawTarget || binding?.sessionId;
+          ? resolvedBinding?.sessionId
+          : rawTarget || resolvedBinding?.sessionId;
         const limitArg = implicitLimit !== undefined ? rawTarget : parts[2];
         const parsedLimit = parsePositiveInteger(limitArg);
         if ((limitArg && parsedLimit === undefined) || !sessionId) {
@@ -2027,8 +2098,9 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
       }
 
       if (sub === "resume" || sub === "takeover" || sub === "continue") {
+        const resolvedBinding = binding ?? await resolveConversationBinding(message, resolvedPrincipal);
         const sessionId = parts[1]?.trim();
-        const resolvedSessionId = sessionId || binding?.sessionId;
+        const resolvedSessionId = sessionId || resolvedBinding?.sessionId;
         if (!resolvedSessionId) {
           await sendToConversation(
             message.adapterId,
@@ -2053,23 +2125,41 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
           conversationId: message.conversationId,
           principalType: resolvedPrincipal.principalType,
           principalId: resolvedPrincipal.principalId,
-          previousSessionId: binding?.sessionId,
+          previousSessionId: resolvedBinding?.sessionId,
         });
-        gatewayClient.send({ type: sub === "takeover" ? "session_takeover" : "session_replay", sessionId: resolvedSessionId });
+        gatewayClient.send({ type: "session_attach", sessionId: resolvedSessionId });
         await sendToConversation(
           message.adapterId,
           message.conversationId,
-          `${sub === "takeover" ? "Taking over" : "Resuming"} session ${resolvedSessionId}...`,
+          `Resuming session ${resolvedSessionId}...`,
         );
         return true;
       }
 
+      if (sub === "detach") {
+        const resolvedBinding = binding ?? await resolveConversationBinding(message, resolvedPrincipal);
+        const sessionId = parts[1]?.trim() || resolvedBinding?.sessionId;
+        if (!sessionId) {
+          await sendToConversation(message.adapterId, message.conversationId, "Usage: /session detach [sessionId]");
+          return true;
+        }
+        await ensureConnectionPrincipal(resolvedPrincipal.principalType, resolvedPrincipal.principalId);
+        gatewayClient.send({ type: "session_detach", sessionId });
+        if (resolvedBinding?.sessionId === sessionId) {
+          clearSessionState(sessionId);
+        }
+        await sendToConversation(message.adapterId, message.conversationId, `Detached session ${sessionId}.`);
+        return true;
+      }
+
       if (sub === "transfer") {
-        return handleSessionTransferCommand(message, binding, resolvedPrincipal, parts.slice(1));
+        const resolvedBinding = binding ?? await resolveConversationBinding(message, resolvedPrincipal);
+        return handleSessionTransferCommand(message, resolvedBinding ?? undefined, resolvedPrincipal, parts.slice(1));
       }
 
       if (sub === "close" || sub === "delete") {
-        const sessionId = parts[1]?.trim() || binding?.sessionId;
+        const resolvedBinding = binding ?? await resolveConversationBinding(message, resolvedPrincipal);
+        const sessionId = parts[1]?.trim() || resolvedBinding?.sessionId;
         if (!sessionId) {
           await sendToConversation(message.adapterId, message.conversationId, `Usage: /session ${sub} [sessionId]`);
           return true;
@@ -2089,25 +2179,27 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         await sendToConversation(
           message.adapterId,
           message.conversationId,
-          "Usage: /session [list|history|resume|continue|takeover|transfer|close|delete]",
+          "Usage: /session [list|history|resume|detach|continue|transfer|close|delete]",
         );
         return true;
       }
 
     if (command === "transfer") {
-      return handleSessionTransferCommand(message, binding, resolvedPrincipal, parts, {
+      const resolvedBinding = binding ?? await resolveConversationBinding(message, resolvedPrincipal);
+      return handleSessionTransferCommand(message, resolvedBinding ?? undefined, resolvedPrincipal, parts, {
         deprecatedAlias: true,
       });
     }
 
     if (command === "usage") {
-      if (!binding) {
+      const resolvedBinding = binding ?? await resolveConversationBinding(message, resolvedPrincipal);
+      if (!resolvedBinding) {
         await sendToConversation(message.adapterId, message.conversationId, "No active session for usage commands.");
         return true;
       }
       const sub = parts[0]?.trim().toLowerCase();
       if (!sub || sub === "summary") {
-        gatewayClient.send({ type: "usage_query", sessionId: binding.sessionId, action: "summary" });
+        gatewayClient.send({ type: "usage_query", sessionId: resolvedBinding.sessionId, action: "summary" });
         return true;
       }
 
@@ -2119,7 +2211,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         }
         gatewayClient.send({
           type: "usage_query",
-          sessionId: binding.sessionId,
+          sessionId: resolvedBinding.sessionId,
           action: "stats",
           ...(scope ? { scope } : {}),
         });
@@ -2148,7 +2240,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         }
         gatewayClient.send({
           type: "usage_query",
-          sessionId: binding.sessionId,
+          sessionId: resolvedBinding.sessionId,
           action: "recent",
           ...(parsedLimit !== undefined ? { limit: parsedLimit } : {}),
           ...(scope ? { scope } : {}),
@@ -2171,7 +2263,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         }
         gatewayClient.send({
           type: "usage_query",
-          sessionId: binding.sessionId,
+          sessionId: resolvedBinding.sessionId,
           action: "search",
           query,
           ...(maybeScope ? { scope: maybeScope } : {}),
@@ -2185,7 +2277,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         const prompt = promptParts.join(" ").trim();
         gatewayClient.send({
           type: "usage_query",
-          sessionId: binding.sessionId,
+          sessionId: resolvedBinding.sessionId,
           action: "context",
           ...(prompt ? { prompt } : {}),
           ...(maybeScope ? { scope: maybeScope } : {}),
@@ -2201,7 +2293,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         }
         gatewayClient.send({
           type: "usage_query",
-          sessionId: binding.sessionId,
+          sessionId: resolvedBinding.sessionId,
           action: "clear",
           ...(scope ? { scope } : {}),
         });
@@ -2217,23 +2309,25 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     }
 
     if (command === "cancel") {
-      if (!binding) {
+      const resolvedBinding = binding ?? await resolveConversationBinding(message, resolvedPrincipal);
+      if (!resolvedBinding) {
         await sendToConversation(message.adapterId, message.conversationId, "No active session to cancel.");
         return true;
       }
-      gatewayClient.send({ type: "cancel", sessionId: binding.sessionId });
-      cancelRequested.add(binding.sessionId);
+      gatewayClient.send({ type: "cancel", sessionId: resolvedBinding.sessionId });
+      cancelRequested.add(resolvedBinding.sessionId);
       await sendToConversation(message.adapterId, message.conversationId, "Cancelled current turn.");
       return true;
     }
 
     if (command === "approve") {
-      if (!binding) {
+      const resolvedBinding = binding ?? await resolveConversationBinding(message, resolvedPrincipal);
+      if (!resolvedBinding) {
         await sendToConversation(message.adapterId, message.conversationId, "No active session.");
         return true;
       }
       const arg = parts[0]?.trim().toLowerCase();
-      const approvalsForSession = listPendingApprovalsForSession(binding.sessionId);
+      const approvalsForSession = listPendingApprovalsForSession(resolvedBinding.sessionId);
       if (arg === "all") {
         for (const approval of approvalsForSession) {
           if (approval.allowOptionId) {
@@ -2264,7 +2358,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         );
         return true;
       }
-      if (pending.sessionId !== binding.sessionId) {
+      if (pending.sessionId !== resolvedBinding.sessionId) {
         await sendToConversation(
           message.adapterId,
           message.conversationId,
@@ -2282,9 +2376,9 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         gatewayClient.send({ type: "approval_response", requestId, allow: true });
       }
       pendingApprovalsById.delete(requestId);
-      const remaining = listPendingApprovalsForSession(binding.sessionId).length;
+      const remaining = listPendingApprovalsForSession(resolvedBinding.sessionId).length;
       if (remaining > 0) {
-        await maybeSendNextApprovalPrompt(binding.sessionId);
+        await maybeSendNextApprovalPrompt(resolvedBinding.sessionId);
       } else {
         await sendToConversation(
           message.adapterId,
@@ -2296,7 +2390,8 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     }
 
     if (command === "deny" || command === "reject") {
-      if (!binding) {
+      const resolvedBinding = binding ?? await resolveConversationBinding(message, resolvedPrincipal);
+      if (!resolvedBinding) {
         await sendToConversation(message.adapterId, message.conversationId, "No active session.");
         return true;
       }
@@ -2314,7 +2409,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         );
         return true;
       }
-      if (pending.sessionId !== binding.sessionId) {
+      if (pending.sessionId !== resolvedBinding.sessionId) {
         await sendToConversation(
           message.adapterId,
           message.conversationId,
@@ -2332,9 +2427,9 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
         gatewayClient.send({ type: "approval_response", requestId, allow: false });
       }
       pendingApprovalsById.delete(requestId);
-      const remaining = listPendingApprovalsForSession(binding.sessionId).length;
+      const remaining = listPendingApprovalsForSession(resolvedBinding.sessionId).length;
       if (remaining > 0) {
-        await maybeSendNextApprovalPrompt(binding.sessionId);
+        await maybeSendNextApprovalPrompt(resolvedBinding.sessionId);
       } else {
         await sendToConversation(
           message.adapterId,
@@ -2423,6 +2518,9 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
             principalType: event.principalType,
             principalId: event.principalId,
           };
+          if (event.ownerDid) {
+            ownerDidByPrincipal.set(principalKeyOf(event.principalType, event.principalId), event.ownerDid);
+          }
         }
         pushAuthResult(event);
         break;
@@ -2439,6 +2537,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
           lifecycleState: "live",
           model: event.model,
           ...(event.workspaceId ? { workspaceId: event.workspaceId } : {}),
+          ...(event.ownerDid ? { ownerDid: event.ownerDid } : {}),
           ...(event.displayName ? { displayName: event.displayName } : {}),
           ...(event.principalType ? { principalType: event.principalType } : {}),
           ...(event.principalId ? { principalId: event.principalId } : {}),
@@ -3041,7 +3140,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
     pendingSessionLifecycleRequests.length = 0;
     sessionListStateByConversation.clear();
     for (const [sessionId] of pendingSessionResumeBySession) {
-      clearPendingSessionResume(sessionId, new Error("Gateway connection closed before session replay completed."));
+      clearPendingSessionResume(sessionId, new Error("Gateway connection closed before session attach completed."));
     }
     for (const sessionId of Array.from(runningTurns)) {
       stopTyping(sessionId);
@@ -3090,7 +3189,7 @@ export const createChannelManager = (options: ChannelManagerOptions): ChannelMan
       pendingSessionLifecycleRequests.length = 0;
       sessionListStateByConversation.clear();
       for (const [sessionId] of pendingSessionResumeBySession) {
-        clearPendingSessionResume(sessionId, new Error("Channel manager stopped before session replay completed."));
+        clearPendingSessionResume(sessionId, new Error("Channel manager stopped before session attach completed."));
       }
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);

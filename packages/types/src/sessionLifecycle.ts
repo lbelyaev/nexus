@@ -6,6 +6,7 @@ export type SessionParkedReason =
   | "transfer_pending"
   | "transfer_expired"
   | "runtime_timeout"
+  | "idle"
   | "owner_disconnected"
   | "approval_pending"
   | "manual";
@@ -21,6 +22,7 @@ export type SessionLifecycleEventType =
   | "OWNER_RESUMED"
   | "TAKEOVER"
   | "RUNTIME_TIMEOUT"
+  | "IDLE_TIMEOUT"
   | "OWNER_DISCONNECTED"
   | "SESSION_CLOSED";
 
@@ -62,6 +64,7 @@ export const OWNER_TRANSFER_RESUME_ALLOWED_PARKED_REASONS = [
 export const OWNER_RESUMABLE_PARKED_REASONS = [
   "owner_disconnected",
   "runtime_timeout",
+  "idle",
   "manual",
   "transfer_expired",
 ] as const satisfies readonly SessionParkedReason[];
@@ -69,6 +72,7 @@ export const OWNER_RESUMABLE_PARKED_REASONS = [
 export const AUTO_RESUME_ALLOWED_PARKED_REASONS = [
   "owner_disconnected",
   "runtime_timeout",
+  "idle",
   "manual",
   "transfer_expired",
   "approval_pending",
@@ -77,6 +81,7 @@ export const AUTO_RESUME_ALLOWED_PARKED_REASONS = [
 export const TAKEOVER_ALLOWED_PARKED_REASONS = [
   "owner_disconnected",
   "runtime_timeout",
+  "idle",
   "manual",
   "transfer_expired",
 ] as const satisfies readonly SessionParkedReason[];
@@ -95,6 +100,7 @@ const SESSION_PARKED_REASONS = new Set<SessionParkedReason>([
   "transfer_pending",
   "transfer_expired",
   "runtime_timeout",
+  "idle",
   "owner_disconnected",
   "approval_pending",
   "manual",
@@ -111,6 +117,7 @@ const SESSION_LIFECYCLE_EVENT_TYPES = new Set<SessionLifecycleEventType>([
   "OWNER_RESUMED",
   "TAKEOVER",
   "RUNTIME_TIMEOUT",
+  "IDLE_TIMEOUT",
   "OWNER_DISCONNECTED",
   "SESSION_CLOSED",
 ]);
@@ -121,6 +128,7 @@ const SESSION_LIFECYCLE_TRANSITIONS: Record<SessionLifecycleState, Partial<Recor
     APPROVAL_REQUESTED: "parked",
     TRANSFER_REQUESTED: "parked",
     RUNTIME_TIMEOUT: "parked",
+    IDLE_TIMEOUT: "parked",
     OWNER_DISCONNECTED: "parked",
     SESSION_CLOSED: "closed",
   },
@@ -134,6 +142,7 @@ const SESSION_LIFECYCLE_TRANSITIONS: Record<SessionLifecycleState, Partial<Recor
     OWNER_RESUMED: "live",
     TAKEOVER: "live",
     RUNTIME_TIMEOUT: "parked",
+    IDLE_TIMEOUT: "parked",
     OWNER_DISCONNECTED: "parked",
     SESSION_CLOSED: "closed",
   },
@@ -144,6 +153,7 @@ const DEFAULT_PARKED_REASON_BY_EVENT: Partial<Record<SessionLifecycleEventType, 
   TRANSFER_REQUESTED: "transfer_pending",
   TRANSFER_EXPIRED: "transfer_expired",
   RUNTIME_TIMEOUT: "runtime_timeout",
+  IDLE_TIMEOUT: "idle",
   OWNER_DISCONNECTED: "owner_disconnected",
   APPROVAL_REQUESTED: "approval_pending",
 };

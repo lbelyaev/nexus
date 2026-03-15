@@ -7,6 +7,7 @@ import { createSessionStore } from "../sessions.js";
 const makeSession = (overrides: Partial<SessionRecord> = {}): SessionRecord => ({
   id: "sess-1",
   workspaceId: "default",
+  ownerDid: "did:key:z6Mkowner",
   principalType: "user",
   principalId: "user:local",
   source: "interactive",
@@ -73,31 +74,34 @@ describe("SessionStore", () => {
     expect(store.listSessions()).toEqual([]);
   });
 
-  it("listSessionsPage filters by principal and paginates with cursor", () => {
+  it("listSessionsPage filters by ownerDid and paginates with cursor", () => {
     store.createSession(makeSession({
       id: "sess-1",
+      ownerDid: "did:key:z6Mkowner-a",
       principalId: "user:web:1",
       lastActivityAt: "2025-01-01T00:00:00Z",
     }));
     store.createSession(makeSession({
       id: "sess-2",
+      ownerDid: "did:key:z6Mkowner-a",
       principalId: "user:web:1",
       lastActivityAt: "2025-01-03T00:00:00Z",
     }));
     store.createSession(makeSession({
       id: "sess-3",
+      ownerDid: "did:key:z6Mkowner-a",
       principalId: "user:web:1",
       lastActivityAt: "2025-01-02T00:00:00Z",
     }));
     store.createSession(makeSession({
       id: "sess-4",
+      ownerDid: "did:key:z6Mkowner-b",
       principalId: "user:web:2",
       lastActivityAt: "2025-01-04T00:00:00Z",
     }));
 
     const page1 = store.listSessionsPage({
-      principalType: "user",
-      principalId: "user:web:1",
+      ownerDid: "did:key:z6Mkowner-a",
       limit: 2,
     });
     expect(page1.sessions.map((session) => session.id)).toEqual(["sess-2", "sess-3"]);
@@ -105,8 +109,7 @@ describe("SessionStore", () => {
     expect(page1.nextCursor).toBeDefined();
 
     const page2 = store.listSessionsPage({
-      principalType: "user",
-      principalId: "user:web:1",
+      ownerDid: "did:key:z6Mkowner-a",
       limit: 2,
       cursor: page1.nextCursor,
     });
@@ -117,8 +120,7 @@ describe("SessionStore", () => {
 
   it("listSessionsPage throws on malformed cursor", () => {
     expect(() => store.listSessionsPage({
-      principalType: "user",
-      principalId: "user:web:1",
+      ownerDid: "did:key:z6Mkowner-a",
       limit: 5,
       cursor: "bad-cursor",
     })).toThrow(/invalid session list cursor/i);

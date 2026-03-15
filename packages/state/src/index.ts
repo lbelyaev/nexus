@@ -8,3 +8,5 @@ export * from "./memory.js";
 export * from "./executions.js";
 export * from "./channelBindings.js";
 export * from "./sessionTransfers.js";
+export * from "./sessionEvents.js";
+export * from "./identities.js";

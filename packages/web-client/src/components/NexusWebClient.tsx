@@ -14,6 +14,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { mergeContiguousMessages, type ChatMessage } from "../lib/chatMerge";
 import { inferRuntimeFromModel, resolveModelAlias } from "../lib/modelRouting";
+import { transcriptToChatMessages } from "../lib/transcriptToChat";
 import { createWebAuthProofProvider } from "../lib/authProof";
 import { ScrollArea } from "./ui/ScrollArea";
 import { Separator } from "./ui/Separator";
@@ -42,6 +43,7 @@ const compact = (text: string, max: number = 120): string => {
 };
 
 const SESSION_DRAWER_LIMIT = 50;
+const LAST_SESSION_STORAGE_KEY = "nexus.web.last-session.v1";
 
 const formatSessionTitle = (session: SessionInfo): string => (
   session.displayName?.trim() || `Session ${session.id.slice(-6)}`
@@ -51,23 +53,28 @@ const formatSessionState = (session: SessionInfo): "live" | "parked" | "closed" 
   session.lifecycleState ?? (session.status === "active" ? "live" : "parked")
 );
 
+const sortSessionsByActivity = (sessions: SessionInfo[]): SessionInfo[] => (
+  [...sessions].sort((left, right) => {
+    const byActivity = right.lastActivityAt.localeCompare(left.lastActivityAt);
+    if (byActivity !== 0) return byActivity;
+    return right.id.localeCompare(left.id);
+  })
+);
+
+const pickLatestAttachableSession = (sessions: SessionInfo[]): SessionInfo | null => (
+  sortSessionsByActivity(sessions).find((candidate) => formatSessionState(candidate) !== "closed") ?? null
+);
+
 const getSessionStatusPresentation = (
   session: SessionInfo,
   activeSessionId: string | null,
 ): { dotClass: string; label: string; hint: string } => {
-  if (session.id === activeSessionId) {
+  const state = formatSessionState(session);
+  if (session.attachmentState === "controller" || session.id === activeSessionId) {
     return {
       dotClass: "bg-sky-400 shadow-[0_0_0_4px_rgba(56,189,248,0.16)]",
       label: "Current",
       hint: "live in this client",
-    };
-  }
-  const state = formatSessionState(session);
-  if (state === "parked") {
-    return {
-      dotClass: "bg-rose-400 shadow-[0_0_0_4px_rgba(251,113,133,0.14)]",
-      label: "Suspended",
-      hint: session.parkedReason ?? "parked",
     };
   }
   if (state === "closed") {
@@ -75,6 +82,20 @@ const getSessionStatusPresentation = (
       dotClass: "bg-slate-500 shadow-[0_0_0_4px_rgba(100,116,139,0.14)]",
       label: "Closed",
       hint: "closed",
+    };
+  }
+  if (session.attachmentState === "detached") {
+    return {
+      dotClass: "bg-emerald-400 shadow-[0_0_0_4px_rgba(52,211,153,0.14)]",
+      label: "Detached",
+      hint: "owned, not attached",
+    };
+  }
+  if (state === "parked") {
+    return {
+      dotClass: "bg-rose-400 shadow-[0_0_0_4px_rgba(251,113,133,0.14)]",
+      label: "Suspended",
+      hint: session.parkedReason ?? "parked",
     };
   }
   return {
@@ -231,7 +252,7 @@ const formatSessionListResult = (
 
   const formatNextAction = (session: UseSessionResult["sessionList"][number]): string => {
     if (session.id === activeSessionId) {
-      return "current";
+      return `/session detach ${session.id}`;
     }
     const state = session.lifecycleState ?? (session.status === "active" ? "live" : "parked");
     if (state === "closed") {
@@ -257,6 +278,7 @@ const formatSessionListResult = (
     })),
     ...(hasMore ? [{ id: makeId(), role: "system" as const, text: "More sessions available. Use /session list next." }] : []),
     { id: makeId(), role: "system" as const, text: "Use /session resume <sessionId> to attach a listed session." },
+    { id: makeId(), role: "system" as const, text: "Use /session detach [sessionId] to leave the current session without closing it." },
     { id: makeId(), role: "system" as const, text: "Use /session delete [sessionId] to close a session explicitly." },
   ];
 };
@@ -283,15 +305,20 @@ const formatSessionLifecycleResult = (
   ];
 };
 
-const MarkdownView = ({ text }: { text: string }) => (
+export const MarkdownView = ({ text }: { text: string }) => (
   <div className="markdown-body">
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
       components={{
-        a: ({ children, ...props }) => (
+        a: ({ children, node: _node, ...props }) => (
           <a className="text-pulse-400 underline underline-offset-2" target="_blank" rel="noreferrer" {...props}>
             {children}
           </a>
+        ),
+        p: ({ children, node: _node, ...props }) => (
+          <p className="whitespace-pre-wrap" {...props}>
+            {children}
+          </p>
         ),
       }}
     >
@@ -342,10 +369,14 @@ const ConnectedClient = ({
   const [usageSearch, setUsageSearch] = useState("");
   const [initializingDotCount, setInitializingDotCount] = useState(1);
   const [sessionDrawerOpen, setSessionDrawerOpen] = useState(true);
+  const [suppressAutoRestore, setSuppressAutoRestore] = useState(false);
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
   const [sessionNameDraft, setSessionNameDraft] = useState("");
 
   const creatingSessionRef = useRef(false);
+  const initialRestoreRequestedRef = useRef(false);
+  const initialRestoreResolvedRef = useRef(false);
+  const lastSessionRestoreIdRef = useRef<string | null>(null);
   const prevStreamingRef = useRef(false);
   const processedUsageResultsRef = useRef(0);
   const pendingSessionListLimitRef = useRef<number | null>(null);
@@ -368,6 +399,21 @@ const ConnectedClient = ({
   const appendSystem = useCallback((text: string): void => {
     appendMessages([{ id: makeId(), role: "system", text }]);
   }, [appendMessages]);
+
+  const readStoredLastSessionId = useCallback((): string | null => {
+    if (typeof window === "undefined") return null;
+    const value = window.localStorage.getItem(LAST_SESSION_STORAGE_KEY)?.trim();
+    return value ? value : null;
+  }, []);
+
+  const writeStoredLastSessionId = useCallback((value: string | null): void => {
+    if (typeof window === "undefined") return;
+    if (!value) {
+      window.localStorage.removeItem(LAST_SESSION_STORAGE_KEY);
+      return;
+    }
+    window.localStorage.setItem(LAST_SESSION_STORAGE_KEY, value);
+  }, []);
 
   const scrollToBottom = useCallback((behavior: ScrollBehavior = "auto"): void => {
     const viewport = chatViewportRef.current;
@@ -409,6 +455,7 @@ const ConnectedClient = ({
 
   const createSession = useCallback(
     (runtimeId?: string, model?: string, workspaceId?: string) => {
+      setSuppressAutoRestore(false);
       sendMessage({
         type: "session_new",
         runtimeId,
@@ -418,6 +465,15 @@ const ConnectedClient = ({
     },
     [preferredWorkspaceId, sendMessage],
   );
+
+  const restoreSessionCandidate = useCallback((
+    candidate: SessionInfo,
+    mode: "restore" | "replay" = "restore",
+  ) => {
+    setSuppressAutoRestore(false);
+    session.attachSession(candidate.id);
+    appendSystem(`${mode === "restore" ? "Restoring" : "Attaching"} session ${candidate.id}...`);
+  }, [appendSystem, session]);
 
   useEffect(() => {
     if (previousStatusRef.current !== status) {
@@ -429,8 +485,26 @@ const ConnectedClient = ({
   }, [appendSystem, status]);
 
   useEffect(() => {
+    const activeSessionId = session.sessionId?.trim() || null;
+    if (activeSessionId) {
+      if (suppressAutoRestore) {
+        setSuppressAutoRestore(false);
+      }
+      writeStoredLastSessionId(activeSessionId);
+      lastSessionRestoreIdRef.current = activeSessionId;
+      return;
+    }
+    if (session.error?.includes("Session not found")) {
+      writeStoredLastSessionId(null);
+      lastSessionRestoreIdRef.current = null;
+    }
+  }, [session.error, session.sessionId, suppressAutoRestore, writeStoredLastSessionId]);
+
+  useEffect(() => {
     if (status !== "connected") {
       creatingSessionRef.current = false;
+      initialRestoreRequestedRef.current = false;
+      initialRestoreResolvedRef.current = false;
       return;
     }
     if (session.authStatus === "unverified" || session.authStatus === "verifying") {
@@ -438,12 +512,47 @@ const ConnectedClient = ({
     }
     if (session.sessionId) {
       creatingSessionRef.current = false;
+      initialRestoreResolvedRef.current = true;
       return;
     }
-    if (creatingSessionRef.current) return;
+    if (suppressAutoRestore) {
+      creatingSessionRef.current = false;
+      initialRestoreRequestedRef.current = true;
+      initialRestoreResolvedRef.current = true;
+      return;
+    }
+    if (!initialRestoreRequestedRef.current) {
+      initialRestoreRequestedRef.current = true;
+      lastSessionRestoreIdRef.current = readStoredLastSessionId();
+      session.requestSessionList({ limit: SESSION_DRAWER_LIMIT });
+      return;
+    }
+    if (!session.sessionListLoaded || initialRestoreResolvedRef.current) {
+      return;
+    }
 
-    creatingSessionRef.current = true;
-    createSession(preferredRuntimeId, preferredModel, preferredWorkspaceId);
+    const candidate = pickLatestAttachableSession(session.sessionList);
+    if (!candidate) {
+      initialRestoreResolvedRef.current = true;
+      if (creatingSessionRef.current) return;
+      creatingSessionRef.current = true;
+      createSession(preferredRuntimeId, preferredModel, preferredWorkspaceId);
+      return;
+    }
+
+    if (lastSessionRestoreIdRef.current && candidate.id !== lastSessionRestoreIdRef.current) {
+      const storedCandidate = session.sessionList.find((entry) => entry.id === lastSessionRestoreIdRef.current);
+      if (storedCandidate && formatSessionState(storedCandidate) !== "closed") {
+        initialRestoreResolvedRef.current = true;
+        restoreSessionCandidate(storedCandidate, "restore");
+        return;
+      }
+      writeStoredLastSessionId(null);
+      lastSessionRestoreIdRef.current = null;
+    }
+
+    initialRestoreResolvedRef.current = true;
+    restoreSessionCandidate(candidate, "restore");
   }, [
     createSession,
     preferredModel,
@@ -451,7 +560,13 @@ const ConnectedClient = ({
     preferredWorkspaceId,
     session.authStatus,
     session.sessionId,
+    session.sessionList,
+    session.sessionListLoaded,
+    session.requestSessionList,
     status,
+    suppressAutoRestore,
+    readStoredLastSessionId,
+    restoreSessionCandidate,
   ]);
 
   useEffect(() => {
@@ -483,6 +598,12 @@ const ConnectedClient = ({
     }
     prevStreamingRef.current = session.isStreaming;
   }, [appendMessages, session.isStreaming, session.responseText, session.toolCalls]);
+
+  useEffect(() => {
+    if (!session.sessionId) return;
+    setMessages(transcriptToChatMessages(session.transcript));
+    requestAutoScroll("auto");
+  }, [requestAutoScroll, session.sessionId, session.transcript]);
 
   useEffect(() => {
     if (session.usageResults.length <= processedUsageResultsRef.current) return;
@@ -526,22 +647,32 @@ const ConnectedClient = ({
     if (previousSessionId === nextSessionId) return;
 
     if (!previousSessionId && nextSessionId) {
-      appendSystem([
+      const lines = [
         "----- Session attached -----",
         `session=${nextSessionId}`,
         `workspace=${session.sessionWorkspaceId ?? preferredWorkspaceId}`,
         `runtime=${session.sessionRuntimeId ?? preferredRuntimeId ?? "default"}`,
         `model=${session.sessionModel ?? preferredModel ?? "runtime-default"}`,
-      ].join("\n"));
+        `principal=${session.sessionPrincipalId ?? "(none)"} (type=${session.sessionPrincipalType ?? "user"})`,
+      ];
+      if (session.sessionOwnerDid) {
+        lines.push(`owner_did=${session.sessionOwnerDid}`);
+      }
+      appendSystem(lines.join("\n"));
     } else if (previousSessionId && nextSessionId) {
-      appendSystem([
+      const lines = [
         "----- Session switched -----",
         `from=${previousSessionId}`,
         `to=${nextSessionId}`,
         `workspace=${session.sessionWorkspaceId ?? preferredWorkspaceId}`,
         `runtime=${session.sessionRuntimeId ?? preferredRuntimeId ?? "default"}`,
         `model=${session.sessionModel ?? preferredModel ?? "runtime-default"}`,
-      ].join("\n"));
+        `principal=${session.sessionPrincipalId ?? "(none)"} (type=${session.sessionPrincipalType ?? "user"})`,
+      ];
+      if (session.sessionOwnerDid) {
+        lines.push(`owner_did=${session.sessionOwnerDid}`);
+      }
+      appendSystem(lines.join("\n"));
     } else if (previousSessionId && !nextSessionId) {
       appendSystem([
         "----- Session detached -----",
@@ -558,6 +689,9 @@ const ConnectedClient = ({
     preferredWorkspaceId,
     session.sessionId,
     session.sessionModel,
+    session.sessionOwnerDid,
+    session.sessionPrincipalId,
+    session.sessionPrincipalType,
     session.sessionRuntimeId,
     session.sessionWorkspaceId,
   ]);
@@ -774,7 +908,9 @@ const ConnectedClient = ({
           appendSystem(`runtime=${session.sessionRuntimeId ?? preferredRuntimeId ?? "default"}`);
           appendSystem(`model=${session.sessionModel ?? preferredModel ?? "default"}`);
           appendSystem(`principal=${session.sessionPrincipalId ?? "(none)"} (type=${session.sessionPrincipalType ?? "user"})`);
+          appendSystem(`owner_did=${session.sessionOwnerDid ?? "(none)"}`);
           appendSystem(`auth_principal=${session.authPrincipalId ?? "(unverified)"} (type=${session.authPrincipalType ?? "user"})`);
+          appendSystem(`auth_did=${session.authOwnerDid ?? "(unverified)"}`);
           appendSystem(`streaming=${session.isStreaming ? "yes" : "no"}, approvals=${approval.pendingApprovals.length}, activeTools=${session.activeTools.length}`);
           appendSystem(`pending_transfers=${session.pendingSessionTransfers.length}`);
           setPromptInput("");
@@ -986,7 +1122,7 @@ const ConnectedClient = ({
             appendSystem("/session list [limit|next [limit]]");
             appendSystem("/session history [sessionId] [limit]");
             appendSystem("/session resume <sessionId>");
-            appendSystem("/session takeover <sessionId>");
+            appendSystem("/session detach [sessionId]");
             appendSystem("/session transfer pending|request|accept|dismiss");
             appendSystem("/session close [sessionId]");
             appendSystem("/session delete [sessionId]");
@@ -1053,12 +1189,20 @@ const ConnectedClient = ({
               setPromptInput("");
               return;
             }
-            if (sub === "takeover") {
-              session.takeoverSession(sid);
-            } else {
-              session.resumeSession(sid);
+            session.attachSession(sid);
+            appendSystem(`Attaching session ${sid}...`);
+            setPromptInput("");
+            return;
+          }
+          if (sub === "detach") {
+            const sid = restParts[1] ?? session.sessionId ?? undefined;
+            if (!sid) {
+              appendSystem("Usage: /session detach [sessionId]");
+              setPromptInput("");
+              return;
             }
-            appendSystem(`${sub === "takeover" ? "Taking over" : "Resuming"} session ${sid}...`);
+            session.detachSession(sid);
+            appendSystem(`Detaching session ${sid}...`);
             setPromptInput("");
             return;
           }
@@ -1082,7 +1226,7 @@ const ConnectedClient = ({
             setPromptInput("");
             return;
           }
-          appendSystem("Usage: /session [list|history|resume|takeover|transfer|close|delete]");
+          appendSystem("Usage: /session [list|history|resume|detach|transfer|close|delete]");
           setPromptInput("");
           return;
         }
@@ -1118,6 +1262,7 @@ const ConnectedClient = ({
       preferredWorkspaceId,
       promptInput,
       requestAutoScroll,
+      restoreSessionCandidate,
       sendMessage,
       session,
       status,
@@ -1147,19 +1292,20 @@ const ConnectedClient = ({
   }, [appendSystem, session, sessionNameDraft]);
 
   const handleResumeListedSession = useCallback((candidate: SessionInfo) => {
-    const state = formatSessionState(candidate);
-    if (state === "live" && candidate.id !== session.sessionId) {
-      appendSystem(`Session ${candidate.id} is already live on another client.`);
-      return;
-    }
-    session.resumeSession(candidate.id);
-    appendSystem(`Resuming session ${candidate.id}...`);
-  }, [appendSystem, session]);
+    restoreSessionCandidate(candidate, "replay");
+  }, [restoreSessionCandidate]);
 
-  const handleTakeoverListedSession = useCallback((candidate: SessionInfo) => {
-    session.takeoverSession(candidate.id);
-    appendSystem(`Taking over session ${candidate.id}...`);
-  }, [appendSystem, session]);
+  const handleDetachListedSession = useCallback((candidate: SessionInfo) => {
+    if (candidate.id === session.sessionId) {
+      setSuppressAutoRestore(true);
+      writeStoredLastSessionId(null);
+      lastSessionRestoreIdRef.current = null;
+      initialRestoreRequestedRef.current = true;
+      initialRestoreResolvedRef.current = true;
+    }
+    session.detachSession(candidate.id);
+    appendSystem(`Detaching session ${candidate.id}...`);
+  }, [appendSystem, session, writeStoredLastSessionId]);
 
   const handleCloseListedSession = useCallback((candidate: SessionInfo) => {
     sendMessage({ type: "session_close", sessionId: candidate.id });
@@ -1215,13 +1361,17 @@ const ConnectedClient = ({
     () => Object.entries(session.runtimeHealth).sort(([a], [b]) => a.localeCompare(b)),
     [session.runtimeHealth],
   );
-  const isSessionInitializing = status === "connected" && !session.sessionId;
+  const isSessionInitializing = status === "connected" && !session.sessionId && !suppressAutoRestore;
   const showSessionControlPanel = false;
-  const promptIsDisabled = isSessionInitializing || !session.sessionId;
+  const promptIsDisabled = isSessionInitializing || !session.sessionId || !session.isSessionController;
   const promptPlaceholder = isSessionInitializing
     ? `Session initializing${".".repeat(initializingDotCount)}`
     : session.isStreaming
       ? "Steer the running turn..."
+      : !session.sessionId
+        ? "No active session"
+      : !session.isSessionController
+        ? "Session attached read-only in this client"
       : "Ask Nexus ...";
 
   useEffect(() => {
@@ -1278,10 +1428,10 @@ const ConnectedClient = ({
               ) : visibleSessions.map((candidate) => {
                 const presentation = getSessionStatusPresentation(candidate, session.sessionId);
                 const state = formatSessionState(candidate);
-                const isCurrent = candidate.id === session.sessionId;
+                const isCurrent = candidate.attachmentState === "controller" || candidate.id === session.sessionId;
                 const isEditing = editingSessionId === candidate.id;
-                const canResume = state === "parked" && candidate.parkedReason !== "transfer_pending";
-                const canTakeover = state === "parked";
+                const canResume = !isCurrent && state !== "closed";
+                const canDetach = isCurrent;
                 const canClose = state !== "closed";
 
                 return (
@@ -1384,13 +1534,13 @@ const ConnectedClient = ({
                               Resume
                             </button>
                           ) : null}
-                          {canTakeover ? (
+                          {canDetach ? (
                             <button
                               type="button"
                               className="button-secondary px-2.5 py-1.5 text-xs"
-                              onClick={() => handleTakeoverListedSession(candidate)}
+                              onClick={() => handleDetachListedSession(candidate)}
                             >
-                              Takeover
+                              Detach
                             </button>
                           ) : null}
                           {canClose ? (
@@ -1423,7 +1573,10 @@ const ConnectedClient = ({
                   title={`${formatSessionTitle(candidate)} · ${presentation.hint}`}
                   onClick={() => {
                     setSessionDrawerOpen(true);
-                    if (formatSessionState(candidate) === "parked" && candidate.parkedReason !== "transfer_pending") {
+                    if (
+                      candidate.id !== session.sessionId
+                      && formatSessionState(candidate) !== "closed"
+                    ) {
                       handleResumeListedSession(candidate);
                     }
                   }}

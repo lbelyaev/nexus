@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createStateStore, type StateStore } from "@nexus/state";
 import type { PolicyConfig, GatewayEvent, ClientMessage } from "@nexus/types";
 import type { MemoryProvider } from "@nexus/memory";
-import { generateKeyPairSync, sign } from "node:crypto";
+import { createPublicKey, generateKeyPairSync, sign } from "node:crypto";
 import {
   createRouter,
   type Router,
@@ -42,25 +42,89 @@ const createDeferred = <T>() => {
   return { promise, resolve, reject };
 };
 
+const authKeyPairs = new Map<string, { publicKeyPem: string; privateKey: ReturnType<typeof generateKeyPairSync>["privateKey"] }>();
+const ED25519_SPKI_DER_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
+const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+const encodeBase58 = (bytes: Uint8Array): string => {
+  if (bytes.length === 0) return "";
+  const digits = [0];
+  for (const byte of bytes) {
+    let carry = byte;
+    for (let index = 0; index < digits.length; index += 1) {
+      const value = (digits[index] ?? 0) * 256 + carry;
+      digits[index] = value % 58;
+      carry = Math.floor(value / 58);
+    }
+    while (carry > 0) {
+      digits.push(carry % 58);
+      carry = Math.floor(carry / 58);
+    }
+  }
+  let output = "";
+  for (const byte of bytes) {
+    if (byte !== 0) break;
+    output += BASE58_ALPHABET[0];
+  }
+  for (let index = digits.length - 1; index >= 0; index -= 1) {
+    output += BASE58_ALPHABET[digits[index] ?? 0];
+  }
+  return output;
+};
+
+const deriveDidKeyFromPem = (publicKeyPem: string): string => {
+  const key = createPublicKey(publicKeyPem);
+  const der = key.export({ format: "der", type: "spki" });
+  if (!Buffer.isBuffer(der)) {
+    throw new Error("Expected DER buffer for SPKI export.");
+  }
+  const keyBytes = der.subarray(ED25519_SPKI_DER_PREFIX.length);
+  return `did:key:z${encodeBase58(Buffer.concat([Buffer.from([0xed, 0x01]), keyBytes]))}`;
+};
+
+const getOwnerDidForIdentity = (
+  principalId: string,
+  principalType: "user" | "service_account" = "user",
+  identityKey?: string,
+): string => {
+  const proof = createAuthProof({
+    challengeId: "challenge",
+    nonce: "nonce",
+    principalType,
+    principalId,
+    ...(identityKey ? { identityKey } : {}),
+  });
+  return deriveDidKeyFromPem(proof.publicKey);
+};
+
 const createAuthProof = (params: {
   challengeId: string;
   nonce: string;
   principalType?: "user" | "service_account";
   principalId: string;
+  identityKey?: string;
 }): Extract<ClientMessage, { type: "auth_proof" }> => {
   const principalType = params.principalType ?? "user";
-  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  const keyId = params.identityKey ?? `${principalType}:${params.principalId}`;
+  let keyPair = authKeyPairs.get(keyId);
+  if (!keyPair) {
+    const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+    keyPair = {
+      publicKeyPem: publicKey.export({ type: "spki", format: "pem" }).toString(),
+      privateKey,
+    };
+    authKeyPairs.set(keyId, keyPair);
+  }
   const payload = Buffer.from(
     `${params.challengeId}:${params.nonce}:${principalType}:${params.principalId}`,
     "utf8",
   );
-  const signature = sign(null, payload, privateKey).toString("base64");
-  const publicKeyPem = publicKey.export({ type: "spki", format: "pem" }).toString();
+  const signature = sign(null, payload, keyPair.privateKey).toString("base64");
   return {
     type: "auth_proof",
     principalType,
     principalId: params.principalId,
-    publicKey: publicKeyPem,
+    publicKey: keyPair.publicKeyPem,
     challengeId: params.challengeId,
     nonce: params.nonce,
     signature,
@@ -79,6 +143,7 @@ describe("createRouter", () => {
   };
 
   beforeEach(() => {
+    authKeyPairs.clear();
     stateStore = createStateStore(":memory:");
     acpSession = mockAcpSession();
     memoryProvider = {
@@ -158,7 +223,7 @@ describe("createRouter", () => {
       expect(events).toHaveLength(1);
     });
 
-    expect(createAcpSessionMock).toHaveBeenCalledWith("codex", "gpt-5", emit, {
+    expect(createAcpSessionMock).toHaveBeenCalledWith("codex", "gpt-5", expect.any(Function), {
       principalType: "user",
       principalId: "user:local",
       source: "interactive",
@@ -218,7 +283,7 @@ describe("createRouter", () => {
     expect(event.principalType).toBe("service_account");
     expect(event.principalId).toBe("svc:nightly");
     expect(event.source).toBe("schedule");
-    expect(createAcpSessionMock).toHaveBeenCalledWith(undefined, undefined, emit, {
+    expect(createAcpSessionMock).toHaveBeenCalledWith(undefined, undefined, expect.any(Function), {
       principalType: "service_account",
       principalId: "svc:nightly",
       source: "schedule",
@@ -230,6 +295,7 @@ describe("createRouter", () => {
     stateStore.createSession({
       id: "gw-persisted-1",
       workspaceId: "default",
+      ownerDid: getOwnerDidForIdentity("user:local"),
       principalType: "user",
       principalId: "user:local",
       source: "interactive",
@@ -264,7 +330,7 @@ describe("createRouter", () => {
       expect(createAcpSessionMock).toHaveBeenCalledWith(
         "codex",
         "gpt-5",
-        emit,
+        expect.any(Function),
         {
           principalType: "user",
           principalId: "user:local",
@@ -289,6 +355,7 @@ describe("createRouter", () => {
     stateStore.createSession({
       id: "gw-persisted-usage",
       workspaceId: "default",
+      ownerDid: getOwnerDidForIdentity("user:local"),
       principalType: "user",
       principalId: "user:local",
       source: "interactive",
@@ -312,7 +379,7 @@ describe("createRouter", () => {
       expect(createAcpSessionMock).toHaveBeenCalledWith(
         "claude",
         "sonnet",
-        emit,
+        expect.any(Function),
         {
           principalType: "user",
           principalId: "user:local",
@@ -387,6 +454,8 @@ describe("createRouter", () => {
     if (!authResult || authResult.type !== "auth_result") throw new Error("expected auth_result");
     expect(authResult.ok).toBe(true);
     expect(authResult.principalId).toBe("user:alice");
+    expect(authResult.ownerDid).toBeDefined();
+    expect(stateStore.getPrincipalBinding("user", "user:alice")?.ownerDid).toBe(authResult.ownerDid);
 
     events.length = 0;
     router.handleMessage({ type: "session_new" }, emit, { connectionId: "conn-1" });
@@ -397,6 +466,72 @@ describe("createRouter", () => {
     if (!created || created.type !== "session_created") throw new Error("expected session_created");
     expect(created.principalId).toBe("user:alice");
     expect(created.principalType).toBe("user");
+    expect(created.ownerDid).toBe(authResult.ownerDid);
+    expect(stateStore.getSession(created.sessionId)?.ownerDid).toBe(authResult.ownerDid);
+  });
+
+  it("auth_proof rotates recoverable telegram principal bindings and migrates owned sessions", () => {
+    const now = new Date().toISOString();
+    stateStore.upsertOwnerIdentity({
+      did: "did:key:zOldTelegramOwner",
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+    });
+    stateStore.upsertPrincipalBinding({
+      principalType: "user",
+      principalId: "user:telegram-main:139038976",
+      source: "telegram",
+      ownerDid: "did:key:zOldTelegramOwner",
+      bindingStatus: "verified",
+      verificationMethodId: "did:key:zOldTelegramOwner#old",
+      proofFormat: "did-auth",
+      proofPayload: "{}",
+      createdAt: now,
+      updatedAt: now,
+    });
+    stateStore.createSession({
+      id: "gw-session-telegram-old",
+      workspaceId: "default",
+      ownerDid: "did:key:zOldTelegramOwner",
+      principalType: "user",
+      principalId: "user:telegram-main:139038976",
+      source: "api",
+      runtimeId: "claude",
+      acpSessionId: "acp-session-old",
+      status: "idle",
+      lifecycleState: "parked",
+      parkedReason: "idle",
+      lifecycleUpdatedAt: now,
+      lifecycleVersion: 1,
+      createdAt: now,
+      lastActivityAt: now,
+      tokenUsage: { input: 0, output: 0 },
+      model: "claude-sonnet-4-6",
+    });
+
+    const { emit, events } = collectEvents();
+    router.registerConnection("conn-telegram", emit);
+    const challenge = events.find((event) => event.type === "auth_challenge");
+    if (!challenge || challenge.type !== "auth_challenge") {
+      throw new Error("auth_challenge missing");
+    }
+
+    events.length = 0;
+    const proof = createAuthProof({
+      challengeId: challenge.challengeId,
+      nonce: challenge.nonce,
+      principalId: "user:telegram-main:139038976",
+      identityKey: "telegram-stable-owner",
+    });
+    router.handleMessage(proof, emit, { connectionId: "conn-telegram" });
+
+    const authResult = events.find((event) => event.type === "auth_result");
+    if (!authResult || authResult.type !== "auth_result") throw new Error("expected auth_result");
+    expect(authResult.ok).toBe(true);
+    expect(authResult.ownerDid).not.toBe("did:key:zOldTelegramOwner");
+    expect(stateStore.getPrincipalBinding("user", "user:telegram-main:139038976")?.ownerDid).toBe(authResult.ownerDid);
+    expect(stateStore.getSession("gw-session-telegram-old")?.ownerDid).toBe(authResult.ownerDid);
   });
 
   it("auth_proof rebinds pre-auth local sessions owned by the same connection", async () => {
@@ -430,6 +565,7 @@ describe("createRouter", () => {
     const sessionRecord = stateStore.getSession(created.sessionId);
     expect(sessionRecord?.principalType).toBe("user");
     expect(sessionRecord?.principalId).toBe("user:web:abc123");
+    expect(sessionRecord?.ownerDid).toBe(authResult.ownerDid);
   });
 
   it("auth_proof rejects nonce replay", () => {
@@ -841,6 +977,7 @@ describe("createRouter", () => {
     stateStore.createSession({
       id: "sess-owned",
       workspaceId: "default",
+      ownerDid: getOwnerDidForIdentity("user:web:user-1"),
       principalType: "user",
       principalId: "user:web:user-1",
       source: "interactive",
@@ -855,6 +992,7 @@ describe("createRouter", () => {
     stateStore.createSession({
       id: "sess-other",
       workspaceId: "default",
+      ownerDid: getOwnerDidForIdentity("user:web:user-2"),
       principalType: "user",
       principalId: "user:web:user-2",
       source: "interactive",
@@ -869,6 +1007,7 @@ describe("createRouter", () => {
     stateStore.createSession({
       id: "sess-local",
       workspaceId: "default",
+      ownerDid: getOwnerDidForIdentity("user:local"),
       principalType: "user",
       principalId: "user:local",
       source: "interactive",
@@ -914,10 +1053,66 @@ describe("createRouter", () => {
     expect(events[0].sessions.map((session) => session.id)).toEqual(["sess-owned"]);
   });
 
+  it("session_list returns sessions across principals bound to the same owner DID", async () => {
+    const ownerDid = getOwnerDidForIdentity("user:web:user-1", "user", "shared-owner");
+    stateStore.createSession({
+      id: "sess-web",
+      workspaceId: "default",
+      ownerDid,
+      principalType: "user",
+      principalId: "user:web:user-1",
+      source: "interactive",
+      runtimeId: "claude",
+      acpSessionId: "acp-web",
+      status: "active",
+      createdAt: "2026-03-01T00:00:00.000Z",
+      lastActivityAt: "2026-03-01T00:02:00.000Z",
+      tokenUsage: { input: 1, output: 2 },
+      model: "claude",
+    });
+    stateStore.createSession({
+      id: "sess-telegram",
+      workspaceId: "default",
+      ownerDid,
+      principalType: "user",
+      principalId: "telegram:12345",
+      source: "interactive",
+      runtimeId: "claude",
+      acpSessionId: "acp-telegram",
+      status: "active",
+      createdAt: "2026-03-01T00:00:00.000Z",
+      lastActivityAt: "2026-03-01T00:01:00.000Z",
+      tokenUsage: { input: 1, output: 2 },
+      model: "claude",
+    });
+
+    const { emit, events } = collectEvents();
+    router.registerConnection("conn-shared-list", emit);
+    const challenge = events.find((event): event is Extract<GatewayEvent, { type: "auth_challenge" }> => event.type === "auth_challenge");
+    if (!challenge) throw new Error("expected auth_challenge");
+    events.length = 0;
+    router.handleMessage(createAuthProof({
+      challengeId: challenge.challengeId,
+      nonce: challenge.nonce,
+      principalId: "telegram:12345",
+      identityKey: "shared-owner",
+    }), emit, { connectionId: "conn-shared-list" });
+    await vi.waitFor(() => {
+      expect(events.some((event) => event.type === "auth_result" && event.ok)).toBe(true);
+    });
+
+    events.length = 0;
+    router.handleMessage({ type: "session_list" }, emit, { connectionId: "conn-shared-list" });
+    expect(events).toHaveLength(1);
+    if (events[0].type !== "session_list") throw new Error("expected session_list");
+    expect(events[0].sessions.map((session) => session.id)).toEqual(["sess-web", "sess-telegram"]);
+  });
+
   it("session_list supports principal pagination via limit and cursor", async () => {
     stateStore.createSession({
       id: "sess-owned-1",
       workspaceId: "default",
+      ownerDid: getOwnerDidForIdentity("user:web:user-1"),
       principalType: "user",
       principalId: "user:web:user-1",
       source: "interactive",
@@ -932,6 +1127,7 @@ describe("createRouter", () => {
     stateStore.createSession({
       id: "sess-owned-2",
       workspaceId: "default",
+      ownerDid: getOwnerDidForIdentity("user:web:user-1"),
       principalType: "user",
       principalId: "user:web:user-1",
       source: "interactive",
@@ -994,6 +1190,7 @@ describe("createRouter", () => {
     stateStore.createSession({
       id: "sess-history",
       workspaceId: "default",
+      ownerDid: getOwnerDidForIdentity("user:web:user-1"),
       principalType: "user",
       principalId: "user:web:user-1",
       source: "interactive",
@@ -1047,6 +1244,7 @@ describe("createRouter", () => {
     stateStore.createSession({
       id: "sess-history-denied",
       workspaceId: "default",
+      ownerDid: getOwnerDidForIdentity("user:web:user-1"),
       principalType: "user",
       principalId: "user:web:user-1",
       source: "interactive",
@@ -1089,6 +1287,7 @@ describe("createRouter", () => {
     stateStore.createSession({
       id: "sess-rename",
       workspaceId: "default",
+      ownerDid: getOwnerDidForIdentity("user:web:user-1"),
       principalType: "user",
       principalId: "user:web:user-1",
       source: "interactive",
@@ -1715,10 +1914,10 @@ describe("createRouter", () => {
       expect(createAcpSessionMock).toHaveBeenCalledWith(
         "default",
         "claude",
-        targetAfterRestart.emit,
+        expect.any(Function),
         {
           principalType: "user",
-          principalId: "user:alice",
+          principalId: "user:bob",
           source: "interactive",
           workspaceId: "default",
         },
@@ -1831,6 +2030,66 @@ describe("createRouter", () => {
         message: "Session is not parked and cannot be taken over.",
       },
     ]);
+  });
+
+  it("session_takeover rebinds a live session for the same authenticated principal", async () => {
+    const owner = collectEvents();
+    const resumed = collectEvents();
+    router.registerConnection("conn-owner", owner.emit);
+    router.registerConnection("conn-resumed", resumed.emit);
+
+    const ownerChallenge = owner.events.find((event) => event.type === "auth_challenge");
+    const resumedChallenge = resumed.events.find((event) => event.type === "auth_challenge");
+    if (!ownerChallenge || ownerChallenge.type !== "auth_challenge") throw new Error("owner auth_challenge missing");
+    if (!resumedChallenge || resumedChallenge.type !== "auth_challenge") throw new Error("resumed auth_challenge missing");
+
+    owner.events.length = 0;
+    resumed.events.length = 0;
+    router.handleMessage(createAuthProof({
+      challengeId: ownerChallenge.challengeId,
+      nonce: ownerChallenge.nonce,
+      principalId: "user:alice",
+    }), owner.emit, { connectionId: "conn-owner" });
+    router.handleMessage(createAuthProof({
+      challengeId: resumedChallenge.challengeId,
+      nonce: resumedChallenge.nonce,
+      principalId: "user:alice",
+    }), resumed.emit, { connectionId: "conn-resumed" });
+
+    owner.events.length = 0;
+    resumed.events.length = 0;
+    router.handleMessage({ type: "session_new" }, owner.emit, { connectionId: "conn-owner" });
+    await vi.waitFor(() => {
+      expect(owner.events.some((event) => event.type === "session_created")).toBe(true);
+    });
+    const created = owner.events.find((event) => event.type === "session_created");
+    if (!created || created.type !== "session_created") throw new Error("expected session_created");
+
+    owner.events.length = 0;
+    resumed.events.length = 0;
+    router.handleMessage({
+      type: "session_takeover",
+      sessionId: created.sessionId,
+    }, resumed.emit, { connectionId: "conn-resumed" });
+
+    expect(resumed.events.some((event) => event.type === "transcript" && event.sessionId === created.sessionId)).toBe(true);
+    expect(owner.events).toContainEqual({
+      type: "session_invalidated",
+      sessionId: created.sessionId,
+      reason: "ownership_transferred",
+      message: "Session was claimed by another connection for the same principal.",
+    });
+
+    resumed.events.length = 0;
+    router.handleMessage({
+      type: "prompt",
+      sessionId: created.sessionId,
+      text: "hello again",
+    }, resumed.emit, { connectionId: "conn-resumed" });
+
+    await vi.waitFor(() => {
+      expect(resumed.events.some((event) => event.type === "turn_end")).toBe(true);
+    });
   });
 
   it("rejects ownerless replay claims from different authenticated principal", async () => {
@@ -1993,6 +2252,64 @@ describe("createRouter", () => {
 
     const closed = router.sweepIdleSessions(new Date(Date.now() + 10_000));
     expect(closed).toContain(sessionCreated.sessionId);
+  });
+
+  it("sweepIdleSessions keeps explicitly detached sessions open", async () => {
+    const { emit, events } = collectEvents();
+    router = createRouter({
+      createAcpSession: createAcpSessionMock,
+      stateStore,
+      policyConfig,
+      memoryProvider,
+      defaultWorkspaceId: "default",
+      sessionIdleTimeoutMs: 1_000,
+    });
+    router.registerConnection("conn-1", emit);
+    router.handleMessage({ type: "session_new" }, emit, { connectionId: "conn-1" });
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === "session_created")).toBe(true);
+    });
+    const sessionCreated = events.find((e) => e.type === "session_created");
+    if (!sessionCreated || sessionCreated.type !== "session_created") throw new Error("expected session_created");
+
+    router.handleMessage({ type: "session_detach", sessionId: sessionCreated.sessionId }, emit);
+
+    const closed = router.sweepIdleSessions(new Date(Date.now() + 10_000));
+    expect(closed).not.toContain(sessionCreated.sessionId);
+    expect(stateStore.getSession(sessionCreated.sessionId)?.lifecycleState).toBe("live");
+  });
+
+  it("sweepIdleSessions parks stale api sessions instead of closing them", async () => {
+    const { emit, events } = collectEvents();
+    router = createRouter({
+      createAcpSession: createAcpSessionMock,
+      stateStore,
+      policyConfig,
+      memoryProvider,
+      defaultWorkspaceId: "default",
+      sessionIdleTimeoutMs: 1_000,
+    });
+    router.registerConnection("conn-1", emit);
+    router.handleMessage({
+      type: "session_new",
+      principalType: "user",
+      principalId: "user:telegram-test:user-1",
+      source: "api",
+    }, emit, { connectionId: "conn-1" });
+
+    await vi.waitFor(() => {
+      expect(events.some((e) => e.type === "session_created")).toBe(true);
+    });
+    const sessionCreated = events.find((e) => e.type === "session_created");
+    if (!sessionCreated || sessionCreated.type !== "session_created") throw new Error("expected session_created");
+
+    const closed = router.sweepIdleSessions(new Date(Date.now() + 10_000));
+    expect(closed).not.toContain(sessionCreated.sessionId);
+
+    const stored = stateStore.getSession(sessionCreated.sessionId);
+    expect(stored?.lifecycleState).toBe("parked");
+    expect(stored?.parkedReason).toBe("idle");
   });
 
   it("broadcasts runtime health updates to connected clients", () => {

@@ -1,10 +1,18 @@
 import { describe, it, expect } from "vitest";
-import { isSessionRecord, isAuditEvent, isExecutionRecord, isChannelBindingRecord } from "../state.js";
+import {
+  isSessionRecord,
+  isAuditEvent,
+  isExecutionRecord,
+  isChannelBindingRecord,
+  isOwnerIdentity,
+  isPrincipalBindingRecord,
+} from "../state.js";
 
 describe("isSessionRecord", () => {
   const validSession = {
     id: "sess-1",
     workspaceId: "default",
+    ownerDid: "did:key:z6Mkowner",
     principalType: "user",
     principalId: "user:local",
     source: "interactive",
@@ -100,6 +108,47 @@ describe("isAuditEvent", () => {
   it("rejects missing required fields", () => {
     const { detail, ...noDetail } = validEvent;
     expect(isAuditEvent(noDetail)).toBe(false);
+  });
+});
+
+describe("identity record guards", () => {
+  it("validates owner identities", () => {
+    expect(isOwnerIdentity({
+      did: "did:key:z6Mkowner",
+      status: "active",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+    })).toBe(true);
+    expect(isOwnerIdentity({
+      did: "did:key:z6Mkowner",
+      status: "unknown",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+    })).toBe(false);
+  });
+
+  it("validates principal bindings", () => {
+    expect(isPrincipalBindingRecord({
+      principalType: "user",
+      principalId: "web:alice",
+      source: "web",
+      ownerDid: "did:key:z6Mkowner",
+      bindingStatus: "verified",
+      verificationMethodId: "did:key:z6Mkowner#z6Mkowner",
+      proofFormat: "did-auth",
+      proofPayload: "{\"challengeId\":\"abc\"}",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+    })).toBe(true);
+    expect(isPrincipalBindingRecord({
+      principalType: "user",
+      principalId: "web:alice",
+      source: "unknown",
+      ownerDid: "did:key:z6Mkowner",
+      bindingStatus: "verified",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+    })).toBe(false);
   });
 });
 

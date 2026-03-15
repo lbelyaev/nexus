@@ -19,6 +19,7 @@ describe("initDatabase", () => {
 
     expect(columnNames).toContain("id");
     expect(columnNames).toContain("workspaceId");
+    expect(columnNames).toContain("ownerDid");
     expect(columnNames).toContain("principalType");
     expect(columnNames).toContain("principalId");
     expect(columnNames).toContain("source");
@@ -167,6 +168,52 @@ describe("initDatabase", () => {
     expect(columnNames).toContain("createdAt");
   });
 
+  it("creates session_events table with correct columns", () => {
+    initDatabase(db);
+
+    const columns = db
+      .prepare("PRAGMA table_info(session_events)")
+      .all() as Array<{ name: string; type: string }>;
+    const columnNames = columns.map((c) => c.name);
+
+    expect(columnNames).toContain("id");
+    expect(columnNames).toContain("sessionId");
+    expect(columnNames).toContain("type");
+    expect(columnNames).toContain("payload");
+    expect(columnNames).toContain("timestamp");
+    expect(columnNames).toContain("executionId");
+    expect(columnNames).toContain("turnId");
+  });
+
+  it("creates identity tables with correct columns", () => {
+    initDatabase(db);
+
+    const ownerColumns = db
+      .prepare("PRAGMA table_info(owner_identities)")
+      .all() as Array<{ name: string }>;
+    expect(ownerColumns.map((column) => column.name)).toEqual([
+      "did",
+      "status",
+      "createdAt",
+      "updatedAt",
+    ]);
+
+    const bindingColumns = db
+      .prepare("PRAGMA table_info(principal_bindings)")
+      .all() as Array<{ name: string }>;
+    const bindingColumnNames = bindingColumns.map((column) => column.name);
+    expect(bindingColumnNames).toContain("principalType");
+    expect(bindingColumnNames).toContain("principalId");
+    expect(bindingColumnNames).toContain("source");
+    expect(bindingColumnNames).toContain("ownerDid");
+    expect(bindingColumnNames).toContain("bindingStatus");
+    expect(bindingColumnNames).toContain("verificationMethodId");
+    expect(bindingColumnNames).toContain("proofFormat");
+    expect(bindingColumnNames).toContain("proofPayload");
+    expect(bindingColumnNames).toContain("createdAt");
+    expect(bindingColumnNames).toContain("updatedAt");
+  });
+
   it("is idempotent (calling twice does not error)", () => {
     initDatabase(db);
     expect(() => initDatabase(db)).not.toThrow();
@@ -195,6 +242,7 @@ describe("initDatabase", () => {
     const columnNames = columns.map((column) => column.name);
     expect(columnNames).toContain("principalType");
     expect(columnNames).toContain("principalId");
+    expect(columnNames).toContain("ownerDid");
     expect(columnNames).toContain("lifecycleState");
     expect(columnNames).toContain("workspaceId");
     expect(columnNames).toContain("displayName");
@@ -207,6 +255,7 @@ describe("initDatabase", () => {
       .all() as Array<{ name: string }>;
     const indexNames = indexes.map((index) => index.name);
     expect(indexNames).toContain("idx_sessions_lifecycleState");
+    expect(indexNames).toContain("idx_sessions_ownerDid_lastActivity_id");
     expect(indexNames).toContain("idx_sessions_principal_lastActivity_id");
   });
 
@@ -238,5 +287,8 @@ describe("initDatabase", () => {
     expect(indexNames).toContain("idx_channel_bindings_principal");
     expect(indexNames).toContain("idx_session_lifecycle_events_session_createdAt");
     expect(indexNames).toContain("idx_session_lifecycle_events_eventType_createdAt");
+    expect(indexNames).toContain("idx_session_events_session");
+    expect(indexNames).toContain("idx_session_events_execution");
+    expect(indexNames).toContain("idx_principal_bindings_ownerDid_updatedAt");
   });
 });

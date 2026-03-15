@@ -37,6 +37,15 @@ describe("createStateStore", () => {
     expect(typeof store.upsertChannelBinding).toBe("function");
     expect(typeof store.getChannelBinding).toBe("function");
     expect(typeof store.deleteChannelBinding).toBe("function");
+    expect(typeof store.upsertOwnerIdentity).toBe("function");
+    expect(typeof store.getOwnerIdentity).toBe("function");
+    expect(typeof store.upsertPrincipalBinding).toBe("function");
+    expect(typeof store.getPrincipalBinding).toBe("function");
+    expect(typeof store.appendSessionEvent).toBe("function");
+    expect(typeof store.getSessionEvents).toBe("function");
+    expect(typeof store.getLatestSessionEventId).toBe("function");
+    expect(typeof store.deleteSessionEvents).toBe("function");
+    expect(typeof store.countSessionEvents).toBe("function");
     expect(typeof store.close).toBe("function");
 
     store.close();
