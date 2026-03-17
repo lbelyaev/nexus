@@ -52,6 +52,7 @@ interface RuntimeRestartState {
 const DEFAULT_RUNTIME_RESTART_MAX_ATTEMPTS = 3;
 const DEFAULT_RUNTIME_RESTART_BASE_DELAY_MS = 1_000;
 const DEFAULT_RUNTIME_RESTART_MAX_DELAY_MS = 30_000;
+const RUNTIME_REQUEST_TIMEOUT_MS = 600_000;
 
 const normalizeRuntimeRegistry = (config: NexusConfig): RuntimeRegistry => {
   const modelRouting: Record<string, string> = {};
@@ -385,7 +386,7 @@ export const startGateway = async (configPath?: string) => {
     const agent = spawnAgent(profile.command, {
       cwd: profile.cwd,
       env: profile.env,
-      timeout: 300_000, // 5 min — tool-using prompts can be slow
+      timeout: RUNTIME_REQUEST_TIMEOUT_MS,
     });
     runtimeAgents.set(runtimeProfileId, { profile, agent });
     let allowRestartOnExit = true;
@@ -655,6 +656,7 @@ export const startGateway = async (configPath?: string) => {
 
       const session = createAcpSession(runtime.agent.rpc, acpSessionId, gatewaySessionId, {
         policyEvaluator: (tool, params) => evaluatePolicy(policyConfig, tool, params, policyContext),
+        promptInactivityTimeoutMs: RUNTIME_REQUEST_TIMEOUT_MS,
       });
       session.onEvent(onEvent);
 

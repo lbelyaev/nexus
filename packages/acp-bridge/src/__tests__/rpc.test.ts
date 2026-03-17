@@ -96,6 +96,68 @@ describe("createRpcClient", () => {
     rpc.destroy();
   });
 
+  it("sendRequest can disable the default wall clock timeout", async () => {
+    vi.useFakeTimers();
+    const { childStdout, childStdin } = makeStreams();
+    const rpc = createRpcClient(childStdout, childStdin, { timeout: 20 });
+
+    const promise = rpc.sendRequest("test/no-timeout", undefined, { timeout: null });
+
+    await vi.advanceTimersByTimeAsync(30);
+    childStdout.write(JSON.stringify({ jsonrpc: "2.0", id: 1, result: "ok" }) + "\n");
+
+    await expect(promise).resolves.toBe("ok");
+
+    rpc.destroy();
+    vi.useRealTimers();
+  });
+
+  it("sendRequest can time out on inactivity and reset on related session activity", async () => {
+    vi.useFakeTimers();
+    const { childStdout, childStdin } = makeStreams();
+    const rpc = createRpcClient(childStdout, childStdin, { timeout: 1_000 });
+
+    const promise = rpc.sendRequest("session/prompt", { sessionId: "s1" }, {
+      timeout: null,
+      inactivityTimeout: 50,
+      activityKey: "s1",
+    });
+    const rejection = promise.catch((error: unknown) => error);
+    let settled = false;
+    void promise.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+
+    await vi.advanceTimersByTimeAsync(30);
+    childStdout.write(JSON.stringify({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: "s1",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "working" },
+        },
+      },
+    }) + "\n");
+
+    await vi.advanceTimersByTimeAsync(30);
+    expect(settled).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(60);
+    const error = await rejection;
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/timed out after 50ms of inactivity/i);
+
+    rpc.destroy();
+    vi.useRealTimers();
+  });
+
   it("sendNotification writes JSON-RPC notification without id", () => {
     const { childStdout, childStdin } = makeStreams();
     const written = collectWritten(childStdin);

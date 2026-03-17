@@ -6,7 +6,7 @@ import { parseNdjsonStream } from "./stream.js";
 export type RequestHandler = (method: string, params: unknown) => Promise<unknown>;
 
 export interface RpcClient {
-  sendRequest: (method: string, params?: unknown) => Promise<unknown>;
+  sendRequest: (method: string, params?: unknown, options?: RequestOptions) => Promise<unknown>;
   sendNotification: (method: string, params?: unknown) => void;
   sendResponse: (id: number | string, result: unknown) => void;
   sendErrorResponse: (id: number | string, code: number, message: string) => void;
@@ -17,6 +17,24 @@ export interface RpcClient {
   destroy: () => void;
 }
 
+export interface RequestOptions {
+  timeout?: number | null;
+  inactivityTimeout?: number | null;
+  activityKey?: string;
+}
+
+interface PendingRequest {
+  resolve: (value: unknown) => void;
+  reject: (err: Error) => void;
+  timeoutTimer: ReturnType<typeof setTimeout> | null;
+  inactivityTimer: ReturnType<typeof setTimeout> | null;
+  timeoutMs: number | null;
+  inactivityTimeoutMs: number | null;
+  activityKey?: string;
+  method: string;
+  id: number | string;
+}
+
 export const createRpcClient = (
   input: Readable,
   output: Writable,
@@ -25,13 +43,51 @@ export const createRpcClient = (
   const timeout = options?.timeout ?? 30_000;
   let nextId = 1;
 
-  const pending = new Map<
-    number | string,
-    { resolve: (value: unknown) => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout> }
-  >();
+  const pending = new Map<number | string, PendingRequest>();
 
   const notificationHandlers: Array<(notification: JsonRpcNotification) => void> = [];
   const requestHandlers: RequestHandler[] = [];
+
+  const clearPendingTimers = (entry: PendingRequest): void => {
+    if (entry.timeoutTimer) {
+      clearTimeout(entry.timeoutTimer);
+      entry.timeoutTimer = null;
+    }
+    if (entry.inactivityTimer) {
+      clearTimeout(entry.inactivityTimer);
+      entry.inactivityTimer = null;
+    }
+  };
+
+  const startInactivityTimer = (entry: PendingRequest): void => {
+    if (entry.inactivityTimeoutMs === null || entry.inactivityTimeoutMs <= 0) return;
+    if (entry.inactivityTimer) {
+      clearTimeout(entry.inactivityTimer);
+    }
+    entry.inactivityTimer = setTimeout(() => {
+      pending.delete(entry.id);
+      entry.inactivityTimer = null;
+      entry.reject(new Error(
+        `RPC request "${entry.method}" (id=${entry.id}) timed out after ${entry.inactivityTimeoutMs}ms of inactivity`,
+      ));
+    }, entry.inactivityTimeoutMs);
+  };
+
+  const touchActivity = (activityKey: string | undefined): void => {
+    if (!activityKey) return;
+    for (const entry of pending.values()) {
+      if (entry.activityKey !== activityKey) continue;
+      startInactivityTimer(entry);
+    }
+  };
+
+  const extractActivityKey = (msg: unknown): string | undefined => {
+    if (!msg || typeof msg !== "object") return undefined;
+    const params = (msg as { params?: unknown }).params;
+    if (!params || typeof params !== "object") return undefined;
+    const sessionId = (params as { sessionId?: unknown }).sessionId;
+    return typeof sessionId === "string" && sessionId.length > 0 ? sessionId : undefined;
+  };
 
   /** Try each request handler in order. First one that resolves wins. */
   const dispatchRequest = async (method: string, params: unknown): Promise<unknown> => {
@@ -50,6 +106,7 @@ export const createRpcClient = (
   const handleMessage = (msg: unknown): void => {
     if (isJsonRpcRequest(msg)) {
       const req = msg as JsonRpcRequest;
+      touchActivity(extractActivityKey(req));
       console.log(`[rpc] Incoming request: id=${req.id}, method=${req.method}`);
       if (requestHandlers.length > 0) {
         dispatchRequest(req.method, req.params).then(
@@ -70,6 +127,7 @@ export const createRpcClient = (
 
     if (isJsonRpcNotification(msg)) {
       const notif = msg as JsonRpcNotification;
+      touchActivity(extractActivityKey(notif));
       console.log(`[rpc] Incoming notification: method=${notif.method}`);
       for (const handler of notificationHandlers) {
         handler(notif);
@@ -86,7 +144,7 @@ export const createRpcClient = (
         return;
       }
       pending.delete(msg.id as number | string);
-      clearTimeout(entry.timer);
+      clearPendingTimers(entry);
 
       if (msg.error) {
         entry.reject(new Error(msg.error.message));
@@ -98,7 +156,7 @@ export const createRpcClient = (
 
   parseNdjsonStream(input, handleMessage, () => {});
 
-  const sendRequest = (method: string, params?: unknown): Promise<unknown> => {
+  const sendRequest = (method: string, params?: unknown, requestOptions?: RequestOptions): Promise<unknown> => {
     const id = nextId++;
     const request: Record<string, unknown> = { jsonrpc: "2.0", id, method };
     if (params !== undefined) request.params = params;
@@ -107,12 +165,30 @@ export const createRpcClient = (
     output.write(JSON.stringify(request) + "\n");
 
     return new Promise<unknown>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        pending.delete(id);
-        reject(new Error(`RPC request "${method}" (id=${id}) timed out after ${timeout}ms`));
-      }, timeout);
+      const timeoutMs = requestOptions?.timeout === undefined ? timeout : requestOptions.timeout;
+      const inactivityTimeoutMs = requestOptions?.inactivityTimeout ?? null;
+      const entry: PendingRequest = {
+        resolve,
+        reject,
+        timeoutTimer: null,
+        inactivityTimer: null,
+        timeoutMs,
+        inactivityTimeoutMs,
+        activityKey: requestOptions?.activityKey,
+        method,
+        id,
+      };
 
-      pending.set(id, { resolve, reject, timer });
+      if (timeoutMs !== null && timeoutMs > 0) {
+        entry.timeoutTimer = setTimeout(() => {
+          pending.delete(id);
+          entry.timeoutTimer = null;
+          reject(new Error(`RPC request "${method}" (id=${id}) timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+      }
+
+      pending.set(id, entry);
+      startInactivityTimer(entry);
     });
   };
 
@@ -148,7 +224,7 @@ export const createRpcClient = (
 
   const destroy = (): void => {
     for (const [, entry] of pending) {
-      clearTimeout(entry.timer);
+      clearPendingTimers(entry);
     }
     pending.clear();
   };

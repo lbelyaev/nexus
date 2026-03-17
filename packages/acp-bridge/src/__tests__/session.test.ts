@@ -32,6 +32,10 @@ describe("createAcpSession", () => {
     expect(rpc.sendRequest).toHaveBeenCalledWith("session/prompt", {
       sessionId: "acp-123",
       prompt: [{ type: "text", text: "Hello agent" }],
+    }, {
+      timeout: null,
+      inactivityTimeout: 600_000,
+      activityKey: "acp-123",
     });
   });
 
@@ -52,6 +56,10 @@ describe("createAcpSession", () => {
           mimeType: "image/png",
         },
       ],
+    }, {
+      timeout: null,
+      inactivityTimeout: 600_000,
+      activityKey: "acp-123",
     });
   });
 
@@ -79,6 +87,10 @@ describe("createAcpSession", () => {
           uri: "https://example.com/cat.jpg",
         },
       ],
+    }, {
+      timeout: null,
+      inactivityTimeout: 600_000,
+      activityKey: "acp-123",
     });
     vi.unstubAllGlobals();
   });
@@ -103,10 +115,36 @@ describe("createAcpSession", () => {
           mimeType: "image/png",
         },
       ],
+    }, {
+      timeout: null,
+      inactivityTimeout: 600_000,
+      activityKey: "acp-123",
     });
     expect(rpc.sendRequest).toHaveBeenNthCalledWith(2, "session/prompt", {
       sessionId: "acp-123",
       prompt: [{ type: "text", text: "Attached image URLs:\n1. data:image/png;base64,Y2F0" }],
+    }, {
+      timeout: null,
+      inactivityTimeout: 600_000,
+      activityKey: "acp-123",
+    });
+  });
+
+  it("prompt uses configured inactivity timeout instead of RPC wall clock timeout", async () => {
+    const rpc = makeMockRpc();
+    const session = createAcpSession(rpc, "acp-123", "gw-456", {
+      promptInactivityTimeoutMs: 123_000,
+    });
+
+    await session.prompt("Hello agent");
+
+    expect(rpc.sendRequest).toHaveBeenCalledWith("session/prompt", {
+      sessionId: "acp-123",
+      prompt: [{ type: "text", text: "Hello agent" }],
+    }, {
+      timeout: null,
+      inactivityTimeout: 123_000,
+      activityKey: "acp-123",
     });
   });
 

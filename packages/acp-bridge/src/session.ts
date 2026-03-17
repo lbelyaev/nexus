@@ -163,9 +163,10 @@ export const createAcpSession = (
   rpc: RpcClient,
   acpSessionId: string,
   gatewaySessionId: string,
-  options?: { policyEvaluator?: PolicyEvaluator },
+  options?: { policyEvaluator?: PolicyEvaluator; promptInactivityTimeoutMs?: number },
 ): AcpSession => {
   const policyEvaluator = options?.policyEvaluator;
+  const promptInactivityTimeoutMs = options?.promptInactivityTimeoutMs ?? 600_000;
   let eventHandler: AcpEventHandler | undefined;
 
   // Pending permission requests from the agent (request_id → resolver)
@@ -309,6 +310,10 @@ export const createAcpSession = (
       return await rpc.sendRequest("session/prompt", {
         sessionId: acpSessionId,
         prompt: promptBlocks,
+      }, {
+        timeout: null,
+        inactivityTimeout: promptInactivityTimeoutMs,
+        activityKey: acpSessionId,
       });
     } catch (error) {
       if (!hasImages) throw error;
@@ -323,6 +328,10 @@ export const createAcpSession = (
       return rpc.sendRequest("session/prompt", {
         sessionId: acpSessionId,
         prompt: [{ type: "text", text: fallbackText }],
+      }, {
+        timeout: null,
+        inactivityTimeout: promptInactivityTimeoutMs,
+        activityKey: acpSessionId,
       });
     }
   };

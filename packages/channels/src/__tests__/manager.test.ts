@@ -492,6 +492,61 @@ describe("createChannelManager", () => {
     await manager.stop();
   });
 
+  it("keeps idle session closure silent in the channel", async () => {
+    const { gatewayClient, handlers } = createMockGateway();
+    createGatewayClientMock.mockReturnValue(gatewayClient);
+    const adapterFixture = createAdapter();
+
+    const manager = createChannelManager({
+      gatewayUrl: "ws://127.0.0.1:18800/ws",
+      token: "test-token",
+      adapters: [{ adapter: adapterFixture.adapter }],
+    });
+
+    await manager.start();
+    const context = adapterFixture.getContext();
+    expect(context).toBeDefined();
+
+    const inboundPromise = context!.onMessage({
+      adapterId: "telegram-test",
+      conversationId: "chat-idle",
+      senderId: "user-1",
+      text: "hello",
+    });
+
+    await vi.waitFor(() => {
+      expect(gatewayClient.send).toHaveBeenCalledWith(expect.objectContaining({ type: "session_new" }));
+    });
+
+    handlers.onEvent?.({
+      type: "session_created",
+      sessionId: "gw-session-idle",
+      runtimeId: "claude",
+      model: "claude-sonnet-4-6",
+      workspaceId: "default",
+    });
+    await inboundPromise;
+
+    handlers.onEvent?.({
+      type: "turn_end",
+      sessionId: "gw-session-idle",
+      stopReason: "end_turn",
+    });
+    adapterFixture.sendMessage.mockClear();
+
+    handlers.onEvent?.({
+      type: "session_closed",
+      sessionId: "gw-session-idle",
+      reason: "idle_timeout",
+    });
+
+    await vi.waitFor(() => {
+      expect(adapterFixture.sendMessage).not.toHaveBeenCalled();
+    });
+
+    await manager.stop();
+  });
+
   it("silently retries a pending prompt after runtime restart", async () => {
     const { gatewayClient, handlers } = createMockGateway();
     createGatewayClientMock.mockReturnValue(gatewayClient);
