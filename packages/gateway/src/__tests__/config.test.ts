@@ -15,6 +15,9 @@ describe("loadConfig", () => {
 
   afterEach(() => {
     rmSync(tmpDir, { recursive: true, force: true });
+    delete process.env.NEXUS_TEST_AUTH_TOKEN;
+    delete process.env.NEXUS_TEST_TELEGRAM_TOKEN;
+    delete process.env.NEXUS_TEST_DISCORD_TOKEN;
   });
 
   it("reads valid JSON config and returns typed NexusConfig", () => {
@@ -67,6 +70,54 @@ describe("loadConfig", () => {
     const config = loadConfig(configPath);
     expect(config.auth.token).toHaveLength(32);
     expect(config.auth.token).toMatch(/^[0-9a-f]{32}$/);
+  });
+
+  it("resolves environment placeholders in auth and channel tokens", () => {
+    process.env.NEXUS_TEST_AUTH_TOKEN = "auth-from-env";
+    process.env.NEXUS_TEST_TELEGRAM_TOKEN = "telegram-from-env";
+    process.env.NEXUS_TEST_DISCORD_TOKEN = "discord-from-env";
+
+    const configPath = join(tmpDir, "nexus.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        auth: { token: "${NEXUS_TEST_AUTH_TOKEN}" },
+        runtimes: {
+          claude: { command: ["npx", "@zed-industries/claude-agent-acp"] },
+        },
+        channels: {
+          telegramMain: {
+            kind: "telegram",
+            botToken: "${NEXUS_TEST_TELEGRAM_TOKEN}",
+            runtimeId: "claude",
+          },
+          discordMain: {
+            kind: "discord",
+            botToken: "${NEXUS_TEST_DISCORD_TOKEN}",
+            runtimeId: "claude",
+          },
+        },
+      }),
+    );
+
+    const config = loadConfig(configPath);
+    expect(config.auth.token).toBe("auth-from-env");
+    expect(config.channels?.telegramMain?.kind).toBe("telegram");
+    expect((config.channels?.telegramMain as { botToken?: string } | undefined)?.botToken).toBe("telegram-from-env");
+    expect((config.channels?.discordMain as { botToken?: string } | undefined)?.botToken).toBe("discord-from-env");
+  });
+
+  it("throws when an environment placeholder is missing", () => {
+    const configPath = join(tmpDir, "nexus.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        auth: { token: "${NEXUS_TEST_AUTH_TOKEN}" },
+        runtime: { command: ["npx", "cc-acp"] },
+      }),
+    );
+
+    expect(() => loadConfig(configPath)).toThrow(/Missing environment variable NEXUS_TEST_AUTH_TOKEN/);
   });
 
   it("throws on missing runtime.command", () => {

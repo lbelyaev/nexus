@@ -41,6 +41,32 @@ const CONFIG_SEARCH_PATHS = [
   resolve(repoRoot, "config/nexus.default.json"),
 ];
 
+const ENV_PLACEHOLDER = /\$\{([A-Z0-9_]+)\}/g;
+
+const resolveEnvPlaceholders = (value: unknown, path: string = "config"): unknown => {
+  if (typeof value === "string") {
+    return value.replace(ENV_PLACEHOLDER, (_match, name: string) => {
+      const resolved = process.env[name];
+      if (resolved === undefined) {
+        throw new Error(`Missing environment variable ${name} referenced by ${path}`);
+      }
+      return resolved;
+    });
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((entry, index) => resolveEnvPlaceholders(entry, `${path}[${index}]`));
+  }
+
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, resolveEnvPlaceholders(entry, `${path}.${key}`)]),
+    );
+  }
+
+  return value;
+};
+
 export const loadConfig = (configPath?: string): NexusConfig => {
   const resolvedPath = configPath
     ?? process.env.NEXUS_CONFIG
@@ -52,7 +78,7 @@ export const loadConfig = (configPath?: string): NexusConfig => {
     );
   }
 
-  const raw = JSON.parse(readFileSync(resolvedPath, "utf-8")) as Record<
+  const raw = resolveEnvPlaceholders(JSON.parse(readFileSync(resolvedPath, "utf-8")), "config") as Record<
     string,
     unknown
   >;
