@@ -49,8 +49,20 @@ const serializePrettyEvent = (event: GatewayEvent): string => {
   switch (event.type) {
     case "session_created":
       return `[session_created] session=${event.sessionId} runtime=${event.runtimeId ?? "default"} model=${event.model} principal=${event.principalType ?? "user"}:${event.principalId ?? "user:local"} source=${event.source ?? "interactive"}`;
+    case "session_updated":
+      return [
+        `[session_updated] session=${event.sessionId}`,
+        `name=${event.displayName ?? "(none)"}`,
+        event.lifecycleState ? `lifecycle=${event.lifecycleState}` : null,
+        event.parkedReason ? `parked=${event.parkedReason}` : null,
+        event.interruption ? `interruption=${event.interruption.kind}` : null,
+      ].filter((part): part is string => part !== null).join(" ");
     case "session_invalidated":
       return `[session_invalidated] session=${event.sessionId} reason=${event.reason} message=${event.message}`;
+    case "session_attached":
+      return `[session_attached] session=${event.sessionId} controller=${event.controller ? "yes" : "no"}`;
+    case "session_detached":
+      return `[session_detached] session=${event.sessionId} reason=${event.reason}`;
     case "session_closed":
       return `[session_closed] session=${event.sessionId} reason=${event.reason}`;
     case "auth_challenge":
@@ -59,8 +71,14 @@ const serializePrettyEvent = (event: GatewayEvent): string => {
       return `[auth_result] ok=${event.ok}${event.principalId ? ` principal=${event.principalId}` : ""}${event.message ? ` message=${event.message}` : ""}`;
     case "session_transfer_requested":
       return `[session_transfer_requested] session=${event.sessionId} from=${event.fromPrincipalId} to=${event.targetPrincipalId} expiresAt=${event.expiresAt}`;
+    case "session_transfer_updated":
+      return `[session_transfer_updated] session=${event.sessionId} from=${event.fromPrincipalId} to=${event.targetPrincipalId} state=${event.state}${event.reason ? ` reason=${event.reason}` : ""}${event.expiresAt ? ` expiresAt=${event.expiresAt}` : ""}`;
     case "session_transferred":
       return `[session_transferred] session=${event.sessionId} from=${event.fromPrincipalId} to=${event.targetPrincipalId} at=${event.transferredAt}`;
+    case "session_lifecycle":
+      return `[session_lifecycle] session=${event.sessionId} ${event.eventType} ${event.fromState}->${event.toState} at=${event.at}${event.parkedReason ? ` parked=${event.parkedReason}` : ""}${event.reason ? ` reason=${event.reason}` : ""}`;
+    case "session_lifecycle_result":
+      return `[session_lifecycle_result] session=${event.sessionId} events=${event.events.length}`;
     case "runtime_health":
       return `[runtime_health] runtime=${event.runtime.runtimeId} status=${event.runtime.status}${event.runtime.reason ? ` reason=${event.runtime.reason}` : ""}`;
     case "text_delta":
@@ -79,6 +97,8 @@ const serializePrettyEvent = (event: GatewayEvent): string => {
       return `[error] session=${event.sessionId} ${event.message}`;
     case "session_list":
       return `[session_list] ${event.sessions.length} session(s)`;
+    case "session_history":
+      return `[session_history] session=${event.sessionId} events=${event.events.length} hasMore=${event.hasMore ? "yes" : "no"}`;
     case "transcript":
       return `[transcript] session=${event.sessionId} messages=${event.messages.length}`;
     case "memory_result":
