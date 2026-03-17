@@ -6,6 +6,7 @@ coverage/
 .next/
 **/.next/
 data/
+config/
 *.db
 *.db-journal
 *.db-wal
