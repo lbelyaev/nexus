@@ -42,6 +42,44 @@ const CONFIG_SEARCH_PATHS = [
 ];
 
 const ENV_PLACEHOLDER = /\$\{([A-Z0-9_]+)\}/g;
+const ENV_LINE = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/;
+
+const stripEnvQuotes = (value: string): string => {
+  if (
+    (value.startsWith("\"") && value.endsWith("\""))
+    || (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    return value.slice(1, -1);
+  }
+  return value;
+};
+
+export const loadEnvFiles = (paths: string[]): void => {
+  const originalKeys = new Set(Object.keys(process.env));
+  const loaded: Record<string, string> = {};
+
+  for (const path of paths) {
+    if (!existsSync(path)) continue;
+
+    const raw = readFileSync(path, "utf-8");
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+
+      const match = ENV_LINE.exec(line);
+      if (!match) continue;
+
+      const [, key, value] = match;
+      loaded[key] = stripEnvQuotes(value);
+    }
+  }
+
+  for (const [key, value] of Object.entries(loaded)) {
+    if (!originalKeys.has(key)) {
+      process.env[key] = value;
+    }
+  }
+};
 
 const resolveEnvPlaceholders = (value: unknown, path: string = "config"): unknown => {
   if (typeof value === "string") {
@@ -68,6 +106,11 @@ const resolveEnvPlaceholders = (value: unknown, path: string = "config"): unknow
 };
 
 export const loadConfig = (configPath?: string): NexusConfig => {
+  loadEnvFiles([
+    resolve(repoRoot, ".env"),
+    resolve(repoRoot, ".env.local"),
+  ]);
+
   const resolvedPath = configPath
     ?? process.env.NEXUS_CONFIG
     ?? CONFIG_SEARCH_PATHS.find((p) => existsSync(p));

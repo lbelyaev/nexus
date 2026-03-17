@@ -3,7 +3,7 @@ import { writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
-import { loadConfig } from "../config.js";
+import { loadConfig, loadEnvFiles } from "../config.js";
 
 describe("loadConfig", () => {
   let tmpDir: string;
@@ -118,6 +118,32 @@ describe("loadConfig", () => {
     );
 
     expect(() => loadConfig(configPath)).toThrow(/Missing environment variable NEXUS_TEST_AUTH_TOKEN/);
+  });
+
+  it("loads .env files without overriding existing shell env", () => {
+    const envPath = join(tmpDir, ".env");
+    const envLocalPath = join(tmpDir, ".env.local");
+
+    writeFileSync(envPath, [
+      "NEXUS_TEST_ENV_FILE=from-dotenv",
+      "NEXUS_TEST_ENV_OVERRIDE=from-dotenv",
+    ].join("\n"));
+    writeFileSync(envLocalPath, [
+      "NEXUS_TEST_ENV_FILE=from-dotenv-local",
+      "NEXUS_TEST_ENV_LOCAL_ONLY=local-only",
+    ].join("\n"));
+
+    process.env.NEXUS_TEST_ENV_OVERRIDE = "from-shell";
+
+    loadEnvFiles([envPath, envLocalPath]);
+
+    expect(process.env.NEXUS_TEST_ENV_FILE).toBe("from-dotenv-local");
+    expect(process.env.NEXUS_TEST_ENV_LOCAL_ONLY).toBe("local-only");
+    expect(process.env.NEXUS_TEST_ENV_OVERRIDE).toBe("from-shell");
+
+    delete process.env.NEXUS_TEST_ENV_FILE;
+    delete process.env.NEXUS_TEST_ENV_LOCAL_ONLY;
+    delete process.env.NEXUS_TEST_ENV_OVERRIDE;
   });
 
   it("throws on missing runtime.command", () => {
